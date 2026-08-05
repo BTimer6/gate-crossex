@@ -353,7 +353,7 @@ test('Windows bootstrap installer verifies, updates, preserves data, and purges 
     assert.match(`${unsafePurge.stdout}\n${unsafePurge.stderr}`, /refusing to uninstall an unrecognized installation root/i);
     assert.equal(readFileSync(join(unrelatedRoot, 'keep.txt'), 'utf8'), 'keep\n');
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
