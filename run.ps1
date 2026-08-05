@@ -14,7 +14,11 @@ if ((Test-Path -LiteralPath $LocalNode -PathType Leaf) -and (Test-Path -LiteralP
 }
 
 function Get-Sha256([string]$FilePath) {
-  $Stream = [IO.File]::OpenRead($FilePath)
+  # .NET resolves relative paths against the host process working directory,
+  # which may remain C:\Windows\System32 after Set-Location changes PowerShell's
+  # location. Resolve through PowerShell first so source installs are portable.
+  $ResolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($FilePath)
+  $Stream = [IO.File]::OpenRead($ResolvedPath)
   try {
     $Algorithm = [Security.Cryptography.SHA256]::Create()
     try {

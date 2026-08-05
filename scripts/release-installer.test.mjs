@@ -132,6 +132,13 @@ test('Windows scripts hash files without PowerShell utility module auto-loading'
   }
 });
 
+test('Windows source launcher resolves relative hash paths through PowerShell', () => {
+  const contents = readFileSync(join(root, 'run.ps1'), 'utf8');
+  assert.match(contents, /GetUnresolvedProviderPathFromPSPath\(\$FilePath\)/);
+  assert.match(contents, /\[IO\.File\]::OpenRead\(\$ResolvedPath\)/);
+  assert.doesNotMatch(contents, /\[IO\.File\]::OpenRead\(\$FilePath\)/);
+});
+
 test('Windows release bundler invokes npm through Node instead of a batch file', () => {
   const contents = readFileSync(join(root, 'scripts/build-release-bundle-windows.mjs'), 'utf8');
   assert.doesNotMatch(contents, /run\(['"]npm\.cmd['"]/);

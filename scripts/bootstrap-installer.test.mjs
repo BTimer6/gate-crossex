@@ -84,7 +84,7 @@ function makeWindowsSourceArchive(directory, label) {
   })}\n`);
   writeFileSync(join(source, 'package-lock.json'), `${JSON.stringify({ name: 'gate-crossex-terminal', lockfileVersion: 3 })}\n`);
   writeFileSync(join(source, 'bootstrap.ps1'), 'exit 0\n');
-  writeFileSync(join(source, 'run.ps1'), 'param([string]$Command = "start")\n');
+  copyFileSync(join(root, 'run.ps1'), join(source, 'run.ps1'));
   writeFileSync(join(source, 'scripts/launcher.mjs'), '/* fixture */\n');
   writeFileSync(join(source, 'fixture-version.txt'), `${label}\n`);
   const archive = join(directory, `windows-source-${label}.zip`);
@@ -213,6 +213,21 @@ test('Windows bootstrap installs, updates, and preserves local state', {
     assert.equal(readFileSync(join(installRoot, 'fixture-version.txt'), 'utf8').trim(), 'first');
     assert.equal(existsSync(join(installRoot, '.runtime/node.exe')), true);
     assert.equal(existsSync(join(installRoot, 'node_modules/.bin/tsx.cmd')), true);
+
+    // Windows PowerShell can keep the process working directory even after
+    // run.ps1 calls Set-Location. Relative .NET file access must still use the
+    // installed source root rather than this unrelated directory.
+    const foreignWorkingDirectory = join(directory, 'foreign-working-directory');
+    mkdirSync(foreignWorkingDirectory);
+    execFileSync(windowsPowerShell, [
+      '-NoProfile',
+      '-ExecutionPolicy', 'Bypass',
+      '-File', join(installRoot, 'run.ps1'),
+    ], {
+      cwd: foreignWorkingDirectory,
+      env: baseEnvironment,
+      stdio: 'pipe',
+    });
 
     writeFileSync(join(installRoot, '.local-data/preserved.txt'), 'local state\n');
     writeFileSync(join(installRoot, '.env'), 'SECRET=preserved\n');
