@@ -139,6 +139,37 @@ test('Windows source launcher resolves relative hash paths through PowerShell', 
   assert.doesNotMatch(contents, /\[IO\.File\]::OpenRead\(\$FilePath\)/);
 });
 
+test('Windows source launcher invokes npm through Node instead of spawning npm.cmd', {
+  skip: process.platform !== 'win32' ? 'Windows child-process behavior' : false,
+}, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'gate-crossex-launcher-test-'));
+  const environment = Object.fromEntries(Object.entries(process.env)
+    .filter(([name]) => name.toLowerCase() !== 'path'));
+  try {
+    const result = spawnSync(process.execPath, [join(root, 'scripts/launcher.mjs'), 'doctor'], {
+      cwd: join(process.env.SystemRoot ?? 'C:\\Windows', 'System32'),
+      env: {
+        ...environment,
+        Path: dirname(process.execPath),
+        GCT_DATA_DIR: join(directory, 'data'),
+      },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /^npm=\d+\.\d+\.\d+$/m);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /spawn(?:Sync)? npm\.cmd EINVAL/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('production launcher records the backend node process instead of an npm wrapper', () => {
+  const contents = readFileSync(join(root, 'scripts/launcher.mjs'), 'utf8');
+  assert.match(contents, /spawn\(process\.execPath, \[join\(root, 'apps', 'backend', 'dist', 'server\.js'\)\]/);
+  assert.doesNotMatch(contents, /\['run', backendScript, '-w', 'apps\/backend'\]/);
+  assert.match(contents, /removeExitedBackendLock\(runtime\.backendPid\)/);
+});
+
 test('Windows release bundler invokes npm through Node instead of a batch file', () => {
   const contents = readFileSync(join(root, 'scripts/build-release-bundle-windows.mjs'), 'utf8');
   assert.doesNotMatch(contents, /run\(['"]npm\.cmd['"]/);

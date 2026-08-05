@@ -117,6 +117,45 @@ function Copy-PreservedPath([string]$InstallRoot, [string]$Name) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
 }
 
+function Repair-WorkspaceLinks([string]$InstallRoot) {
+    $RootPath = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
+    $RootPrefix = "$RootPath\"
+    $RootManifest = Get-Content -LiteralPath (Join-Path $RootPath 'package.json') -Raw | ConvertFrom-Json
+    $WorkspaceValue = $RootManifest.workspaces
+    if ($null -eq $WorkspaceValue) { return }
+    $PackagesProperty = $WorkspaceValue.PSObject.Properties['packages']
+    $Patterns = if ($null -ne $PackagesProperty) { @($PackagesProperty.Value) } else { @($WorkspaceValue) }
+
+    foreach ($Pattern in $Patterns) {
+        $NormalizedPattern = ([string]$Pattern).Replace('/', '\')
+        $ManifestPattern = Join-Path $RootPath (Join-Path $NormalizedPattern 'package.json')
+        foreach ($WorkspaceManifestPath in @(Get-ChildItem -Path $ManifestPattern -File -ErrorAction SilentlyContinue)) {
+            $WorkspaceDirectory = $WorkspaceManifestPath.Directory.FullName
+            if (-not $WorkspaceDirectory.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Workspace path escapes the installation root: $WorkspaceDirectory"
+            }
+            $WorkspaceManifest = Get-Content -LiteralPath $WorkspaceManifestPath.FullName -Raw | ConvertFrom-Json
+            $WorkspaceName = [string]$WorkspaceManifest.name
+            if ($WorkspaceName -notmatch '^(@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|[A-Za-z0-9._-]+)$') {
+                throw "Invalid workspace package name: $WorkspaceName"
+            }
+            $LinkPath = Join-Path $RootPath (Join-Path 'node_modules' $WorkspaceName.Replace('/', '\'))
+            $ExistingLink = Get-Item -LiteralPath $LinkPath -Force -ErrorAction SilentlyContinue
+            if ($null -ne $ExistingLink) {
+                if (($ExistingLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    throw "Refusing to replace a non-link workspace path: $LinkPath"
+                }
+                Remove-Item -LiteralPath $LinkPath -Force
+            }
+            New-Item -ItemType Directory -Path (Split-Path -Parent $LinkPath) -Force | Out-Null
+            New-Item -ItemType Junction -Path $LinkPath -Target $WorkspaceDirectory | Out-Null
+            if (-not (Test-Path -LiteralPath (Join-Path $LinkPath 'package.json') -PathType Leaf)) {
+                throw "Could not repair workspace link: $LinkPath"
+            }
+        }
+    }
+}
+
 function Install-GateCrossExSource {
     if ($env:OS -ne 'Windows_NT') { throw 'This bootstrap currently supports Windows only.' }
 
@@ -313,10 +352,18 @@ function Install-GateCrossExSource {
         try {
             Move-Item -LiteralPath $Script:NewRoot -Destination $InstallRoot
             $Script:NewRoot = $null
+            Repair-WorkspaceLinks $InstallRoot
         }
         catch {
-            Move-Item -LiteralPath $PreviousRoot -Destination $InstallRoot
-            throw 'Could not activate the new source installation; the previous installation was restored.'
+            $ActivationError = $_.Exception.Message
+            if (Test-Path -LiteralPath $InstallRoot) {
+                $FailedRoot = Join-Path $Script:TemporaryDirectory 'failed-root'
+                Move-Item -LiteralPath $InstallRoot -Destination $FailedRoot
+            }
+            if (-not (Test-Path -LiteralPath $InstallRoot) -and (Test-Path -LiteralPath $PreviousRoot)) {
+                Move-Item -LiteralPath $PreviousRoot -Destination $InstallRoot
+            }
+            throw "Could not activate the new source installation; the previous installation was restored. $ActivationError"
         }
         try {
             Remove-Item -LiteralPath $PreviousRoot -Recurse -Force
@@ -326,8 +373,19 @@ function Install-GateCrossExSource {
         }
     }
     else {
-        Move-Item -LiteralPath $Script:NewRoot -Destination $InstallRoot
-        $Script:NewRoot = $null
+        try {
+            Move-Item -LiteralPath $Script:NewRoot -Destination $InstallRoot
+            $Script:NewRoot = $null
+            Repair-WorkspaceLinks $InstallRoot
+        }
+        catch {
+            $ActivationError = $_.Exception.Message
+            if (Test-Path -LiteralPath $InstallRoot) {
+                $FailedRoot = Join-Path $Script:TemporaryDirectory 'failed-root'
+                Move-Item -LiteralPath $InstallRoot -Destination $FailedRoot
+            }
+            throw "Could not activate the new source installation. $ActivationError"
+        }
     }
 
     Write-Host ''
