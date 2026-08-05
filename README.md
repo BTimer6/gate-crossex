@@ -25,75 +25,77 @@ CrossEx connects Gate.io, Binance, OKX, Bybit, Kraken, Hyperliquid, and Deribit 
 - 仅在你的电脑上运行，只绑定 `127.0.0.1`，不包含遥测或云端后端。<br>
   Runs on your computer, binds only to `127.0.0.1`, and has no telemetry or hosted backend.
 
-## 安装 | Install
+## 安装并启动 | Install and start
 
-运行一条引导命令即可下载源码、项目专用的 Node.js 运行时以及锁文件固定的全部依赖项。无需预先安装 Node.js、npm、Git、Docker，也无需管理员权限或 `sudo`。
+首次使用需要先运行一次**安装命令**，以后打开 Gate CrossEx 时只需运行**启动命令**。安装程序会下载源码、项目专用的 Node.js 运行时以及锁文件固定的全部依赖项，并完成应用构建。无需预先安装 Node.js、npm、Git、Docker，也无需管理员权限或 `sudo`。
 
-Run one bootstrap command to download the source, a private Node.js runtime, and all lockfile-pinned dependencies. You do not need Node.js, npm, Git, Docker, administrator access, or `sudo`.
+The first time you use Gate CrossEx, run the **install command** once. After that, use only the **start command** whenever you want to open it. The installer downloads the source, a private Node.js runtime, and all lockfile-pinned dependencies, then builds the app. You do not need Node.js, npm, Git, Docker, administrator access, or `sudo`.
 
-### macOS 或 Linux — ARM64 和 x64 | macOS or Linux — ARM64 and x64
+### macOS — ARM64 和 x64 | macOS — ARM64 and x64
 
-打开**终端**，粘贴以下命令，然后按下 Return：
+1. 打开 **Terminal（终端）**。<br>
+   Open **Terminal**.
 
-Open **Terminal**, paste this command, and press Return:
+2. 粘贴下面的安装命令，按下 Return，然后等待安装完成：<br>
+   Paste the install command below, press Return, and wait for it to finish:
 
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.sh)"
-```
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.sh)"
+   ```
 
-Linux 引导程序支持基于 glibc 的发行版。
+3. 看到 `Gate CrossEx is ready to start` 后，运行下面的启动命令：<br>
+   When you see `Gate CrossEx is ready to start`, run the start command:
 
-The Linux bootstrap supports glibc-based distributions.
+   ```bash
+   cd ~/gate-crossex
+   ./run
+   ```
+
+4. 等待终端显示 `Gate CrossEx is ready`。浏览器会自动打开本地应用；请保持终端窗口运行。需要停止时，在终端中按 `Ctrl+C`。<br>
+   Wait for `Gate CrossEx is ready` to appear. Your browser opens the local app automatically; keep the Terminal window running. To stop the app, press `Ctrl+C` in Terminal.
+
+5. 以后再次打开 Gate CrossEx 时，无需重新安装，只需打开终端并重复第 3 步。<br>
+   The next time you open Gate CrossEx, do not reinstall it—open Terminal and repeat step 3.
 
 ### Windows — x64 和 ARM64 | Windows — x64 and ARM64
 
-打开 **PowerShell**，粘贴以下命令，然后按下 Enter：
+1. 从开始菜单打开 **PowerShell**（不是“命令提示符”）。<br>
+   Open **PowerShell** from the Start menu—not Command Prompt.
 
-Open **PowerShell**, paste this command, and press Enter:
+2. 粘贴下面的安装命令，按下 Enter，然后等待安装完成：<br>
+   Paste the install command below, press Enter, and wait for it to finish:
 
-```powershell
-& ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.ps1)))
-```
+   ```powershell
+   & ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.ps1)))
+   ```
 
-### 启动本地网页应用 | Start the local web app
+3. 看到 `Gate CrossEx is ready to start` 后，在同一个 PowerShell 窗口运行下面的启动命令：<br>
+   When you see `Gate CrossEx is ready to start`, run the start command in the same PowerShell window:
 
-#### macOS 或 Linux | macOS or Linux
+   ```powershell
+   Set-Location "$HOME\gate-crossex"
+   .\run.ps1
+   ```
 
-在 macOS 或 Linux 上，引导程序默认安装到 `~/gate-crossex`。安装完成后，在**终端**中运行：
+4. 等待 PowerShell 显示 `Gate CrossEx is ready`。浏览器会自动打开本地应用；请保持 PowerShell 窗口运行。需要停止时，在 PowerShell 中按 `Ctrl+C`。<br>
+   Wait for `Gate CrossEx is ready` to appear. Your browser opens the local app automatically; keep the PowerShell window running. To stop the app, press `Ctrl+C` in PowerShell.
 
-On macOS or Linux, the bootstrap installs into `~/gate-crossex` by default. After installation, run these commands in **Terminal**:
+5. 以后再次打开 Gate CrossEx 时，无需重新安装，只需打开 PowerShell 并重复第 3 步。<br>
+   The next time you open Gate CrossEx, do not reinstall it—open PowerShell and repeat step 3.
 
-```bash
-cd ~/gate-crossex && ./run
-```
+### Linux — ARM64 和 x64 | Linux — ARM64 and x64
 
-#### Windows | Windows
+Linux 用户请按照上面的 macOS 步骤操作：安装命令和启动命令完全相同，默认安装目录也是 `~/gate-crossex`。目前支持基于 glibc 的 Linux 发行版。
 
-在 Windows 上，引导程序默认安装到 `$HOME\gate-crossex`。安装完成后，在 **PowerShell** 中运行：
+Linux users can follow the macOS steps above: the install and start commands are identical, and the default install directory is also `~/gate-crossex`. The bootstrap currently supports glibc-based Linux distributions.
 
-On Windows, the bootstrap installs into `$HOME\gate-crossex` by default. After installation, run these commands in **PowerShell**:
+默认情况下，本地应用地址为 **http://127.0.0.1:17840**。这是当前电脑上的私有地址，不是公网网站。如果浏览器没有自动打开，请复制终端中 `Gate CrossEx is ready` 后显示的完整地址；默认端口被占用时，启动器会选择其他本地端口。
 
-```powershell
-Set-Location "$HOME\gate-crossex"; .\run.ps1
-```
+By default, the local app is available at **http://127.0.0.1:17840**. This is a private address on your computer, not a public website. If the browser does not open automatically, copy the full address shown after `Gate CrossEx is ready`; the launcher chooses another local port if the default is unavailable.
 
-启动器会构建已下载的源码，等待仅限本机访问的网页应用通过健康检查，然后在浏览器中打开。按终端中的 `Ctrl+C` 即可停止。引导程序会使用 Node.js 官方发布的 SHA-256 校验值验证项目专用运行时。以上命令会运行本仓库中的远程脚本；如安全策略有要求，请先检查脚本内容。
+引导程序会使用 Node.js 官方发布的 SHA-256 校验值验证项目专用运行时。以上安装命令会运行本仓库中的远程脚本；如安全策略有要求，请先检查脚本内容。如需选择其他安装目录，请在运行安装命令前将 `GCT_INSTALL_DIR` 设置为绝对路径。贡献者命令和 Docker 用法请参阅[本地开发文档](docs/local-development.md)。
 
-The launcher builds the checked-out source, waits for the loopback-only web app to become healthy, and opens it in your browser. Press `Ctrl+C` in the terminal to stop it. The bootstrap verifies the private Node.js runtime against Node.js's published SHA-256 checksums. These commands run a remote script from this repository; inspect it first if required by your security policy.
-
-如需选择其他安装目录，请在运行引导程序前将 `GCT_INSTALL_DIR` 设置为绝对路径。贡献者命令和 Docker 用法请参阅[本地开发文档](docs/local-development.md)。
-
-To choose another installation folder, set `GCT_INSTALL_DIR` to an absolute path before running the bootstrap. See [local development](docs/local-development.md) for contributor and Docker commands.
-
-## 网页应用地址 | Web app URL
-
-Gate CrossEx 运行时，请在浏览器中打开 **http://127.0.0.1:17840**。这是你当前电脑上的私有本地地址，不是公网网站，其他设备无法访问。如果默认端口被占用，或你配置了其他端口，请使用启动器或安装器显示的 **Gate CrossEx is ready** 或 **Local URL** 完整地址。
-
-Open **http://127.0.0.1:17840** in a browser while Gate CrossEx is running. This is a private address on your own computer, not a public website; another device cannot open it. If the default port is unavailable or you configured a different port, use the exact **Gate CrossEx is ready** or **Local URL** address printed by the launcher or installer.
-
-应用通过健康检查后，`cd ~/gate-crossex && ./run` 和 `Set-Location "$HOME\gate-crossex"; .\run.ps1` 启动命令会自动打开该地址。
-
-The `cd ~/gate-crossex && ./run` and `Set-Location "$HOME\gate-crossex"; .\run.ps1` commands open this URL automatically after the app becomes healthy.
+The bootstrap verifies the private Node.js runtime against Node.js's published SHA-256 checksums. The install commands run a remote script from this repository; inspect it first if required by your security policy. To choose another installation folder, set `GCT_INSTALL_DIR` to an absolute path before running the install command. See [local development](docs/local-development.md) for contributor and Docker commands.
 
 ## 首次使用 | First use
 
