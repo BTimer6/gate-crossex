@@ -40,6 +40,11 @@ function Invoke-Npm {
   if ($LASTEXITCODE -ne 0) { throw "npm command failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-Launcher([string]$LauncherCommand) {
+  & $NodeCommand scripts/launcher.mjs $LauncherCommand
+  if ($LASTEXITCODE -ne 0) { throw "Gate CrossEx $LauncherCommand failed with exit code $LASTEXITCODE" }
+}
+
 function Ensure-Node {
   if (-not (Get-Command $NodeCommand -ErrorAction SilentlyContinue)) {
     throw "Node.js 20.19+, 22.13+, or 24 is required. Install an LTS release from https://nodejs.org/"
@@ -52,6 +57,28 @@ function Ensure-Node {
   }
 }
 
+function Test-WorkspaceLinks {
+  $Manifest = Get-Content -LiteralPath (Join-Path $Root 'package.json') -Raw | ConvertFrom-Json
+  $WorkspaceValue = $Manifest.workspaces
+  if ($null -eq $WorkspaceValue) { return $true }
+  $PackagesProperty = $WorkspaceValue.PSObject.Properties['packages']
+  $Patterns = if ($null -ne $PackagesProperty) { @($PackagesProperty.Value) } else { @($WorkspaceValue) }
+  foreach ($Pattern in $Patterns) {
+    $NormalizedPattern = ([string]$Pattern).Replace('/', '\')
+    $ManifestPattern = Join-Path $Root (Join-Path $NormalizedPattern 'package.json')
+    foreach ($WorkspaceManifestPath in @(Get-ChildItem -Path $ManifestPattern -File -ErrorAction SilentlyContinue)) {
+      $WorkspaceManifest = Get-Content -LiteralPath $WorkspaceManifestPath.FullName -Raw | ConvertFrom-Json
+      $WorkspaceName = [string]$WorkspaceManifest.name
+      if ([string]::IsNullOrWhiteSpace($WorkspaceName)) { continue }
+      $InstalledManifest = Join-Path $Root (Join-Path 'node_modules' (Join-Path $WorkspaceName.Replace('/', '\') 'package.json'))
+      if (-not (Test-Path -LiteralPath $InstalledManifest -PathType Leaf)) { return $false }
+      $InstalledName = [string](Get-Content -LiteralPath $InstalledManifest -Raw | ConvertFrom-Json).name
+      if ($InstalledName -ne $WorkspaceName) { return $false }
+    }
+  }
+  return $true
+}
+
 function Ensure-Dependencies {
   New-Item -ItemType Directory -Force .local-data, logs | Out-Null
   $Expected = Get-Sha256 'package-lock.json'
@@ -59,9 +86,10 @@ function Ensure-Dependencies {
   $Installed = if (Test-Path -LiteralPath $DependencyMarker -PathType Leaf) {
     (Get-Content -LiteralPath $DependencyMarker -Raw).Trim().ToLowerInvariant()
   } else { '' }
-  if (-not (Test-Path node_modules/.bin/tsx.cmd) -or $Installed -ne $Expected) {
+  if (-not (Test-Path node_modules/.bin/tsx.cmd) -or $Installed -ne $Expected -or -not (Test-WorkspaceLinks)) {
     Write-Host "Installing pinned dependencies..."
     Invoke-Npm ci --cache .local-data/npm-cache --no-audit --no-fund
+    if (-not (Test-WorkspaceLinks)) { throw 'npm ci did not create usable workspace links.' }
     Set-Content -LiteralPath $DependencyMarker -Value $Expected -Encoding ASCII
   }
 }
@@ -70,17 +98,17 @@ Ensure-Node
 switch ($Command) {
   { $_ -in "start", "dev" } {
     Ensure-Dependencies
-    & $NodeCommand scripts/launcher.mjs $Command
+    Invoke-Launcher $Command
     break
   }
   { $_ -in "doctor", "stop", "logs" } {
-    & $NodeCommand scripts/launcher.mjs $Command
+    Invoke-Launcher $Command
     break
   }
   "reset" {
     $answer = Read-Host "Destructive reset removes local configuration and database. Type RESET to continue"
     if ($answer -eq "RESET") {
-      & $NodeCommand scripts/launcher.mjs stop
+      Invoke-Launcher 'stop'
       Remove-Item -Recurse -Force .local-data
       Write-Host "Local state reset."
     } else { Write-Host "Reset aborted." }
@@ -91,7 +119,7 @@ switch ($Command) {
       & (Join-Path $Root 'bootstrap.ps1') -Update
       break
     }
-    & $NodeCommand scripts/launcher.mjs stop
+    Invoke-Launcher 'stop'
     Ensure-Dependencies
     if (Test-Path .local-data/gate-crossex.sqlite) {
       $stamp = Get-Date -Format "yyyyMMddHHmmss"
@@ -108,7 +136,7 @@ switch ($Command) {
   }
   "backup" {
     Ensure-Dependencies
-    & $NodeCommand scripts/launcher.mjs stop
+    Invoke-Launcher 'stop'
     if (-not (Test-Path .local-data/gate-crossex.sqlite)) { throw "No local database exists to back up." }
     if (-not $Path) {
       $stamp = Get-Date -Format "yyyyMMddHHmmss"
@@ -123,13 +151,13 @@ switch ($Command) {
     if (-not $Path) { throw "Usage: ./run.ps1 restore <backup.sqlite>" }
     $answer = Read-Host "Restore from $Path; the current database will be preserved. Type RESTORE to continue"
     if ($answer -ne "RESTORE") { Write-Host "Restore aborted."; break }
-    & $NodeCommand scripts/launcher.mjs stop
+    Invoke-Launcher 'stop'
     & $NodeCommand scripts/restore-database.mjs $Path .local-data/gate-crossex.sqlite
     break
   }
   "maintenance" {
     Ensure-Dependencies
-    & $NodeCommand scripts/launcher.mjs stop
+    Invoke-Launcher 'stop'
     & $NodeCommand scripts/maintain-database.mjs .local-data/gate-crossex.sqlite
     break
   }

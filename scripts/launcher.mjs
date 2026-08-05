@@ -23,7 +23,25 @@ const dataDir = resolve(process.env.GCT_DATA_DIR ?? join(root, '.local-data'));
 const logsDir = join(root, 'logs');
 const configPath = join(dataDir, 'config.json');
 const runtimePath = join(dataDir, 'runtime.json');
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const isWindows = process.platform === 'win32';
+const npmCliCandidates = [
+  process.env.npm_execpath,
+  join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+].filter(Boolean);
+const npmCli = isWindows ? npmCliCandidates.find(existsSync) : null;
+const npmCommand = npmCli ? process.execPath : isWindows ? 'npm.cmd' : 'npm';
+
+function npmArgs(args) {
+  return npmCli ? [npmCli, ...args] : args;
+}
+
+function spawnNpmSync(args, options) {
+  return spawnSync(npmCommand, npmArgs(args), options);
+}
+
+function spawnNpm(args, options) {
+  return spawn(npmCommand, npmArgs(args), options);
+}
 
 process.umask?.(0o077);
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -46,6 +64,13 @@ function writeJson(path, value) {
   if (!isWindows) chmodSync(path, 0o600);
 }
 
+function removeExitedBackendLock(pid) {
+  if (!Number.isInteger(pid) || processExists(pid)) return;
+  const lockPath = join(dataDir, 'backend.lock');
+  const lock = readJson(lockPath);
+  if (lock?.pid === pid) rmSync(lockPath, { force: true });
+}
+
 function processExists(pid) {
   if (!Number.isInteger(pid) || pid < 1) return false;
   try {
@@ -55,8 +80,6 @@ function processExists(pid) {
     return false;
   }
 }
-
-const isWindows = process.platform === 'win32';
 
 /**
  * Children are spawned as detached process-group leaders, so the group id stays killable even
@@ -239,13 +262,18 @@ async function start(mode) {
   });
 
   const buildScript = mode === 'dev' ? 'build:packages' : 'build';
-  const packageBuild = spawnSync(npmCommand, ['run', buildScript], { cwd: root, stdio: 'inherit' });
+  const packageBuild = spawnNpmSync(['run', buildScript], { cwd: root, stdio: 'inherit' });
+  if (packageBuild.error) {
+    throw new Error(`Could not launch npm for the ${buildScript} build: ${packageBuild.error.message}`);
+  }
   if (packageBuild.status !== 0) {
-    throw new Error(mode === 'dev' ? 'Failed to build shared packages' : 'Failed to build production application');
+    const description = mode === 'dev' ? 'shared packages' : 'production application';
+    throw new Error(`Failed to build ${description} (npm exited with code ${packageBuild.status ?? 'unknown'})`);
   }
 
   const environment = {
     ...process.env,
+    npm_package_version: readJson(join(root, 'package.json'))?.version ?? process.env.npm_package_version,
     GCT_DATA_DIR: dataDir,
     GCT_MIGRATIONS_DIR: join(root, 'migrations'),
     GCT_PORT: String(backendPort),
@@ -253,17 +281,20 @@ async function start(mode) {
     GCT_FRONTEND_ORIGIN: `http://127.0.0.1:${frontendPort}`,
     GCT_FRONTEND_DIST_DIR: join(root, 'apps/frontend/dist'),
   };
-  const backendScript = mode === 'dev' ? 'dev' : 'start';
-  // detached makes each npm wrapper a process-group leader, so stop/cleanup can signal the whole
-  // tree (npm -> shell -> tsx/vite) with one group kill instead of only the wrapper pid.
-  const backend = spawn(npmCommand, ['run', backendScript, '-w', 'apps/backend'], {
+  const backendOptions = {
     cwd: root,
     env: environment,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: !isWindows,
-  });
+  };
+  // Production runs the compiled backend directly so runtime.json records the process that owns
+  // the database lock. On Windows, waiting only for an npm.cmd wrapper can report a clean stop
+  // while its node.exe child is still completing order-safe shutdown.
+  const backend = mode === 'dev'
+    ? spawnNpm(['run', 'dev', '-w', 'apps/backend'], backendOptions)
+    : spawn(process.execPath, [join(root, 'apps', 'backend', 'dist', 'server.js')], backendOptions);
   const frontend = mode === 'dev'
-    ? spawn(npmCommand, ['run', 'dev', '-w', 'apps/frontend'], {
+    ? spawnNpm(['run', 'dev', '-w', 'apps/frontend'], {
         cwd: root,
         env: environment,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -290,7 +321,10 @@ async function start(mode) {
       const clean = await terminateProcessGroups(children.map((child) => child.pid));
       // Only report a clean stop when the groups are verifiably gone; a kept runtime.json lets
       // ./run stop find and finish off survivors instead of lying about the state.
-      if (clean) rmSync(runtimePath, { force: true });
+      if (clean) {
+        removeExitedBackendLock(backend.pid);
+        rmSync(runtimePath, { force: true });
+      }
       else console.error('Some local processes did not exit; kept runtime.json — run ./run stop.');
       return clean;
     })();
@@ -365,6 +399,7 @@ async function stop() {
     process.exitCode = 1;
     return;
   }
+  removeExitedBackendLock(runtime.backendPid);
   rmSync(runtimePath, { force: true });
   console.log('Stopped Gate CrossEx local services.');
 }
@@ -393,7 +428,8 @@ async function doctor() {
   }
 
   console.log(`node=${process.version} compatible=${nodeCompatible ? 'yes' : 'no'}`);
-  console.log(`npm=${spawnSync(npmCommand, ['--version'], { encoding: 'utf8' }).stdout?.trim() ?? 'missing'}`);
+  const npmVersion = spawnNpmSync(['--version'], { encoding: 'utf8' });
+  console.log(`npm=${npmVersion.error ? `missing (${npmVersion.error.message})` : npmVersion.stdout?.trim() || 'missing'}`);
   console.log(`os=${platform()} arch=${arch()}`);
   console.log(`dependencies=${dependenciesInstalled ? 'installed' : 'missing'}`);
   console.log(`data_dir=${dataDir}`);

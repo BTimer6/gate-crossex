@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -81,11 +82,23 @@ function makeWindowsSourceArchive(directory, label) {
     name: 'gate-crossex-terminal',
     private: true,
     version: '0.1.0',
+    workspaces: ['packages/*'],
   })}\n`);
   writeFileSync(join(source, 'package-lock.json'), `${JSON.stringify({ name: 'gate-crossex-terminal', lockfileVersion: 3 })}\n`);
   writeFileSync(join(source, 'bootstrap.ps1'), 'exit 0\n');
   copyFileSync(join(root, 'run.ps1'), join(source, 'run.ps1'));
-  writeFileSync(join(source, 'scripts/launcher.mjs'), '/* fixture */\n');
+  writeFileSync(join(source, 'scripts/launcher.mjs'), `
+import fixtureVersion from '@gate-crossex/bootstrap-fixture';
+if (fixtureVersion !== '${label}') throw new Error('workspace link resolved the wrong fixture');
+`);
+  mkdirSync(join(source, 'packages/bootstrap-fixture'), { recursive: true });
+  writeFileSync(join(source, 'packages/bootstrap-fixture/package.json'), `${JSON.stringify({
+    name: '@gate-crossex/bootstrap-fixture',
+    version: '0.1.0',
+    type: 'module',
+    main: 'index.js',
+  })}\n`);
+  writeFileSync(join(source, 'packages/bootstrap-fixture/index.js'), `export default '${label}';\n`);
   writeFileSync(join(source, 'fixture-version.txt'), `${label}\n`);
   const archive = join(directory, `windows-source-${label}.zip`);
   execFileSync('tar.exe', ['-a', '-cf', archive, '-C', dirname(source), basename(source)]);
@@ -101,8 +114,8 @@ function makeWindowsNodeArchive(directory, version) {
   const npmCli = join(runtime, 'node_modules/npm/bin/npm-cli.js');
   mkdirSync(dirname(npmCli), { recursive: true });
   writeFileSync(npmCli, `
-const { mkdirSync, writeFileSync } = require('node:fs');
-const { dirname, join } = require('node:path');
+const { mkdirSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
+const { dirname, join, resolve } = require('node:path');
 if (process.argv[2] === 'ci') {
   mkdirSync('node_modules/.bin', { recursive: true });
   writeFileSync('node_modules/.bin/tsx.cmd', '@exit /b 0\\r\\n');
@@ -112,6 +125,10 @@ if (process.argv[2] === 'ci') {
     writeFileSync(join(directory, 'package.json'), JSON.stringify({ name, main: 'index.js' }));
     writeFileSync(join(directory, 'index.js'), 'module.exports = {}\\n');
   }
+  const workspaceLink = resolve('node_modules/@gate-crossex/bootstrap-fixture');
+  mkdirSync(dirname(workspaceLink), { recursive: true });
+  rmSync(workspaceLink, { recursive: true, force: true });
+  symlinkSync(resolve('packages/bootstrap-fixture'), workspaceLink, 'junction');
 }
 `);
   const archive = join(directory, `${assetRoot}.zip`);
@@ -213,6 +230,10 @@ test('Windows bootstrap installs, updates, and preserves local state', {
     assert.equal(readFileSync(join(installRoot, 'fixture-version.txt'), 'utf8').trim(), 'first');
     assert.equal(existsSync(join(installRoot, '.runtime/node.exe')), true);
     assert.equal(existsSync(join(installRoot, 'node_modules/.bin/tsx.cmd')), true);
+    assert.equal(
+      realpathSync.native(join(installRoot, 'node_modules/@gate-crossex/bootstrap-fixture')).toLowerCase(),
+      realpathSync.native(join(installRoot, 'packages/bootstrap-fixture')).toLowerCase(),
+    );
 
     writeFileSync(join(installRoot, '.local-data/preserved.txt'), 'local state\n');
     writeFileSync(join(installRoot, '.env'), 'SECRET=preserved\n');
@@ -223,19 +244,23 @@ test('Windows bootstrap installs, updates, and preserves local state', {
     assert.equal(readFileSync(join(installRoot, '.local-data/preserved.txt'), 'utf8').trim(), 'local state');
     assert.equal(readFileSync(join(installRoot, '.env'), 'utf8').trim(), 'SECRET=preserved');
     assert.equal(readFileSync(join(installRoot, 'logs/preserved.log'), 'utf8').trim(), 'log');
+    assert.equal(
+      realpathSync.native(join(installRoot, 'node_modules/@gate-crossex/bootstrap-fixture')).toLowerCase(),
+      realpathSync.native(join(installRoot, 'packages/bootstrap-fixture')).toLowerCase(),
+    );
 
     // Windows PowerShell can keep the process working directory even after
     // run.ps1 calls Set-Location. Relative .NET file access must still use the
-    // installed source root rather than this unrelated directory. Run this
-    // after the update so a slow node.exe shutdown cannot race the root swap.
-    const foreignWorkingDirectory = join(directory, 'foreign-working-directory');
-    mkdirSync(foreignWorkingDirectory);
+    // installed source root rather than System32. The fixture launcher imports
+    // a workspace package, so this also catches staging-directory junctions
+    // left behind by an atomic update. Run this after the update so a slow
+    // node.exe shutdown cannot race the root swap.
     execFileSync(windowsPowerShell, [
       '-NoProfile',
       '-ExecutionPolicy', 'Bypass',
       '-File', join(installRoot, 'run.ps1'),
     ], {
-      cwd: foreignWorkingDirectory,
+      cwd: join(process.env.SystemRoot ?? 'C:\\Windows', 'System32'),
       env: baseEnvironment,
       stdio: 'pipe',
     });
