@@ -214,9 +214,20 @@ test('Windows bootstrap installs, updates, and preserves local state', {
     assert.equal(existsSync(join(installRoot, '.runtime/node.exe')), true);
     assert.equal(existsSync(join(installRoot, 'node_modules/.bin/tsx.cmd')), true);
 
+    writeFileSync(join(installRoot, '.local-data/preserved.txt'), 'local state\n');
+    writeFileSync(join(installRoot, '.env'), 'SECRET=preserved\n');
+    writeFileSync(join(installRoot, 'logs/preserved.log'), 'log\n');
+    const secondSource = makeWindowsSourceArchive(directory, 'second');
+    runBootstrap(secondSource);
+    assert.equal(readFileSync(join(installRoot, 'fixture-version.txt'), 'utf8').trim(), 'second');
+    assert.equal(readFileSync(join(installRoot, '.local-data/preserved.txt'), 'utf8').trim(), 'local state');
+    assert.equal(readFileSync(join(installRoot, '.env'), 'utf8').trim(), 'SECRET=preserved');
+    assert.equal(readFileSync(join(installRoot, 'logs/preserved.log'), 'utf8').trim(), 'log');
+
     // Windows PowerShell can keep the process working directory even after
     // run.ps1 calls Set-Location. Relative .NET file access must still use the
-    // installed source root rather than this unrelated directory.
+    // installed source root rather than this unrelated directory. Run this
+    // after the update so a slow node.exe shutdown cannot race the root swap.
     const foreignWorkingDirectory = join(directory, 'foreign-working-directory');
     mkdirSync(foreignWorkingDirectory);
     execFileSync(windowsPowerShell, [
@@ -228,16 +239,6 @@ test('Windows bootstrap installs, updates, and preserves local state', {
       env: baseEnvironment,
       stdio: 'pipe',
     });
-
-    writeFileSync(join(installRoot, '.local-data/preserved.txt'), 'local state\n');
-    writeFileSync(join(installRoot, '.env'), 'SECRET=preserved\n');
-    writeFileSync(join(installRoot, 'logs/preserved.log'), 'log\n');
-    const secondSource = makeWindowsSourceArchive(directory, 'second');
-    runBootstrap(secondSource);
-    assert.equal(readFileSync(join(installRoot, 'fixture-version.txt'), 'utf8').trim(), 'second');
-    assert.equal(readFileSync(join(installRoot, '.local-data/preserved.txt'), 'utf8').trim(), 'local state');
-    assert.equal(readFileSync(join(installRoot, '.env'), 'utf8').trim(), 'SECRET=preserved');
-    assert.equal(readFileSync(join(installRoot, 'logs/preserved.log'), 'utf8').trim(), 'log');
 
     const unsafeRoot = join(directory, 'unrelated');
     mkdirSync(unsafeRoot);
