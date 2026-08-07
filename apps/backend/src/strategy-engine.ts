@@ -1312,20 +1312,29 @@ export class StrategyEngine {
     const takerLeg = makerLegKey === 'left' ? legs.right : legs.left;
     const pair = this.freshMarketPair(legs.left.symbol, legs.right.symbol);
     if (!pair) return null;
+    const makerMarket = makerLeg.leg === 'left' ? pair.left : pair.right;
     const takerMarket = takerLeg.leg === 'left' ? pair.left : pair.right;
     const threshold = intent === 'entry' ? new Decimal(actor.config.entryBps ?? '0') : new Decimal(actor.config.takeProfitBps ?? '0');
     const factor = threshold.div(BPS);
     const tick = this.constraintsFor(makerLeg.symbol).tickSize;
-    let price: Decimal;
+    let boundary: Decimal;
     if (intent === 'entry') {
-      price = makerLeg.side === 'SELL'
+      boundary = makerLeg.side === 'SELL'
         ? roundToStep(new Decimal(takerMarket.askPrice).mul(new Decimal(1).plus(factor)), tick, 'up')
         : roundToStep(new Decimal(takerMarket.bidPrice).mul(new Decimal(1).minus(factor)), tick, 'down');
     } else {
-      price = makerLeg.side === 'BUY'
+      boundary = makerLeg.side === 'BUY'
         ? roundToStep(new Decimal(takerMarket.bidPrice).mul(new Decimal(1).plus(factor)), tick, 'down')
         : roundToStep(new Decimal(takerMarket.askPrice).div(new Decimal(1).plus(factor)), tick, 'up');
     }
+    // Join the maker venue's best queue whenever that price already satisfies the configured
+    // spread. Otherwise rest at the spread boundary. A BUY never exceeds its maximum acceptable
+    // price; a SELL never goes below its minimum acceptable price, so the POC order cannot cross
+    // the maker book merely because the economic boundary lies through the best ask/bid.
+    const makerTop = new Decimal(makerLeg.side === 'BUY' ? makerMarket.bidPrice : makerMarket.askPrice);
+    const price = makerLeg.side === 'BUY'
+      ? Decimal.min(boundary, makerTop)
+      : Decimal.max(boundary, makerTop);
     if (!price.gt(0)) return null;
     return { price, makerLeg, takerLeg };
   }
@@ -1575,15 +1584,37 @@ export class StrategyEngine {
     }
     const legs = legsOf(actor.config);
     const laggingLeg = target.lagging === 'left' ? legs.left : legs.right;
-    const side: 'BUY' | 'SELL' = target.delta.gt(0) ? 'BUY' : 'SELL';
-    const lot = this.constraintsFor(laggingLeg.symbol).lotSize;
+    let repairLeg = laggingLeg;
+    let side: 'BUY' | 'SELL' = target.delta.gt(0) ? 'BUY' : 'SELL';
+    let lot = this.constraintsFor(repairLeg.symbol).lotSize;
     // Deltas are in left-leg (ADR) units; a right-leg repair converts to venue shares first.
     const venueDelta = target.lagging === 'right' ? target.delta.abs().mul(target.k) : target.delta.abs();
-    const desiredQuantity = roundToStep(venueDelta, lot, 'down');
+    let desiredQuantity = roundToStep(venueDelta, lot, 'down');
+    let trimExcess = false;
+
+    // A partial fill can leave less residual than the lagging venue's lot/minimum size. Adding to
+    // that leg then rounds to zero and used to leave the strategy RUNNING forever. While a maker
+    // quote is still live, let later fills accumulate into an executable hedge. Once no quote can
+    // do that, reduce the overfilled leg by the residual instead. This is always reduce-only: the
+    // fallback must remove exposure, never turn a bookkeeping repair into a new position.
+    if (!desiredQuantity.gt(QUANTITY_EPSILON) || this.orderSizeError(repairLeg.symbol, desiredQuantity)) {
+      if (actor.quotes.size > 0) return;
+      repairLeg = target.lagging === 'left' ? legs.right : legs.left;
+      side = repairLeg.leg === 'left'
+        ? (exposure.left.gt(0) ? 'SELL' : 'BUY')
+        : (exposure.right.gt(0) ? 'SELL' : 'BUY');
+      lot = this.constraintsFor(repairLeg.symbol).lotSize;
+      const excessVenueDelta = repairLeg.leg === 'right'
+        ? target.delta.abs().mul(target.k)
+        : target.delta.abs();
+      desiredQuantity = roundToStep(excessVenueDelta, lot, 'down');
+      if (!desiredQuantity.gt(QUANTITY_EPSILON) || this.orderSizeError(repairLeg.symbol, desiredQuantity)) return;
+      trimExcess = true;
+    }
     const previous = this.latestLegOrderStatement.get(
       actor.id,
-      laggingLeg.leg,
-      laggingLeg.symbol,
+      repairLeg.leg,
+      repairLeg.symbol,
       side,
     ) as { state: string; quantity: string; executed_quantity: string; failure_reason: string | null } | undefined;
     // Gate's account router explicitly recommends a smaller order for this terminal rejection.
@@ -1602,17 +1633,19 @@ export class StrategyEngine {
     actor.lastRepairAt = now;
     actor.repairAttempts += 1;
     try {
-      this.runtime.addStrategyLog(actor.id, 'info', 'Hedging filled quantity', `Residual ${target.residual.toString()} ${actor.config.asset}`,
-        quantity.toString(), `${side} ${laggingLeg.symbol} market`
+      this.runtime.addStrategyLog(actor.id, 'info', trimExcess ? 'Trimming residual imbalance' : 'Hedging filled quantity',
+        `Residual ${target.residual.toString()} ${actor.config.asset}`,
+        quantity.toString(), `${side} ${repairLeg.symbol} market${trimExcess ? ' · reduce-only excess trim' : ''}`
         + (quantity.lt(desiredQuantity) ? ` · split after router rejected ${previous?.quantity}` : ''));
-      const order = await this.runtime.createOrder({ symbol: laggingLeg.symbol, side, type: 'MARKET', timeInForce: 'IOC',
-        quantity: quantity.toString(), reduceOnly: actor.config.reduceOnly },
-      { strategyId: actor.id, strategyLeg: laggingLeg.leg, riskReducing: true,
+      const order = await this.runtime.createOrder({ symbol: repairLeg.symbol, side, type: 'MARKET', timeInForce: 'IOC',
+        quantity: quantity.toString(), reduceOnly: trimExcess || actor.config.reduceOnly },
+      { strategyId: actor.id, strategyLeg: repairLeg.leg, riskReducing: true,
         ...(target.clip ? { strategyClip: target.clip } : {}) });
       const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
       if (settled.state === 'FILLED') actor.repairAttempts = 0;
       const failure = failureSummary(settled.failureReason);
-      this.runtime.addStrategyLog(actor.id, settled.state === 'FILLED' ? 'info' : 'warning', 'Hedge order settled',
+      this.runtime.addStrategyLog(actor.id, settled.state === 'FILLED' ? 'info' : 'warning',
+        trimExcess ? 'Residual trim settled' : 'Hedge order settled',
         `Residual ${target.residual.toString()}`, `${settled.executedQuantity}/${settled.quantity}`,
         `${settled.state} · ${failure ?? `avg ${settled.executedAveragePrice ?? '—'}`}`);
     } catch (error) {
