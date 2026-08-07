@@ -17,7 +17,6 @@ import {
   type OrderBookSnapshot,
   type PrivateStreamStatus,
   type PublicTrade,
-  type StrategyConfig,
   type StrategyRecord,
   type TerminalStreamHandle,
   type TradingMode,
@@ -25,7 +24,7 @@ import {
   type VenueFeeRate,
 } from './api.js';
 import { parseStoredFavorites } from './local-preferences.js';
-import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute } from './frontend-routes.js';
+import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute, type StrategyRouteKind } from './frontend-routes.js';
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
 import type { FundingMetric, PairedPositionPrefill } from './route-shared.js';
 import brandMark from './assets/brand-mark.svg';
@@ -33,6 +32,7 @@ import brandMark from './assets/brand-mark.svg';
 const TradingView = lazy(() => import('./trade-route.js').then((module) => ({ default: module.TradingView })));
 const StrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.StrategyView })));
 const PremiumStrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.PremiumStrategyView })));
+const BorosStrategyView = lazy(() => import('./boros-route.js').then((module) => ({ default: module.BorosStrategyView })));
 const FundingDetailView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingDetailView })));
 const FundingRatesView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingRatesView })));
 const PortfolioView = lazy(() => import('./portfolio-route.js').then((module) => ({ default: module.PortfolioView })));
@@ -40,14 +40,16 @@ const SOURCE_CODE_URL = 'https://github.com/your-quantguy/gate-crossex';
 const LICENSE_URL = `${SOURCE_CODE_URL}/blob/main/LICENSE`;
 
 type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio';
-type StrategyKind = StrategyConfig['kind'];
+type NavigationLabel = Workspace | 'Boros by Pendle';
+type StrategyKind = StrategyRouteKind;
 type FundingHistoryDuration = 1 | 7 | 30;
 type FundingHistoryCache = Record<FundingHistoryDuration, Record<string, FundingHistoryEntry>>;
 
-const navItems: { label: Workspace; glyph: string }[] = [
+const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Trade', glyph: '⌁' },
   { label: 'Strategy', glyph: '⇄' },
   { label: 'Funding Rates', glyph: '%' },
+  { label: 'Boros by Pendle', glyph: '◐' },
   { label: 'Portfolio', glyph: '◒' },
 ];
 
@@ -306,6 +308,7 @@ function App() {
   const [strategies, setStrategies] = useState<StrategyRecord[]>([]);
   const [balances, setBalances] = useState<Record<string, LiveBalance>>({});
   const [fees, setFees] = useState<VenueFeeRate[]>([]);
+  const [feesReady, setFeesReady] = useState(false);
   const [tradingMode, setTradingMode] = useState<TradingMode | null>(null);
   const [modeDialogOpen, setModeDialogOpen] = useState(false);
   const [connection, setConnection] = useState<CredentialConnectionStatus | null>(null);
@@ -488,7 +491,10 @@ function App() {
     void refreshStrategies().catch(reportBackendConnectivityError);
     void api.tradingMode().then((response) => setTradingMode(response.mode)).catch(reportBackendConnectivityError);
     void api.connection().then(setConnection).catch(reportBackendConnectivityError);
-    void api.fees().then((response) => setFees(response.fees)).catch(reportBackendConnectivityError);
+    void api.fees()
+      .then((response) => setFees(response.fees))
+      .catch(reportBackendConnectivityError)
+      .finally(() => setFeesReady(true));
     const handle = connectTerminalStream((message) => {
       if (message.type === 'market.snapshot') setMarketSnapshot((current) => {
         if (!current) return message.payload;
@@ -743,16 +749,18 @@ function App() {
 
   const content = useMemo(() => {
     if (workspace === 'Trade') return <TradingView asset={selectedAsset} catalog={availableCatalog} onSelectAsset={selectAsset} marketSnapshot={marketSnapshot} tradingSnapshot={tradingSnapshot} authenticatedPortfolio={authenticatedPortfolio} balances={balances} fees={fees} orderBook={orderBook} publicTrades={publicTrades} candleSeries={candleSeries} candleBackfilling={candleBackfilling} watchMarket={watchMarket} seedCandles={seedCandles} onTradingChanged={refreshTrading} onPositionsRefresh={refreshPositions} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} favorites={favorites} onToggleFavorite={toggleFavorite} confirmOrders={confirmOrders} onSetConfirmOrders={setConfirmOrders} />;
-    if (workspace === 'Strategy') return strategyKind === 'premium'
-      ? <PremiumStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />
-      : <StrategyView mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
+    if (workspace === 'Strategy') {
+      if (strategyKind === 'premium') return <PremiumStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
+      if (strategyKind === 'boros') return <BorosStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} balances={balances} fees={fees} feesReady={feesReady} strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
+      return <StrategyView mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
+    }
     if (workspace === 'Funding Rates') return fundingDetailAsset
       ? <FundingDetailView asset={fundingDetailAsset} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
     if (workspace === 'Portfolio') return <PortfolioView tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshPositions, refreshMarketSnapshot, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshPositions, refreshMarketSnapshot, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -788,7 +796,7 @@ function App() {
       </button>
       <nav aria-label={t('Main navigation')}>{navItems.map((item) => item.label === 'Strategy'
         ? <div className="nav-strategy" key={item.label} ref={strategyNavRef}>
-          <button ref={strategyTriggerRef} className={`${workspace === 'Strategy' ? 'active' : ''}${strategyMenuAt ? ' menu-open' : ''}`}
+          <button ref={strategyTriggerRef} className={`${workspace === 'Strategy' && strategyKind !== 'boros' ? 'active' : ''}${strategyMenuAt ? ' menu-open' : ''}`}
             aria-haspopup="menu" aria-expanded={strategyMenuAt !== null}
             onClick={(event) => { if (strategyMenuAt) setStrategyMenuAt(null); else openStrategyMenu(event.currentTarget); }}
             onKeyDown={(event) => {
@@ -810,9 +818,11 @@ function App() {
             </li>)}
           </ul>}
         </div>
-        : <button key={item.label} className={workspace === item.label ? 'active' : ''} onClick={() => {
+        : <button key={item.label} className={item.label === 'Boros by Pendle' ? workspace === 'Strategy' && strategyKind === 'boros' ? 'active' : '' : workspace === item.label ? 'active' : ''} onClick={() => {
           navigate(item.label === 'Trade'
             ? { workspace: 'Trade' }
+            : item.label === 'Boros by Pendle'
+              ? { workspace: 'Strategy', strategyKind: 'boros' }
             : item.label === 'Funding Rates'
               ? { workspace: 'Funding Rates', asset: null }
               : { workspace: 'Portfolio' });

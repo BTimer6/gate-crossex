@@ -14,6 +14,8 @@ import { z } from 'zod';
 import { PublicMarketDataError, type PublicMarketDataGateway } from '@gate-crossex/public-data';
 import { reconcilePortfolioSnapshots, stalePortfolioReconciliation } from '@gate-crossex/domain';
 import {
+  BorosUpstreamMarketFeesResponseSchema,
+  BorosUpstreamStrategiesResponseSchema,
   CrossExTransferAccountSchema,
   CrossExTransferRequestSchema,
   canonicalizeCrossExTransfer,
@@ -22,6 +24,7 @@ import {
   type UserPreferencesResponse,
 } from '@gate-crossex/shared-types';
 import type {
+  BorosStrategiesResponse,
   CandleInterval,
   CandleSeriesResponse,
   CredentialConnectionStatus,
@@ -106,6 +109,9 @@ const STREAM_STATUS_INTERVAL_MS = 20_000;
 const MAX_STREAM_TRADE_BATCH = 80;
 const MARKET_CATALOG_FRESH_MS = 30 * 60_000;
 const PUBLIC_SNAPSHOT_FRESH_MS = 4_000;
+const BOROS_STRATEGIES_URL = 'https://api-boros.pendle.finance/apis/v1/strategies';
+const BOROS_MARKETS_URL = 'https://api-boros.pendle.finance/apis/v1/markets/by-ids';
+const BOROS_STRATEGIES_CACHE_MS = 30_000;
 
 const CATALOG_VENUES = ['GATE', 'BINANCE', 'OKX', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT'] as const;
 const QUOTE_PREFERENCE = ['USDT', 'USDC', 'USD'] as const;
@@ -200,6 +206,36 @@ export interface BuildAppOptions {
   startMarketStream?: boolean;
   logger?: boolean;
   rateLimitMax?: number;
+  /** Test seam for the fixed, public Boros strategy endpoint. */
+  borosStrategyFetcher?: () => Promise<unknown>;
+  /** Test seam for the public Boros market fee configuration endpoint. */
+  borosMarketFeeFetcher?: (marketIds: number[]) => Promise<unknown>;
+}
+
+async function fetchBorosStrategyPayload(): Promise<unknown> {
+  const response = await fetch(BOROS_STRATEGIES_URL, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Boros strategies returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function fetchBorosMarketFeePayload(marketIds: number[]): Promise<unknown> {
+  const url = new URL(BOROS_MARKETS_URL);
+  url.searchParams.set('marketIds', marketIds.join(','));
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Boros markets returned HTTP ${response.status}`);
+  return response.json();
+}
+
+function fixedX18Rate(value: string): number {
+  const rate = Number(value) / 1e18;
+  if (!Number.isFinite(rate) || rate < 0) throw new Error('Invalid Boros fixed-point fee rate');
+  return rate;
 }
 
 function noControlCharacters(value: string): boolean {
@@ -482,6 +518,50 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   let transferCoinFetchInFlight: Promise<{ items: CrossExTransferCoinsResponse['items']; fetchedAt: string }> | null = null;
   let sizeUnitCache: { units: Record<string, string>; fetchedAt: string; complete: boolean; marketCount: number } | null = null;
   let sizeUnitInFlight: Promise<void> | null = null;
+  let borosStrategyCache: BorosStrategiesResponse | null = null;
+  let borosStrategyFetchInFlight: Promise<BorosStrategiesResponse> | null = null;
+  const loadBorosStrategies = (): Promise<BorosStrategiesResponse> => {
+    if (borosStrategyCache && Date.now() - Date.parse(borosStrategyCache.fetchedAt) < BOROS_STRATEGIES_CACHE_MS) {
+      return Promise.resolve(borosStrategyCache);
+    }
+    borosStrategyFetchInFlight ??= (async () => {
+      const payload = await (options.borosStrategyFetcher ?? fetchBorosStrategyPayload)();
+      const parsed = BorosUpstreamStrategiesResponseSchema.parse(payload);
+      let strategies = parsed.strategies;
+      if (options.borosMarketFeeFetcher || !options.borosStrategyFetcher) {
+        try {
+          const marketIds = [...new Set(strategies.flatMap((strategy) => [strategy.longMarket.marketId, strategy.shortMarket.marketId]))];
+          const feePayload = await (options.borosMarketFeeFetcher ?? fetchBorosMarketFeePayload)(marketIds);
+          const marketFees = BorosUpstreamMarketFeesResponseSchema.parse(feePayload);
+          const feeByMarket = new Map(marketFees.results.map((market) => [market.marketId, {
+            takerFeeRate: fixedX18Rate(market.config.takerFee),
+            settleFeeRate: fixedX18Rate(market.extConfig.settleFeeRate),
+            initialMarginFactor: fixedX18Rate(market.config.kIM),
+            marginRateFloor: market.imData.marginFloor,
+            marginTimeFloorSeconds: market.config.tThresh,
+            timeToMaturitySeconds: market.data.timeToMaturity,
+          }]));
+          strategies = strategies.map((strategy) => ({
+            ...strategy,
+            longMarket: { ...strategy.longMarket, ...feeByMarket.get(strategy.longMarket.marketId) },
+            shortMarket: { ...strategy.shortMarket, ...feeByMarket.get(strategy.shortMarket.marketId) },
+          }));
+        } catch (error) {
+          app.log.warn({ reason: error instanceof Error ? error.message : 'invalid_response' }, 'Boros market fee enrichment failed');
+        }
+      }
+      const refreshed: BorosStrategiesResponse = {
+        ...parsed,
+        strategies,
+        fetchedAt: new Date().toISOString(),
+        cacheStatus: 'fresh',
+        source: 'boros_open_api',
+      };
+      borosStrategyCache = refreshed;
+      return refreshed;
+    })().finally(() => { borosStrategyFetchInFlight = null; });
+    return borosStrategyFetchInFlight;
+  };
   const selectableStorageProviders = credentialVault.availableProviders.filter(
     (provider): provider is SelectableCredentialStorageProvider => provider === 'os_keychain' || provider === 'env_file',
   );
@@ -704,6 +784,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     app.get('/strategies/paired-position', sendFrontend);
     app.get('/strategies/price-difference', sendFrontend);
     app.get('/strategies/sk-hynix-premium', sendFrontend);
+    app.get('/strategies/boros', sendFrontend);
   }
 
   const candleStore = new CandleStore(database, marketHub, publicMarketGateway, {
@@ -982,6 +1063,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   app.get('/api/markets', async () => marketHub.snapshot());
+
+  app.get('/api/boros/strategies', {
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store, max-age=0');
+    try {
+      return await loadBorosStrategies();
+    } catch (error) {
+      request.log.warn({ reason: error instanceof z.ZodError ? 'INVALID_BOROS_RESPONSE' : 'BOROS_UNAVAILABLE' }, 'Boros strategy refresh failed');
+      if (borosStrategyCache) return { ...borosStrategyCache, cacheStatus: 'stale' as const };
+      return reply.code(502).send({ error: 'boros_strategies_unavailable' });
+    }
+  });
 
   app.get('/api/trading/snapshot', async () => tradingRuntime.snapshot());
 

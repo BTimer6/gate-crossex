@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AuthenticatedPortfolioSnapshot, LiveBalance } from './api.js';
-import { assessMarginCapacity, balanceFor, balanceUnitFor } from './route-shared.js';
+import { assessMarginCapacity, balanceFor, balanceUnitFor, classifyLeverageMargin } from './route-shared.js';
 
 function portfolio(accountMode: string, availableMargin: string): AuthenticatedPortfolioSnapshot {
   return {
@@ -55,5 +55,24 @@ describe('CrossEx margin capacity', () => {
       { venue: 'DERIBIT', required: 50, available: 100 },
       { venue: 'BYBIT', required: 200, available: 500 },
     ])).toEqual({ known: true, insufficient: true });
+  });
+
+  it('separates a higher-leverage requirement from insufficient capital at maximum leverage', () => {
+    expect(classifyLeverageMargin(
+      { known: true, insufficient: true },
+      { known: true, insufficient: false },
+      200,
+    )).toBe('higher_leverage_required');
+    expect(classifyLeverageMargin(
+      { known: true, insufficient: true },
+      { known: true, insufficient: true },
+      200,
+    )).toBe('insufficient_at_max');
+    expect(classifyLeverageMargin(
+      { known: true, insufficient: false },
+      { known: true, insufficient: false },
+      200,
+    )).toBe('sufficient');
+    expect(classifyLeverageMargin(null, { known: true, insufficient: false }, 200)).toBe('unknown');
   });
 });

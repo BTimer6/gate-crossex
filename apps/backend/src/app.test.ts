@@ -337,7 +337,14 @@ interface TestContext {
 
 const resources: TestContext[] = [];
 
-async function createTestApp(options: { liveTradingEnabled?: boolean; marketHub?: CrossExMarketHub; startMarketStream?: boolean; directory?: string } = {}): Promise<TestContext> {
+async function createTestApp(options: {
+  liveTradingEnabled?: boolean;
+  marketHub?: CrossExMarketHub;
+  startMarketStream?: boolean;
+  directory?: string;
+  borosStrategyFetcher?: () => Promise<unknown>;
+  borosMarketFeeFetcher?: (marketIds: number[]) => Promise<unknown>;
+} = {}): Promise<TestContext> {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
@@ -361,6 +368,8 @@ async function createTestApp(options: { liveTradingEnabled?: boolean; marketHub?
     tradingSession,
     marketHub: options.marketHub,
     startMarketStream: options.startMarketStream,
+    borosStrategyFetcher: options.borosStrategyFetcher,
+    borosMarketFeeFetcher: options.borosMarketFeeFetcher,
     logger: false,
   });
   const context = { app, database, vault, gateway, publicMarketGateway, tradingSession, directory };
@@ -382,6 +391,54 @@ function catalogSymbol(symbol: string, venue: string): GateCrossExSymbol {
     min_size: '0.001', min_notional: '5', lot_size: '0.001', tick_size: '0.01',
     max_num_orders: '100', max_market_size: '120', max_limit_size: '1000', contract_size: null,
     liquidation_fee: '0.0125', default_leverage: '3', delist_time: '0',
+  };
+}
+
+function borosStrategyFixture() {
+  const longMarket = {
+    marketId: 185,
+    address: '0x6bb121533f78d8d0c8a847b0ab399e0399966563',
+    tokenId: 2,
+    name: 'ETHUSDT',
+    assetSymbol: 'ETH',
+    maturity: 1790294400,
+    state: 'Normal',
+    impliedApr: 0.0225,
+    maxLeverage: 2.1,
+    maxPerpLeverage: 100,
+    ammId: 0,
+    platformName: 'OKX',
+  };
+  return {
+    strategies: [{
+      id: 'ETH-2-1790294400-OKX-Hyperliquid',
+      longMarket,
+      shortMarket: {
+        ...longMarket,
+        marketId: 102,
+        address: '0xd035309b604d6e252d29ce1d61e9a1e0a0553918',
+        name: 'ETHUSDC',
+        impliedApr: 0.0628,
+        platformName: 'Hyperliquid',
+      },
+      daysToMaturity: 50,
+      impliedAprSpread: 0.0403,
+      maxPerpLeverage: 10,
+      aprTimesMaxLeverage: 0.1487,
+    }],
+    totalCount: 1,
+  };
+}
+
+function borosMarketFeesFixture() {
+  return {
+    results: [185, 102].map((marketId) => ({
+      marketId,
+      imData: { marginFloor: 0.06 },
+      config: { takerFee: '500000000000000', kIM: '476190476190476190', tThresh: 864000 },
+      extConfig: { settleFeeRate: '1000000000000000' },
+      data: { timeToMaturity: 4_204_800 },
+    })),
   };
 }
 
@@ -427,6 +484,42 @@ describe('local backend', () => {
         browserJavaScriptHandlesSecrets: false,
       },
     });
+  });
+
+  it('proxies, validates, and briefly caches public Boros strategies', async () => {
+    const borosStrategyFetcher = vi.fn(async () => borosStrategyFixture());
+    const borosMarketFeeFetcher = vi.fn(async () => borosMarketFeesFixture());
+    const { app } = await createTestApp({ borosStrategyFetcher, borosMarketFeeFetcher });
+    const request = { method: 'GET' as const, url: '/api/boros/strategies', headers: { host: '127.0.0.1:17840' } };
+
+    const first = await app.inject(request);
+    const second = await app.inject(request);
+
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({
+      strategies: [{
+        id: 'ETH-2-1790294400-OKX-Hyperliquid',
+        longMarket: { platformName: 'OKX', takerFeeRate: 0.0005, settleFeeRate: 0.001, initialMarginFactor: 0.47619047619047616, marginRateFloor: 0.06, marginTimeFloorSeconds: 864000, timeToMaturitySeconds: 4204800 },
+        shortMarket: { platformName: 'Hyperliquid', takerFeeRate: 0.0005, settleFeeRate: 0.001, initialMarginFactor: 0.47619047619047616, marginRateFloor: 0.06, marginTimeFloorSeconds: 864000, timeToMaturitySeconds: 4204800 },
+      }],
+      totalCount: 1,
+      cacheStatus: 'fresh',
+      source: 'boros_open_api',
+    });
+    expect(first.json().fetchedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(second.json().fetchedAt).toBe(first.json().fetchedAt);
+    expect(borosStrategyFetcher).toHaveBeenCalledTimes(1);
+    expect(borosMarketFeeFetcher).toHaveBeenCalledTimes(1);
+    expect(borosMarketFeeFetcher).toHaveBeenCalledWith([185, 102]);
+  });
+
+  it('does not pass malformed Boros data through the local trust boundary', async () => {
+    const { app } = await createTestApp({ borosStrategyFetcher: async () => ({ strategies: [{ id: 'bad' }], totalCount: 1 }) });
+    const response = await app.inject({
+      method: 'GET', url: '/api/boros/strategies', headers: { host: '127.0.0.1:17840' },
+    });
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toEqual({ error: 'boros_strategies_unavailable' });
   });
 
   it('keeps live order submission locked unless explicitly enabled', async () => {

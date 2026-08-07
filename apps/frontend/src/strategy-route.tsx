@@ -125,7 +125,7 @@ function strategyStartTime(createdAt: string, language: Language): { date: strin
   };
 }
 
-function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tradingSnapshot, onStrategiesChanged, onPositionsRefresh }: {
+export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tradingSnapshot, onStrategiesChanged, onPositionsRefresh }: {
   strategies: StrategyRecord[];
   authenticatedPortfolio: AuthenticatedPortfolioSnapshot | null;
   tradingSnapshot: TradingSnapshot | null;
