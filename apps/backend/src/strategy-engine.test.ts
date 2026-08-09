@@ -243,6 +243,24 @@ function ingestFill(runtime: TradingRuntime, remoteId: string, symbol: string, s
   } });
 }
 
+function seedFilledStrategyOrder(
+  database: Database.Database,
+  strategyId: string,
+  id: string,
+  symbol: string,
+  side: 'BUY' | 'SELL',
+  quantity: string,
+  leg: 'left' | 'right',
+): void {
+  const now = new Date().toISOString();
+  database.prepare(`INSERT INTO execution_orders (
+    id, client_order_id, environment, symbol, venue, side, order_type, time_in_force,
+    quantity, price, reduce_only, state, executed_quantity, executed_average_price,
+    created_at, updated_at, strategy_id, strategy_leg
+  ) VALUES (?, ?, 'live', ?, ?, ?, 'MARKET', 'IOC', ?, NULL, 0, 'FILLED', ?, '54', ?, ?, ?, ?)`)
+    .run(id, `${id}-client`, symbol, symbol.split('_')[0], side, quantity, quantity, now, now, strategyId, leg);
+}
+
 afterEach(async () => {
   for (const harness of harnesses.splice(0)) {
     await harness.engine.stop();
@@ -323,6 +341,19 @@ describe('strategy engine', () => {
 
     await expect(engine.startStrategy({ ...takerTakerConfig, totalAmount: '0.15' })).rejects.toMatchObject({
       code: 'strategy_order_below_minimum_size',
+    });
+  });
+
+  it('rejects a configured clip below the instrument minimum notional', async () => {
+    const { engine, database, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '54.2', '54.3');
+    markets.set('OKX_FUTURE_BTC_USDT', '54', '54.1');
+    database.prepare("UPDATE crossex_instruments SET min_size = '0.01', min_notional = '5', lot_size = '0.01' WHERE symbol LIKE '%_FUTURE_BTC_USDT'").run();
+
+    await expect(engine.startStrategy({
+      ...takerTakerConfig, totalAmount: '0.09', perOrderQuantity: '0.09',
+    })).rejects.toMatchObject({
+      code: 'strategy_order_below_minimum_notional', statusCode: 400,
     });
   });
 
@@ -607,7 +638,7 @@ describe('strategy engine', () => {
     });
   });
 
-  it('trims an overfilled maker leg when the residual is below the lagging venue lot size', async () => {
+  it('carries an untradeable maker residual into the next clip before the target is complete', async () => {
     const { engine, runtime, database, gateway, markets } = await createHarness();
     markets.set('BINANCE_FUTURE_BTC_USDT', '100000', '100001');
     markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
@@ -632,23 +663,130 @@ describe('strategy engine', () => {
     ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
     await waitFor(() => runtime.getStrategy(record.id).filledQuantity === '0.1');
 
-    // Do not trim while the maker can still accumulate another executable 0.1. Once it closes,
-    // the next reconciliation pass removes the unhedgeable 0.03 from the excess leg.
+    // Once the partial maker quote closes, keep the 0.03 residual for the next normal clip. The
+    // excess maker leg quotes only 0.07, after which the coarse taker leg can execute a full 0.1.
     ackOrder(runtime, 'remote-1', 'CANCELLED', '0.13', '99900');
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+    const carryTick = engine.tick();
     await waitFor(() => gateway.createdOrders.length === 3);
     expect(gateway.createdOrders[2]).toMatchObject({
-      symbol: 'OKX_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.03', reduce_only: 'true',
+      symbol: 'OKX_FUTURE_BTC_USDT', side: 'BUY', type: 'LIMIT', time_in_force: 'POC', qty: '0.07', reduce_only: 'false',
     });
-    ackOrder(runtime, 'remote-3', 'FILLED', '0.03', '99900');
-    await waitFor(() => runtime.getStrategy(record.id).filledRight === '0.1');
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.07', '99900');
+    await waitFor(() => gateway.createdOrders.length === 4);
+    expect(gateway.createdOrders[3]).toMatchObject({
+      symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.1', reduce_only: 'false',
+    });
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100000');
+    await carryTick;
+    await waitFor(() => runtime.getStrategy(record.id).status === 'COMPLETED');
 
     expect(runtime.getStrategy(record.id)).toMatchObject({
-      status: 'RUNNING', filledLeft: '0.1', filledRight: '0.1', filledQuantity: '0.1', progress: 50,
+      status: 'COMPLETED', filledLeft: '0.2', filledRight: '0.2', filledQuantity: '0.2', progress: 100,
+    });
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Trimming residual imbalance')).toBe(false);
+  });
+
+  it('absorbs a sub-min-notional residual in the next maker-taker clip before 100%', async () => {
+    const { engine, runtime, database, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '54.2', '54.3');
+    markets.set('OKX_FUTURE_BTC_USDT', '54', '54.1');
+    database.prepare("UPDATE crossex_instruments SET min_size = '0.01', min_notional = '5', lot_size = '0.01' WHERE symbol LIKE '%_FUTURE_BTC_USDT'").run();
+    const record = await engine.startStrategy({
+      ...takerTakerConfig, totalAmount: '2', perOrderQuantity: '1',
+      executionMethod: 'MAKER_TAKER', makerLeg: 'right',
+    });
+    seedFilledStrategyOrder(database, record.id, 'carry-left', 'BINANCE_FUTURE_BTC_USDT', 'SELL', '1', 'left');
+    seedFilledStrategyOrder(database, record.id, 'carry-right', 'OKX_FUTURE_BTC_USDT', 'BUY', '1.03', 'right');
+
+    // Progress is below 100%, so do not top up or submit the invalid 0.03 repair. The excess
+    // maker leg absorbs it by quoting 0.97 in the next configured 1.00 clip.
+    await engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]).toMatchObject({
+      symbol: 'OKX_FUTURE_BTC_USDT', side: 'BUY', type: 'LIMIT', time_in_force: 'POC',
+      qty: '0.97', reduce_only: 'false',
+    });
+
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.97', '54.05');
+    await waitFor(() => gateway.createdOrders.length === 2);
+    expect(gateway.createdOrders[1]).toMatchObject({
+      symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '1', reduce_only: 'false',
+    });
+    ackOrder(runtime, 'remote-2', 'FILLED', '1', '54.2');
+    await waitFor(() => runtime.getStrategy(record.id).status === 'COMPLETED');
+
+    expect(runtime.getStrategy(record.id)).toMatchObject({
+      progress: 100, filledLeft: '2', filledRight: '2', filledQuantity: '2',
+    });
+    expect(gateway.createdOrders.some((order) => order.qty === '0.03')).toBe(false);
+  });
+
+  it('tops up and exactly trims a sub-min-notional residual only after reaching 100%', async () => {
+    const { engine, runtime, database, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '54.2', '54.3');
+    markets.set('OKX_FUTURE_BTC_USDT', '54', '54.1');
+    database.prepare("UPDATE crossex_instruments SET min_size = '0.01', min_notional = '5', lot_size = '0.01' WHERE symbol LIKE '%_FUTURE_BTC_USDT'").run();
+    const record = await engine.startStrategy({
+      ...takerTakerConfig, totalAmount: '1', perOrderQuantity: '1',
+      executionMethod: 'MAKER_TAKER', makerLeg: 'right',
+    });
+    seedFilledStrategyOrder(database, record.id, 'terminal-left', 'BINANCE_FUTURE_BTC_USDT', 'SELL', '1', 'left');
+    seedFilledStrategyOrder(database, record.id, 'terminal-right', 'OKX_FUTURE_BTC_USDT', 'BUY', '1.03', 'right');
+
+    const repairTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]).toMatchObject({
+      symbol: 'OKX_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET', qty: '0.11', reduce_only: 'false',
+    });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.11', '54.1');
+
+    await waitFor(() => gateway.createdOrders.length === 2);
+    expect(gateway.createdOrders[1]).toMatchObject({
+      symbol: 'OKX_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.14', reduce_only: 'true',
+    });
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.14', '54');
+    await repairTick;
+    await waitFor(() => runtime.getStrategy(record.id).status === 'COMPLETED');
+
+    expect(runtime.getStrategy(record.id)).toMatchObject({
+      progress: 100, filledLeft: '1', filledRight: '1', filledQuantity: '1',
     });
     expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ event: 'Trimming residual imbalance', result: expect.stringContaining('reduce-only excess trim') }),
-      expect.objectContaining({ event: 'Residual trim settled' }),
+      expect.objectContaining({ event: 'Padding terminal residual', quantity: '0.11 BTC' }),
+      expect.objectContaining({ event: 'Trimming padded residual', quantity: '0.14 BTC' }),
+      expect.objectContaining({ event: 'Padded residual trim settled' }),
     ]));
+  });
+
+  it('retries the enlarged reduce-only trim without padding twice after a close failure', async () => {
+    const { engine, runtime, database, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '54.2', '54.3');
+    markets.set('OKX_FUTURE_BTC_USDT', '54', '54.1');
+    database.prepare("UPDATE crossex_instruments SET min_size = '0.01', min_notional = '5', lot_size = '0.01' WHERE symbol LIKE '%_FUTURE_BTC_USDT'").run();
+    const record = await engine.startStrategy({
+      ...takerTakerConfig, totalAmount: '1', perOrderQuantity: '1',
+      executionMethod: 'MAKER_TAKER', makerLeg: 'right',
+    });
+    seedFilledStrategyOrder(database, record.id, 'retry-left', 'BINANCE_FUTURE_BTC_USDT', 'SELL', '1', 'left');
+    seedFilledStrategyOrder(database, record.id, 'retry-right', 'OKX_FUTURE_BTC_USDT', 'BUY', '1.03', 'right');
+
+    const firstRepair = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 1);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.11', '54.1');
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-2', 'FAIL', '0', '0', 'TEMPORARY_CLOSE_REJECTION');
+    await firstRepair;
+
+    const retry = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 3);
+    expect(gateway.createdOrders[2]).toMatchObject({
+      symbol: 'OKX_FUTURE_BTC_USDT', side: 'SELL', type: 'MARKET', qty: '0.14', reduce_only: 'true',
+    });
+    expect(gateway.createdOrders.filter((order) => order.side === 'BUY')).toHaveLength(1);
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.14', '54');
+    await retry;
+    await waitFor(() => runtime.getStrategy(record.id).status === 'COMPLETED');
   });
 
   it('completes a full position after trimming a persisted terminal-fill residual', async () => {

@@ -83,6 +83,7 @@ interface InstrumentConstraints {
   tickSize: string | null;
   lotSize: string | null;
   minSize: string | null;
+  minNotional: string | null;
 }
 
 const ZERO = new Decimal(0);
@@ -91,6 +92,8 @@ const QUANTITY_EPSILON = new Decimal('1e-12');
 /** Tolerance for rung arithmetic on decimal quantities; far below any real lot size. */
 const RUNG_EPSILON = new Decimal('1e-9');
 const BPS = new Decimal(10_000);
+/** Keep dust-repair orders clear of a moving venue's exact minimum-notional boundary. */
+const MIN_NOTIONAL_REPAIR_BUFFER = new Decimal('1.1');
 
 function symbolFor(venue: string, asset: string): string {
   const quote = venue === 'KRAKEN' ? 'USD' : venue === 'HYPERLIQUID' || venue === 'DERIBIT' ? 'USDC' : 'USDT';
@@ -262,7 +265,7 @@ export class StrategyEngine {
     this.openStrategyOrderIdsStatement = database.prepare(`SELECT id FROM execution_orders
       WHERE strategy_id = ? AND state IN ('PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED')`);
     this.instrumentConstraintsStatement = database.prepare(
-      'SELECT tick_size, lot_size, min_size FROM crossex_instruments WHERE symbol = ?',
+      'SELECT tick_size, lot_size, min_size, min_notional FROM crossex_instruments WHERE symbol = ?',
     );
     this.latestLegOrderStatement = database.prepare(`SELECT state, quantity, executed_quantity, failure_reason
       FROM execution_orders
@@ -770,18 +773,20 @@ export class StrategyEngine {
       tick_size: string;
       lot_size: string;
       min_size: string;
+      min_notional: string | null;
     } | undefined;
     const value: InstrumentConstraints = {
       tickSize: row?.tick_size ?? null,
       lotSize: row?.lot_size ?? null,
       minSize: row?.min_size ?? null,
+      minNotional: row?.min_notional ?? null,
     };
     // Do not cache a miss: the catalog may be fetched immediately after a startup/API preflight.
     if (row) this.constraintCache.set(symbol, { value, cachedAt: this.options.now() });
     return value;
   }
 
-  private orderSizeError(symbol: string, quantity: Decimal): StrategyEngineError | null {
+  private orderSizeError(symbol: string, quantity: Decimal, price?: Decimal): StrategyEngineError | null {
     const constraints = this.constraintsFor(symbol);
     if (!constraints.minSize || !constraints.lotSize) {
       return new StrategyEngineError('strategy_instrument_constraints_unavailable', 409, symbol);
@@ -802,7 +807,37 @@ export class StrategyEngine {
         `${symbol}: ${quantity.toString()} must be a multiple of ${constraints.lotSize}`,
       );
     }
+    if (price && constraints.minNotional) {
+      const minimumNotional = new Decimal(constraints.minNotional);
+      const notional = quantity.mul(price);
+      if (minimumNotional.gt(0) && notional.lt(minimumNotional)) {
+        return new StrategyEngineError(
+          'strategy_order_below_minimum_notional',
+          400,
+          `${symbol}: ${notional.toString()} < ${constraints.minNotional}`,
+        );
+      }
+    }
     return null;
+  }
+
+  private executablePrice(symbol: string, side: 'BUY' | 'SELL'): Decimal | null {
+    const market = this.freshMarket(symbol);
+    if (!market) return null;
+    const price = new Decimal(side === 'BUY' ? market.askPrice : market.bidPrice);
+    return price.gt(0) ? price : null;
+  }
+
+  private marketOrderSizeError(
+    symbol: string,
+    side: 'BUY' | 'SELL',
+    quantity: Decimal,
+  ): StrategyEngineError | null {
+    const price = this.executablePrice(symbol, side);
+    if (!price && this.constraintsFor(symbol).minNotional) {
+      return new StrategyEngineError('strategy_market_data_unavailable', 409, symbol);
+    }
+    return this.orderSizeError(symbol, quantity, price ?? undefined);
   }
 
   /**
@@ -833,13 +868,13 @@ export class StrategyEngine {
     }
 
     for (const leftQuantity of leftClips) {
-      const leftError = this.orderSizeError(legs.left.symbol, leftQuantity);
+      const leftError = this.marketOrderSizeError(legs.left.symbol, legs.left.side, leftQuantity);
       if (leftError) throw leftError;
       const rightRaw = equalNotionalRatio
         ? leftQuantity.mul(equalNotionalRatio)
         : leftQuantity.div(adrRatioOf(config));
       const rightQuantity = roundToStep(rightRaw, this.constraintsFor(legs.right.symbol).lotSize, 'down');
-      const rightError = this.orderSizeError(legs.right.symbol, rightQuantity);
+      const rightError = this.marketOrderSizeError(legs.right.symbol, legs.right.side, rightQuantity);
       if (rightError) throw rightError;
     }
   }
@@ -1193,6 +1228,27 @@ export class StrategyEngine {
     return Decimal.max(ZERO, target.minus(matched).minus(inFlight));
   }
 
+  /**
+   * A sub-minimum maker-taker residual can be absorbed by the next normal clip. When the maker
+   * leg is already the excess leg, reduce its next quote by that residual; the taker repair then
+   * remains one full configured clip. When the taker leg is excess, leave the maker clip whole
+   * and the subsequent hedge naturally shrinks by the residual instead.
+   */
+  private carryAdjustedMakerQuantity(
+    actor: StrategyActor,
+    exposure: { left: Decimal; right: Decimal },
+    quantity: Decimal,
+  ): Decimal {
+    if (actor.kind !== 'position') return quantity;
+    const imbalance = exposure.left.plus(exposure.right);
+    if (imbalance.abs().lte(QUANTITY_EPSILON)) return quantity;
+    const legs = legsOf(actor.config);
+    const makerLeg = (actor.config.makerLeg ?? 'left') === 'left' ? legs.left : legs.right;
+    const makerDirection = makerLeg.side === 'BUY' ? ONE : ONE.neg();
+    if (imbalance.mul(makerDirection).lte(QUANTITY_EPSILON)) return quantity;
+    return Decimal.max(ZERO, quantity.minus(imbalance.abs()));
+  }
+
   private async evaluateTakerClip(actor: StrategyActor): Promise<void> {
     const entry = this.entrySpreadBps(actor.config);
     const exposure = this.legExposures(actor.id, actor.config);
@@ -1235,8 +1291,8 @@ export class StrategyEngine {
     // equal-notional clips (entry: priced hedge, exit: proportional unwind).
     const rightRaw = rightQuantityOverride ?? quantity.div(adrRatioOf(actor.config));
     const rightQuantity = roundToStep(rightRaw, this.constraintsFor(legs.right.symbol).lotSize, 'down');
-    const sizeError = this.orderSizeError(legs.left.symbol, quantity)
-      ?? this.orderSizeError(legs.right.symbol, rightQuantity);
+    const sizeError = this.marketOrderSizeError(legs.left.symbol, legs.left.side, quantity)
+      ?? this.marketOrderSizeError(legs.right.symbol, legs.right.side, rightQuantity);
     if (sizeError) {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
@@ -1345,7 +1401,10 @@ export class StrategyEngine {
     const perOrder = new Decimal(actor.config.perOrderQuantity);
     const intents: Array<{ intent: QuoteIntent; quantity: Decimal }> = [];
     const entryCapacity = this.remainingEntryCapacity(actor, exposure);
-    if (entryCapacity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: Decimal.min(perOrder, entryCapacity) });
+    if (entryCapacity.gt(QUANTITY_EPSILON)) {
+      const entryQuantity = this.carryAdjustedMakerQuantity(actor, exposure, Decimal.min(perOrder, entryCapacity));
+      if (entryQuantity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: entryQuantity });
+    }
     if (actor.kind === 'auto' && actor.config.takeProfitBps && matched.gt(QUANTITY_EPSILON)) {
       intents.push({ intent: 'exit', quantity: Decimal.min(perOrder, matched) });
     }
@@ -1389,7 +1448,7 @@ export class StrategyEngine {
     if (now - actor.lastQuoteAt < this.options.requoteIntervalMs / 2) return;
     const lot = this.constraintsFor(desired.makerLeg.symbol).lotSize;
     const roundedQuantity = roundToStep(quantity, lot, 'down');
-    const sizeError = this.orderSizeError(desired.makerLeg.symbol, roundedQuantity);
+    const sizeError = this.orderSizeError(desired.makerLeg.symbol, roundedQuantity, desired.price);
     if (sizeError) {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
@@ -1548,10 +1607,114 @@ export class StrategyEngine {
   }
 
   /**
-   * Keep the two legs hedged: whenever executed quantities diverge beyond the smallest tradable
-   * step, immediately send a taker order on the lagging leg for the difference. This is the
-   * acknowledgement-aware guarantee that no maker fill is ever left unhedged.
+   * Keep the two legs hedged. Executable differences are repaired immediately; maker-taker dust
+   * below venue constraints is carried into the next clip until the configured target is full,
+   * when the excess leg is reduced without increasing the strategy's completed hedge.
    */
+  private terminalPaddingQuantity(
+    symbol: string,
+    paddingSide: 'BUY' | 'SELL',
+    trimSide: 'BUY' | 'SELL',
+    residual: Decimal,
+  ): Decimal | null {
+    const constraints = this.constraintsFor(symbol);
+    if (!constraints.minNotional || !constraints.lotSize || !constraints.minSize) return null;
+    const minimumNotional = new Decimal(constraints.minNotional);
+    const paddingPrice = this.executablePrice(symbol, paddingSide);
+    const trimPrice = this.executablePrice(symbol, trimSide);
+    if (!minimumNotional.gt(0) || !paddingPrice || !trimPrice) return null;
+    const bufferedNotional = minimumNotional.mul(MIN_NOTIONAL_REPAIR_BUFFER);
+    const minimumSize = new Decimal(constraints.minSize);
+    const paddingForOpen = bufferedNotional.div(paddingPrice);
+    const paddingForTrim = Decimal.max(ZERO, bufferedNotional.div(trimPrice).minus(residual));
+    const padding = roundToStep(
+      Decimal.max(minimumSize, paddingForOpen, paddingForTrim),
+      constraints.lotSize,
+      'up',
+    );
+    const trimQuantity = padding.plus(residual);
+    if (this.marketOrderSizeError(symbol, paddingSide, padding)
+      || this.marketOrderSizeError(symbol, trimSide, trimQuantity)) return null;
+    return padding;
+  }
+
+  private async executeTerminalTopUpAndTrim(
+    actor: StrategyActor,
+    repairLeg: LegDefinition,
+    trimSide: 'BUY' | 'SELL',
+    residual: Decimal,
+    clip: string,
+  ): Promise<boolean> {
+    const paddingSide = oppositeSide(trimSide);
+    const paddingQuantity = this.terminalPaddingQuantity(
+      repairLeg.symbol,
+      paddingSide,
+      trimSide,
+      residual,
+    );
+    if (!paddingQuantity) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Residual top-up unavailable',
+        `Terminal residual ${residual.toString()} ${actor.config.asset}`, residual.toString(),
+        'Fresh prices or complete min-notional constraints unavailable');
+      return false;
+    }
+
+    this.runtime.addStrategyLog(actor.id, 'info', 'Padding terminal residual',
+      `Target filled; residual ${residual.toString()} ${actor.config.asset}`,
+      `${paddingQuantity.toString()} ${actor.config.asset}`,
+      `${paddingSide} ${repairLeg.symbol} market · 10% min-notional buffer`);
+    const paddingOrder = await this.runtime.createOrder({
+      symbol: repairLeg.symbol,
+      side: paddingSide,
+      type: 'MARKET',
+      timeInForce: 'IOC',
+      quantity: paddingQuantity.toString(),
+      reduceOnly: false,
+    }, { strategyId: actor.id, strategyLeg: repairLeg.leg, strategyClip: clip });
+    const settledPadding = await this.runtime.awaitTerminalOrder(paddingOrder.id, this.options.orderTimeoutMs);
+    const padded = new Decimal(settledPadding.executedQuantity || '0');
+    this.runtime.addStrategyLog(actor.id, padded.gt(QUANTITY_EPSILON) ? 'info' : 'warning', 'Residual padding settled',
+      `Terminal residual ${residual.toString()}`, `${settledPadding.executedQuantity}/${settledPadding.quantity}`,
+      `${settledPadding.state} · ${failureSummary(settledPadding.failureReason) ?? `avg ${settledPadding.executedAveragePrice ?? '—'}`}`);
+    if (!padded.gt(QUANTITY_EPSILON)) return false;
+
+    const constraints = this.constraintsFor(repairLeg.symbol);
+    const exactTrim = padded.plus(residual);
+    const trimQuantity = roundToStep(exactTrim, constraints.lotSize, 'down');
+    if (!trimQuantity.eq(exactTrim)) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Residual trim deferred',
+        `Terminal residual ${residual.toString()}`, trimQuantity.toString(),
+        `Exact trim ${exactTrim.toString()} is not aligned to ${constraints.lotSize ?? 'unknown'} lot size`);
+      return false;
+    }
+    const trimError = this.marketOrderSizeError(repairLeg.symbol, trimSide, trimQuantity);
+    if (trimError) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Residual trim deferred',
+        `Terminal residual ${residual.toString()}`, trimQuantity.toString(), trimError.label ?? trimError.code);
+      return false;
+    }
+
+    this.runtime.addStrategyLog(actor.id, 'info', 'Trimming padded residual',
+      `Padding ${padded.toString()} + residual ${residual.toString()}`,
+      `${trimQuantity.toString()} ${actor.config.asset}`,
+      `${trimSide} ${repairLeg.symbol} market · reduce-only exact trim`);
+    const trimOrder = await this.runtime.createOrder({
+      symbol: repairLeg.symbol,
+      side: trimSide,
+      type: 'MARKET',
+      timeInForce: 'IOC',
+      quantity: trimQuantity.toString(),
+      reduceOnly: true,
+    }, { strategyId: actor.id, strategyLeg: repairLeg.leg, strategyClip: clip, riskReducing: true });
+    const settledTrim = await this.runtime.awaitTerminalOrder(trimOrder.id, this.options.orderTimeoutMs);
+    const complete = settledTrim.state === 'FILLED'
+      && new Decimal(settledTrim.executedQuantity || '0').gte(trimQuantity.minus(QUANTITY_EPSILON));
+    this.runtime.addStrategyLog(actor.id, complete ? 'info' : 'warning', 'Padded residual trim settled',
+      `Terminal residual ${residual.toString()}`, `${settledTrim.executedQuantity}/${settledTrim.quantity}`,
+      `${settledTrim.state} · ${failureSummary(settledTrim.failureReason) ?? `avg ${settledTrim.executedAveragePrice ?? '—'}`}`);
+    return complete;
+  }
+
   private async ensureHedged(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): Promise<void> {
     if (actor.busy || (actor.status !== 'RUNNING' && !actor.suspended)) return;
     // One repair target per pass: for equal-notional the oldest broken clip (each clip has its
@@ -1583,34 +1746,57 @@ export class StrategyEngine {
       return;
     }
     const legs = legsOf(actor.config);
-    const laggingLeg = target.lagging === 'left' ? legs.left : legs.right;
-    let repairLeg = laggingLeg;
-    let side: 'BUY' | 'SELL' = target.delta.gt(0) ? 'BUY' : 'SELL';
+    const completedTarget = actor.kind === 'position' && this.matchedQuantity(exposure)
+      .gte(this.strategyTarget(actor.config).minus(QUANTITY_EPSILON));
+    if (completedTarget && actor.quotes.size > 0) return;
+    let trimExcess = completedTarget;
+    let repairLeg = trimExcess
+      ? (target.lagging === 'left' ? legs.right : legs.left)
+      : (target.lagging === 'left' ? legs.left : legs.right);
+    let side: 'BUY' | 'SELL' = trimExcess
+      ? (repairLeg.leg === 'left'
+          ? (exposure.left.gt(0) ? 'SELL' : 'BUY')
+          : (exposure.right.gt(0) ? 'SELL' : 'BUY'))
+      : (target.delta.gt(0) ? 'BUY' : 'SELL');
     let lot = this.constraintsFor(repairLeg.symbol).lotSize;
-    // Deltas are in left-leg (ADR) units; a right-leg repair converts to venue shares first.
-    const venueDelta = target.lagging === 'right' ? target.delta.abs().mul(target.k) : target.delta.abs();
-    let desiredQuantity = roundToStep(venueDelta, lot, 'down');
-    let trimExcess = false;
+    const venueDeltaFor = (leg: LegDefinition): Decimal => leg.leg === 'right'
+      ? target.delta.abs().mul(target.k)
+      : target.delta.abs();
+    let desiredQuantity = roundToStep(venueDeltaFor(repairLeg), lot, 'down');
+    let sizeError = desiredQuantity.gt(QUANTITY_EPSILON)
+      ? this.marketOrderSizeError(repairLeg.symbol, side, desiredQuantity)
+      : new StrategyEngineError('strategy_order_below_minimum_size', 400, repairLeg.symbol);
 
-    // A partial fill can leave less residual than the lagging venue's lot/minimum size. Adding to
-    // that leg then rounds to zero and used to leave the strategy RUNNING forever. While a maker
-    // quote is still live, let later fills accumulate into an executable hedge. Once no quote can
-    // do that, reduce the overfilled leg by the residual instead. This is always reduce-only: the
-    // fallback must remove exposure, never turn a bookkeeping repair into a new position.
-    if (!desiredQuantity.gt(QUANTITY_EPSILON) || this.orderSizeError(repairLeg.symbol, desiredQuantity)) {
+    // Before the target is full, do not manufacture extra volume for dust. A maker-taker strategy
+    // carries this residual into its next quote; that next normal fill makes the opposite hedge
+    // executable (for example 0.97 after a prior 0.03 overfill in a 1.00-HYPE clip).
+    if (sizeError && !completedTarget && actor.kind === 'position'
+      && actor.config.executionMethod === 'MAKER_TAKER') return;
+
+    // Non-maker strategies cannot carry dust through a resting quote. Preserve the old safe
+    // fallback for them: trim the excess leg directly when that exact quantity is executable.
+    if (sizeError && !completedTarget) {
       if (actor.quotes.size > 0) return;
       repairLeg = target.lagging === 'left' ? legs.right : legs.left;
       side = repairLeg.leg === 'left'
         ? (exposure.left.gt(0) ? 'SELL' : 'BUY')
         : (exposure.right.gt(0) ? 'SELL' : 'BUY');
       lot = this.constraintsFor(repairLeg.symbol).lotSize;
-      const excessVenueDelta = repairLeg.leg === 'right'
-        ? target.delta.abs().mul(target.k)
-        : target.delta.abs();
-      desiredQuantity = roundToStep(excessVenueDelta, lot, 'down');
-      if (!desiredQuantity.gt(QUANTITY_EPSILON) || this.orderSizeError(repairLeg.symbol, desiredQuantity)) return;
+      desiredQuantity = roundToStep(venueDeltaFor(repairLeg), lot, 'down');
+      sizeError = desiredQuantity.gt(QUANTITY_EPSILON)
+        ? this.marketOrderSizeError(repairLeg.symbol, side, desiredQuantity)
+        : new StrategyEngineError('strategy_order_below_minimum_size', 400, repairLeg.symbol);
+      if (sizeError) return;
       trimExcess = true;
     }
+    if (completedTarget && sizeError?.code === 'strategy_order_below_minimum_notional'
+      && actor.config.reduceOnly) {
+      await this.pause(actor, 'Terminal residual is below minimum notional and cannot be padded in reduce-only mode');
+      return;
+    }
+    const topUpRequired = completedTarget
+      && sizeError?.code === 'strategy_order_below_minimum_notional';
+    if (sizeError && !topUpRequired) return;
     const previous = this.latestLegOrderStatement.get(
       actor.id,
       repairLeg.leg,
@@ -1633,21 +1819,28 @@ export class StrategyEngine {
     actor.lastRepairAt = now;
     actor.repairAttempts += 1;
     try {
-      this.runtime.addStrategyLog(actor.id, 'info', trimExcess ? 'Trimming residual imbalance' : 'Hedging filled quantity',
-        `Residual ${target.residual.toString()} ${actor.config.asset}`,
-        quantity.toString(), `${side} ${repairLeg.symbol} market${trimExcess ? ' · reduce-only excess trim' : ''}`
-        + (quantity.lt(desiredQuantity) ? ` · split after router rejected ${previous?.quantity}` : ''));
-      const order = await this.runtime.createOrder({ symbol: repairLeg.symbol, side, type: 'MARKET', timeInForce: 'IOC',
-        quantity: quantity.toString(), reduceOnly: trimExcess || actor.config.reduceOnly },
-      { strategyId: actor.id, strategyLeg: repairLeg.leg, riskReducing: true,
-        ...(target.clip ? { strategyClip: target.clip } : {}) });
-      const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
-      if (settled.state === 'FILLED') actor.repairAttempts = 0;
-      const failure = failureSummary(settled.failureReason);
-      this.runtime.addStrategyLog(actor.id, settled.state === 'FILLED' ? 'info' : 'warning',
-        trimExcess ? 'Residual trim settled' : 'Hedge order settled',
-        `Residual ${target.residual.toString()}`, `${settled.executedQuantity}/${settled.quantity}`,
-        `${settled.state} · ${failure ?? `avg ${settled.executedAveragePrice ?? '—'}`}`);
+      if (topUpRequired) {
+        const dustClip = `dust-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+        if (await this.executeTerminalTopUpAndTrim(actor, repairLeg, side, desiredQuantity, dustClip)) {
+          actor.repairAttempts = 0;
+        }
+      } else {
+        this.runtime.addStrategyLog(actor.id, 'info', trimExcess ? 'Trimming residual imbalance' : 'Hedging filled quantity',
+          `Residual ${target.residual.toString()} ${actor.config.asset}`,
+          quantity.toString(), `${side} ${repairLeg.symbol} market${trimExcess ? ' · reduce-only excess trim' : ''}`
+          + (quantity.lt(desiredQuantity) ? ` · split after router rejected ${previous?.quantity}` : ''));
+        const order = await this.runtime.createOrder({ symbol: repairLeg.symbol, side, type: 'MARKET', timeInForce: 'IOC',
+          quantity: quantity.toString(), reduceOnly: trimExcess || actor.config.reduceOnly },
+        { strategyId: actor.id, strategyLeg: repairLeg.leg, riskReducing: true,
+          ...(target.clip ? { strategyClip: target.clip } : {}) });
+        const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
+        if (settled.state === 'FILLED') actor.repairAttempts = 0;
+        const failure = failureSummary(settled.failureReason);
+        this.runtime.addStrategyLog(actor.id, settled.state === 'FILLED' ? 'info' : 'warning',
+          trimExcess ? 'Residual trim settled' : 'Hedge order settled',
+          `Residual ${target.residual.toString()}`, `${settled.executedQuantity}/${settled.quantity}`,
+          `${settled.state} · ${failure ?? `avg ${settled.executedAveragePrice ?? '—'}`}`);
+      }
     } catch (error) {
       this.runtime.addStrategyLog(actor.id, 'warning', 'Hedge order failed', `Residual ${target.residual.toString()}`,
         quantity.toString(), error instanceof Error ? error.message.slice(0, 120) : 'submit error');
