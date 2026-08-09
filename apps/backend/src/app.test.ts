@@ -260,11 +260,11 @@ class FakePublicMarketGateway implements PublicMarketDataGateway {
     this.fundingStatsQueryCount += 1;
     if (this.failFundingStats) throw new PublicMarketDataError('NETWORK_ERROR');
     if (venue === 'BINANCE') return [{
-      venue, base: 'BTC', quote: 'USDT', fundingRate8h: '0.0001', nextFundingAt: '2026-07-11T08:00:00.000Z',
+      venue, base: 'BTC', quote: 'USDT', fundingRate: '0.0001', fundingIntervalHours: 8, fundingRate8h: '0.0001', nextFundingAt: '2026-07-11T08:00:00.000Z',
       openInterestValue: null, lastPrice: '50010', change24h: '-0.01',
     }];
     if (venue === 'GATE') return [{
-      venue, base: 'BTC', quote: 'USDT', fundingRate8h: '0.00013', nextFundingAt: null,
+      venue, base: 'BTC', quote: 'USDT', fundingRate: '0.00001625', fundingIntervalHours: 1, fundingRate8h: '0.00013', nextFundingAt: null,
       openInterestValue: '2500000', lastPrice: '50000', change24h: '0.0125',
     }];
     return [];
@@ -1359,10 +1359,10 @@ describe('local backend', () => {
     expect(body.cacheStatus).toBe('fresh');
     const btc = body.assets.find((entry) => entry.asset === 'BTC');
     expect(btc?.venues.find((venue) => venue.venue === 'GATE')).toMatchObject({
-      fundingRate: '0.00013', openInterestValue: '2500000', lastPrice: '50000', change24h: '0.0125',
+      fundingRate: '0.00001625', fundingIntervalHours: 1, fundingRate8h: '0.00013', openInterestValue: '2500000', lastPrice: '50000', change24h: '0.0125',
     });
     expect(btc?.venues.find((venue) => venue.venue === 'BINANCE')).toMatchObject({
-      fundingRate: '0.0001', openInterestValue: null, lastPrice: '50010', change24h: '-0.01',
+      fundingRate: '0.0001', fundingIntervalHours: 8, fundingRate8h: '0.0001', openInterestValue: null, lastPrice: '50010', change24h: '-0.01',
     });
     // Catalog pairs without venue stats still appear so the page can render the full universe.
     expect(body.assets.find((entry) => entry.asset === 'ZETA')?.venues[0]).toMatchObject({

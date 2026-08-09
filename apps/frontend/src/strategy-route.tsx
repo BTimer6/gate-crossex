@@ -18,6 +18,7 @@ import {
 } from './api.js';
 import type { FundingChartSeries } from './charts.js';
 import { cumulativeFundingHistory, cumulativeFundingPnl } from './cumulative-funding-history.js';
+import { fundingPercentScaledTo8h } from './funding-rates.js';
 import { marketSymbol } from './market-symbol.js';
 import { usePairCandleHistory } from './pair-candle-history.js';
 import { assessMarketPairFreshness, candleTailIsFresh, candleTimestampIsFresh } from './market-freshness.js';
@@ -438,13 +439,14 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     const fallbackNumber = Number(fallback);
     return Number.isFinite(fallbackNumber) && fallbackNumber > 0 ? fallbackNumber : 0;
   };
-  const liveFunding = (primary: string | undefined, fallback: string | null | undefined) => {
+  const liveFunding8h = (primary: string | undefined, intervalHours: number | null | undefined, fallback8h: string | null | undefined) => {
     if (primary !== undefined && primary.trim() !== '') {
       const primaryNumber = Number(primary);
-      if (Number.isFinite(primaryNumber)) return primaryNumber * 100;
+      const normalized = fundingPercentScaledTo8h(Number.isFinite(primaryNumber) ? primaryNumber * 100 : null, intervalHours ?? null);
+      if (normalized !== null) return normalized;
     }
-    if (fallback !== null && fallback !== undefined && fallback.trim() !== '') {
-      const fallbackNumber = Number(fallback);
+    if (fallback8h !== null && fallback8h !== undefined && fallback8h.trim() !== '') {
+      const fallbackNumber = Number(fallback8h);
       if (Number.isFinite(fallbackNumber)) return fallbackNumber * 100;
     }
     return null;
@@ -478,13 +480,15 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     : priceDifferenceHistoryStatus === 'failed'
       ? t('Price-difference history unavailable')
       : t('No overlapping candles for this venue pair.');
-  const leftFunding = liveFunding(
+  const leftFunding = liveFunding8h(
     leftLive?.source === 'gate_crossex_websocket' ? leftLive.fundingRate : undefined,
-    leftOverview?.fundingRate,
+    leftOverview?.fundingIntervalHours,
+    leftOverview?.fundingRate8h,
   );
-  const rightFunding = liveFunding(
+  const rightFunding = liveFunding8h(
     rightLive?.source === 'gate_crossex_websocket' ? rightLive.fundingRate : undefined,
-    rightOverview?.fundingRate,
+    rightOverview?.fundingIntervalHours,
+    rightOverview?.fundingRate8h,
   );
   const fundingEdge = leftFunding !== null && rightFunding !== null
     ? Math.abs(leftFunding - rightFunding)

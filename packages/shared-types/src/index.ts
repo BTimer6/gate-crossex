@@ -502,8 +502,12 @@ export const FundingOverviewVenueEntrySchema = z.object({
   venue: z.string(),
   symbol: z.string(),
   quote: z.string(),
-  /** 8h-equivalent funding fraction (venues on 1h/4h cycles are scaled); null when the venue reported nothing. */
+  /** Native fraction charged or paid at one venue funding interval. */
   fundingRate: z.string().nullable(),
+  /** Native funding interval in hours; null when the venue row is unavailable. */
+  fundingIntervalHours: z.number().positive().max(24).nullable(),
+  /** 8h-equivalent fraction used for cross-venue comparisons. */
+  fundingRate8h: z.string().nullable(),
   nextFundingAt: z.string().nullable(),
   /** Open interest in USD; null when the venue publishes no bulk OI (BINANCE) or the row is missing. */
   openInterestValue: z.string().nullable(),

@@ -574,6 +574,12 @@ test.describe.serial('local trading terminal', () => {
     const fundingControlOrder = await page.locator('.funding-card').evaluate((card) =>
       [...card.children].slice(0, 3).map((child) => child.className));
     expect(fundingControlOrder).toEqual(['exchange-filter', 'oi-filter', 'funding-toolbar']);
+    await expect(page.getByRole('columnheader', { name: /Average rate 8h equivalent/ })).toBeVisible();
+    const hypeRow = page.locator('.funding-clickable-row').filter({ hasText: 'HYPE' });
+    await expect(hypeRow.getByText('next payment · 1h', { exact: true })).toBeVisible();
+    await expect(hypeRow.getByText('next payment · 8h', { exact: true })).toBeVisible();
+    await expect(hypeRow.locator('.funding-row-arrow')).toHaveCount(0);
+    await expect(hypeRow.getByText('next payment · 1h', { exact: true })).toHaveCSS('white-space', 'nowrap');
     const toolbarGap = await page.locator('.funding-toolbar').evaluate((toolbar) => {
       const [search, periods] = [...toolbar.children].map((child) => child.getBoundingClientRect());
       return periods.left - search.right;
