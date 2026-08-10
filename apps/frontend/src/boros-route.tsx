@@ -1016,7 +1016,7 @@ export function BorosStrategyView({
         </aside>
       </section>
     </>}
-    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
+    <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
     {confirmingExecution && selected && symbols && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => { if (!launching) setConfirmingExecution(false); }}>
       <section ref={confirmDialogRef} tabIndex={-1} className="confirm-order-modal boros-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="boros-confirm-execution-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>

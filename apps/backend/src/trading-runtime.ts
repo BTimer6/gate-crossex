@@ -60,7 +60,23 @@ export const CreateStrategyInputSchema = z.object({
   reduceOnly: z.boolean().default(false),
   executionMethod: z.enum(['TAKER_TAKER', 'MAKER_TAKER']),
   makerLeg: z.enum(['left', 'right']).optional(),
+  closePlan: z.object({
+    orderCount: z.number().int().min(2).max(100),
+    intervalSeconds: z.number().int().min(1).max(86_400),
+    targets: z.array(z.object({
+      symbol: z.string().regex(/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/),
+      side: z.enum(['BUY', 'SELL']),
+      quantity: decimalText,
+      positionSide: z.enum(['NONE', 'LONG', 'SHORT']),
+    })).min(1).max(20),
+  }).optional(),
 }).superRefine((value, context) => {
+  if (value.closePlan) {
+    if (value.kind !== 'position') context.addIssue({ code: 'custom', path: ['kind'], message: 'close plans must be position strategies' });
+    if (!value.reduceOnly) context.addIssue({ code: 'custom', path: ['reduceOnly'], message: 'close plans must be reduce only' });
+    if (value.executionMethod !== 'TAKER_TAKER') context.addIssue({ code: 'custom', path: ['executionMethod'], message: 'close plans execute taker orders' });
+    return;
+  }
   // Premium legs trade two different tickers, so both may sit on the same venue.
   if (value.kind !== 'premium' && value.leftVenue === value.rightVenue) context.addIssue({ code: 'custom', path: ['rightVenue'], message: 'venues must differ' });
   if (value.leftSide === value.rightSide) context.addIssue({ code: 'custom', path: ['rightSide'], message: 'legs must have opposing sides' });
@@ -171,7 +187,7 @@ function isDefinitiveSubmitRejection(error: unknown): boolean {
 
 export interface PlaceOrderMetadata {
   strategyId: string;
-  strategyLeg: 'left' | 'right';
+  strategyLeg: 'left' | 'right' | `close-${number}`;
   /** Groups the legs of one clip (and its repairs) so per-clip hedge ratios are recoverable. */
   strategyClip?: string;
   /**
@@ -194,6 +210,7 @@ export interface StrategyMarginLeg {
   leverage: string;
   estimatedQuantity: string;
   estimatedPrice: string;
+  positionSide?: 'NONE' | 'LONG' | 'SHORT';
 }
 
 export interface StrategyMarginPreflight {
@@ -393,7 +410,8 @@ export class TradingRuntime {
     }
 
     const invalid = legs.find((leg) => {
-      const position = positions.find((candidate) => candidate.symbol === leg.symbol);
+      const position = positions.find((candidate) => candidate.symbol === leg.symbol
+        && (!leg.positionSide || leg.positionSide === 'NONE' || candidate.position_side.toUpperCase() === leg.positionSide));
       if (!position) return true;
       const raw = new Decimal(position.position_qty || '0').abs();
       const existing = position.position_side.toUpperCase() === 'SHORT' ? raw.negated()

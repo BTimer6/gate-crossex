@@ -40,6 +40,7 @@ const PortfolioView = lazy(() => import('./portfolio-route.js').then((module) =>
 const FeeComparisonView = lazy(() => import('./fee-comparison-route.js').then((module) => ({ default: module.FeeComparisonView })));
 const SOURCE_CODE_URL = 'https://github.com/your-quantguy/gate-crossex';
 const LICENSE_URL = `${SOURCE_CODE_URL}/blob/main/LICENSE`;
+const RELEASE_VERSION = `v${import.meta.env.VITE_APP_VERSION}`;
 
 type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
 type NavigationLabel = Workspace | 'Boros by Pendle';
@@ -974,7 +975,7 @@ function App() {
         {content}
       </Suspense>
     </main>
-    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><span>UTC {clock}</span><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><button onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API</button></div></footer>
+    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><span>UTC {clock}</span><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span></div></footer>
     {tradingMode !== null && (tradingMode === 'unset' || modeDialogOpen) && <TradingModeGate
       mode={tradingMode}
       credentialEntryPath={connection?.secureEntryPath ?? '/secure/credentials'}

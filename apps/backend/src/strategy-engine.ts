@@ -70,6 +70,8 @@ interface StrategyActor {
   suspended: boolean;
   quiesceTarget: 'PAUSED' | 'STOPPED' | null;
   quiesceReason: string | null;
+  createdAt: number;
+  lastCloseAt: number;
 }
 
 interface LegDefinition {
@@ -129,6 +131,7 @@ function oppositeSide(side: 'BUY' | 'SELL'): 'BUY' | 'SELL' {
 
 interface StrategyOrderRow {
   leg: string | null;
+  symbol: string;
   side: 'BUY' | 'SELL';
   quantity: string;
   executed_quantity: string;
@@ -260,7 +263,7 @@ export class StrategyEngine {
       repairCooldownMs: options.repairCooldownMs ?? 3_000,
       now: options.now ?? Date.now,
     };
-    this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, side, quantity, executed_quantity, strategy_clip, reduce_only
+    this.strategyOrderRowsStatement = database.prepare(`SELECT strategy_leg AS leg, symbol, side, quantity, executed_quantity, strategy_clip, reduce_only
       FROM execution_orders WHERE strategy_id = ? ORDER BY created_at ASC, rowid ASC`);
     this.openStrategyOrderIdsStatement = database.prepare(`SELECT id FROM execution_orders
       WHERE strategy_id = ? AND state IN ('PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED')`);
@@ -389,15 +392,34 @@ export class StrategyEngine {
     if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
     const running = this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING');
     if (running.length >= 10) throw new StrategyEngineError('too_many_running_strategies', 409);
-    const legs = legsOf(input);
-    for (const leg of [legs.left, legs.right]) {
-      if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
-        throw new StrategyEngineError('unknown_strategy_market', 400);
+    let marginPreflight = { requiredMargin: '0', availableMargin: '0' };
+    if (input.closePlan) {
+      for (const target of input.closePlan.targets) {
+        if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
+          throw new StrategyEngineError('unknown_strategy_market', 400);
+        }
       }
+      this.validateClosePlanOrderSizes(input);
+      await this.runtime.prepareReduceOnlyStrategy(input.closePlan.targets.map((target) => ({
+        symbol: target.symbol,
+        venue: target.symbol.split('_', 1)[0] ?? '',
+        side: target.side,
+        leverage: '1',
+        estimatedQuantity: target.quantity,
+        estimatedPrice: '0',
+        positionSide: target.positionSide,
+      })));
+    } else {
+      const legs = legsOf(input);
+      for (const leg of [legs.left, legs.right]) {
+        if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
+          throw new StrategyEngineError('unknown_strategy_market', 400);
+        }
+      }
+      this.validateStrategyOrderSizes(input, legs);
+      marginPreflight = await this.prepareStrategy(input, legs);
     }
-    this.validateStrategyOrderSizes(input, legs);
-    const marginPreflight = await this.prepareStrategy(input, legs);
-    const prefix = input.kind === 'auto' ? 'AUTO' : input.kind === 'premium' ? 'PREM' : 'PAIR';
+    const prefix = input.closePlan ? 'CLOSE' : input.kind === 'auto' ? 'AUTO' : input.kind === 'premium' ? 'PREM' : 'PAIR';
     const id = `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
@@ -405,7 +427,9 @@ export class StrategyEngine {
       VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, NULL)`).run(id, input.kind, JSON.stringify(input), now, now);
     const shortPremium = input.leftSide === 'SELL';
     const hedgeModeLabel = input.hedgeMode === 'EQUAL_NOTIONAL' ? 'equal-notional hedge' : 'share-ratio hedge';
-    const startCondition = input.kind === 'premium'
+    const startCondition = input.closePlan
+      ? `${input.closePlan.orderCount} reduce-only slices · ${input.closePlan.intervalSeconds}s interval`
+      : input.kind === 'premium'
       ? input.grid
         ? `Grid ${input.gridLevels} × ${input.gridStepPct}% from ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
         : input.reduceOnly
@@ -414,8 +438,11 @@ export class StrategyEngine {
       : input.kind === 'auto'
         ? `Enter ≥ ${input.entryBps} bps · exit ≤ ${input.takeProfitBps} bps`
         : `Enter ≥ ${input.entryBps} bps`;
-    this.runtime.addStrategyLog(id, 'info', 'Strategy started', startCondition, `${input.perOrderQuantity} ${input.asset}`,
-      input.reduceOnly
+    this.runtime.addStrategyLog(id, 'info', 'Strategy started', startCondition,
+      input.closePlan ? `${input.closePlan.targets.length} position${input.closePlan.targets.length === 1 ? '' : 's'}` : `${input.perOrderQuantity} ${input.asset}`,
+      input.closePlan
+        ? 'Timed reduce-only close · existing positions validated before scheduling'
+        : input.reduceOnly
         ? 'Reduce-only mode · existing positions validated on both legs'
         : `Leverage ${input.leftLeverage}× / ${input.rightLeverage}× · reserved margin ${marginPreflight.requiredMargin} of ${marginPreflight.availableMargin}`);
     const record = this.runtime.getStrategy(id);
@@ -529,7 +556,8 @@ export class StrategyEngine {
       id: record.id, config: record.config, kind: record.kind, status: record.status,
       busy: false, queue: Promise.resolve(), quotes: new Map(), repairAttempts: 0,
       lastRepairAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
-      suspended, quiesceTarget: null, quiesceReason: null,
+      suspended, quiesceTarget: null, quiesceReason: null, createdAt: Date.parse(record.createdAt),
+      lastCloseAt: Date.parse(record.updatedAt),
     };
     this.actors.set(record.id, actor);
     return actor;
@@ -879,6 +907,151 @@ export class StrategyEngine {
     }
   }
 
+  private closePlanSlices(config: CreateStrategyInput, targetIndex: number): Decimal[] {
+    const plan = config.closePlan;
+    if (!plan) return [];
+    const target = plan.targets[targetIndex];
+    if (!target) return [];
+    const total = new Decimal(target.quantity);
+    const lotText = this.constraintsFor(target.symbol).lotSize;
+    const base = roundToStep(total.div(plan.orderCount), lotText, 'down');
+    if (!base.gt(QUANTITY_EPSILON)) {
+      throw new StrategyEngineError('strategy_order_below_minimum_size', 400, target.symbol);
+    }
+    return Array.from({ length: plan.orderCount }, (_, index) => index === plan.orderCount - 1
+      ? total.minus(base.mul(plan.orderCount - 1))
+      : base);
+  }
+
+  private validateClosePlanOrderSizes(config: CreateStrategyInput): void {
+    const plan = config.closePlan;
+    if (!plan) return;
+    plan.targets.forEach((target, targetIndex) => {
+      for (const quantity of this.closePlanSlices(config, targetIndex)) {
+        const error = this.marketOrderSizeError(target.symbol, target.side, quantity);
+        if (error) throw error;
+      }
+    });
+  }
+
+  private closePlanSubmittedClips(actor: StrategyActor): number {
+    return new Set(this.strategyLedger(actor.id).rows
+      .map((row) => row.strategy_clip)
+      .filter((clip): clip is string => Boolean(clip?.startsWith('close-')))).size;
+  }
+
+  private closePlanExecutedQuantity(actor: StrategyActor, targetIndex: number): Decimal {
+    return this.strategyLedger(actor.id).rows
+      .filter((row) => row.leg === `close-${targetIndex}`)
+      .reduce((sum, row) => sum.plus(row.executed_quantity || '0'), ZERO);
+  }
+
+  private closePlanResiduals(actor: StrategyActor): Array<{ symbol: string; quantity: Decimal }> {
+    const plan = actor.config.closePlan;
+    if (!plan) return [];
+    return plan.targets.map((target, targetIndex) => ({
+      symbol: target.symbol,
+      quantity: Decimal.max(ZERO, new Decimal(target.quantity).minus(this.closePlanExecutedQuantity(actor, targetIndex))),
+    })).filter((target) => target.quantity.gt(QUANTITY_EPSILON));
+  }
+
+  private completeClosePlan(actor: StrategyActor): void {
+    const now = new Date().toISOString();
+    actor.status = 'COMPLETED';
+    this.database.prepare(`UPDATE execution_strategies SET status = 'COMPLETED', progress = 100,
+      stopped_at = ?, updated_at = ? WHERE id = ?`).run(now, now, actor.id);
+    this.runtime.addStrategyLog(actor.id, 'info', 'Strategy completed',
+      `${actor.config.closePlan?.orderCount ?? 0} timed close slices`, '100%', 'All reduce-only close orders filled');
+    this.actors.delete(actor.id);
+    this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
+  }
+
+  private async evaluateClosePlan(actor: StrategyActor): Promise<void> {
+    const plan = actor.config.closePlan;
+    if (!plan || actor.busy) return;
+    if (this.openStrategyOrders(actor.id, new Set()).length > 0) return;
+
+    const clipIndex = this.closePlanSubmittedClips(actor);
+    if (clipIndex >= plan.orderCount) {
+      const residuals = this.closePlanResiduals(actor);
+      if (residuals.length > 0) {
+        await this.pause(actor, `Timed close ended with residual positions: ${residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', ')}`);
+        return;
+      }
+      this.completeClosePlan(actor);
+      return;
+    }
+    const dueAt = clipIndex === 0 ? actor.createdAt : actor.lastCloseAt + plan.intervalSeconds * 1_000;
+    if (this.options.now() < dueAt) return;
+
+    const submissions = plan.targets.flatMap((target, targetIndex) => {
+      const executed = this.closePlanExecutedQuantity(actor, targetIndex);
+      const remaining = Decimal.max(ZERO, new Decimal(target.quantity).minus(executed));
+      if (!remaining.gt(QUANTITY_EPSILON)) return [];
+      const planned = this.closePlanSlices(actor.config, targetIndex)[clipIndex] ?? ZERO;
+      const quantity = clipIndex === plan.orderCount - 1 ? remaining : Decimal.min(planned, remaining);
+      if (!quantity.gt(QUANTITY_EPSILON)) return [];
+      const sizeError = this.marketOrderSizeError(target.symbol, target.side, quantity);
+      if (sizeError) throw sizeError;
+      return [{ target, targetIndex, quantity }];
+    });
+    if (submissions.length === 0) {
+      this.completeClosePlan(actor);
+      return;
+    }
+
+    actor.busy = true;
+    const clip = `close-${clipIndex}`;
+    this.runtime.addStrategyLog(actor.id, 'info', 'Timed close triggered',
+      `Slice ${clipIndex + 1}/${plan.orderCount}`, `${submissions.length} position${submissions.length === 1 ? '' : 's'}`,
+      `Submitting reduce-only market orders · next interval ${plan.intervalSeconds}s`);
+    try {
+      const results = await Promise.allSettled(submissions.map(({ target, targetIndex, quantity }) =>
+        this.runtime.createOrder({
+          symbol: target.symbol,
+          side: target.side,
+          type: 'MARKET',
+          timeInForce: 'IOC',
+          quantity: quantity.toString(),
+          reduceOnly: true,
+          positionSide: target.positionSide,
+        }, { strategyId: actor.id, strategyLeg: `close-${targetIndex}`, strategyClip: clip })));
+      const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+      const accepted = results.filter((result): result is PromiseFulfilledResult<ExecutionOrder> => result.status === 'fulfilled');
+      const settled = await Promise.all(accepted.map((result) => this.runtime.awaitTerminalOrder(result.value.id, this.options.orderTimeoutMs)));
+      const incomplete = settled.filter((order) => order.state !== 'FILLED');
+      if (rejected.length > 0 || incomplete.length > 0) {
+        const reason = rejected[0]?.reason instanceof Error
+          ? rejected[0].reason.message
+          : incomplete[0]?.failureReason ?? incomplete[0]?.state ?? 'order not filled';
+        this.runtime.addStrategyLog(actor.id, 'error', 'Timed close slice failed',
+          `Slice ${clipIndex + 1}/${plan.orderCount}`, `${settled.length}/${submissions.length} orders accepted`, String(reason).slice(0, 200));
+        await this.pause(actor, `Timed close slice ${clipIndex + 1} failed; review remaining positions`);
+        return;
+      }
+
+      const now = new Date().toISOString();
+      actor.lastCloseAt = this.options.now();
+      const progress = ((clipIndex + 1) / plan.orderCount) * 100;
+      this.database.prepare(`UPDATE execution_strategies SET progress = ?, filled_quantity = ?, updated_at = ? WHERE id = ?`)
+        .run(progress, String(clipIndex + 1), now, actor.id);
+      this.runtime.addStrategyLog(actor.id, 'info', 'Timed close slice executed',
+        `Slice ${clipIndex + 1}/${plan.orderCount}`, `${settled.length} order${settled.length === 1 ? '' : 's'}`,
+        settled.map((order) => `${order.side} ${order.symbol} ${order.executedQuantity}`).join(' · '));
+      if (clipIndex + 1 >= plan.orderCount) {
+        const residuals = this.closePlanResiduals(actor);
+        if (residuals.length > 0) {
+          await this.pause(actor, `Timed close ended with residual positions: ${residuals.map((item) => `${item.quantity.toString()} ${item.symbol}`).join(', ')}`);
+        } else {
+          this.completeClosePlan(actor);
+        }
+      }
+      else this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
+    } finally {
+      actor.busy = false;
+    }
+  }
+
   /** Maximum matched quantity the strategy may accumulate, in left-leg units. */
   private strategyTarget(config: CreateStrategyInput): Decimal {
     if (config.kind === 'position') return new Decimal(config.totalAmount ?? '0');
@@ -903,6 +1076,7 @@ export class StrategyEngine {
 
   private async afterExecutionChange(actor: StrategyActor): Promise<void> {
     if (!this.actors.has(actor.id)) return;
+    if (actor.config.closePlan) return;
     const exposure = this.legExposures(actor.id, actor.config);
     this.persist(actor, exposure);
     await this.reconcileExposure(actor, exposure);
@@ -916,6 +1090,7 @@ export class StrategyEngine {
 
   private async checkCompletion(actor: StrategyActor): Promise<void> {
     if (actor.status !== 'RUNNING') return;
+    if (actor.config.closePlan) return;
     const exposure = this.legExposures(actor.id, actor.config);
     const matched = this.matchedQuantity(exposure);
     let condition: string | null = null;
@@ -1105,6 +1280,10 @@ export class StrategyEngine {
 
   private async evaluate(actor: StrategyActor): Promise<void> {
     if (!this.actors.has(actor.id) || actor.status !== 'RUNNING' || actor.busy) return;
+    if (actor.config.closePlan) {
+      await this.evaluateClosePlan(actor);
+      return;
+    }
     const exposure = this.legExposures(actor.id, actor.config);
     await this.reconcileExposure(actor, exposure);
     await this.checkCompletion(actor);

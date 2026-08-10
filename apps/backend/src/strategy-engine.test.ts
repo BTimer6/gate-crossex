@@ -275,6 +275,99 @@ const takerTakerConfig = {
 } as const;
 
 describe('strategy engine', () => {
+  it('closes a position in the requested number of timed reduce-only slices', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, markets } = await createHarness({ now: () => now });
+    const symbol = 'BINANCE_FUTURE_BTC_USDT';
+    markets.set(symbol, '100000', '100001', new Date(now).toISOString());
+    gateway.positions = [futuresPosition(symbol, 'LONG', '0.1')];
+
+    const record = await engine.startStrategy({
+      kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'BINANCE',
+      leftSide: 'SELL', rightSide: 'BUY', totalAmount: '0.1', perOrderQuantity: '0.03',
+      reduceOnly: true, executionMethod: 'TAKER_TAKER',
+      closePlan: {
+        orderCount: 3,
+        intervalSeconds: 5,
+        targets: [{ symbol, side: 'SELL', quantity: '0.1', positionSide: 'NONE' }],
+      },
+    });
+    expect(record).toMatchObject({ status: 'RUNNING', kind: 'position', config: { closePlan: { orderCount: 3, intervalSeconds: 5 } } });
+
+    now += 100;
+    const firstTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]).toMatchObject({ symbol, side: 'SELL', qty: '0.03333333', reduce_only: 'true' });
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.03333333', '100000');
+    await firstTick;
+
+    now += 4_999;
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(1);
+
+    now += 1;
+    const secondTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    expect(gateway.createdOrders[1]?.qty).toBe('0.03333333');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.03333333', '100000');
+    await secondTick;
+
+    now += 5_000;
+    const finalTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 3);
+    expect(gateway.createdOrders[2]?.qty).toBe('0.03333334');
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.03333334', '100000');
+    await finalTick;
+
+    expect(runtime.getStrategy(record.id)).toMatchObject({ status: 'COMPLETED', progress: 100, filledQuantity: '3' });
+    expect(runtime.listOrders().filter((order) => order.strategyId === record.id).every((order) => order.reduceOnly)).toBe(true);
+  });
+
+  it('submits every Close all target together in each timed slice', async () => {
+    let now = Date.now();
+    const { engine, runtime, gateway, markets } = await createHarness({ now: () => now });
+    const longSymbol = 'BINANCE_FUTURE_BTC_USDT';
+    const shortSymbol = 'OKX_FUTURE_BTC_USDT';
+    markets.set(longSymbol, '100000', '100001', new Date(now).toISOString());
+    markets.set(shortSymbol, '99999', '100000', new Date(now).toISOString());
+    gateway.positions = [futuresPosition(longSymbol, 'LONG', '0.1'), futuresPosition(shortSymbol, 'SHORT', '0.2')];
+    const record = await engine.startStrategy({
+      kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'SELL', rightSide: 'BUY', totalAmount: '0.1', perOrderQuantity: '0.1',
+      reduceOnly: true, executionMethod: 'TAKER_TAKER',
+      closePlan: {
+        orderCount: 2,
+        intervalSeconds: 3,
+        targets: [
+          { symbol: longSymbol, side: 'SELL', quantity: '0.1', positionSide: 'NONE' },
+          { symbol: shortSymbol, side: 'BUY', quantity: '0.2', positionSide: 'NONE' },
+        ],
+      },
+    });
+
+    now += 100;
+    const firstTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    expect(gateway.createdOrders).toEqual(expect.arrayContaining([
+      expect.objectContaining({ symbol: longSymbol, side: 'SELL', qty: '0.05', reduce_only: 'true' }),
+      expect.objectContaining({ symbol: shortSymbol, side: 'BUY', qty: '0.1', reduce_only: 'true' }),
+    ]));
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.05', '100000');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
+    await firstTick;
+
+    now += 3_000;
+    const secondTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 4);
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.05', '100000');
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100000');
+    await secondTick;
+
+    expect(runtime.getStrategy(record.id)).toMatchObject({ status: 'COMPLETED', progress: 100 });
+    expect(new Set(runtime.listOrders().filter((order) => order.strategyId === record.id).map((order) => order.strategyClip)))
+      .toEqual(new Set(['close-0', 'close-1']));
+  });
+
   it('routes the canonical SKHYNIX asset through Hyperliquid native SKHX', async () => {
     const { engine, gateway, markets } = await createHarness();
     markets.set('GATE_FUTURE_SKHYNIX_USDT', '1081', '1082');
