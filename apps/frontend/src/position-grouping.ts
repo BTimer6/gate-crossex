@@ -11,4 +11,3 @@ export function positionGroupLabel(assets: readonly string[]): string {
     ? 'SKHY / SKHYNIX'
     : assets[0] ?? '';
 }
-
