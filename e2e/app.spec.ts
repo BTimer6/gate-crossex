@@ -594,6 +594,8 @@ test.describe.serial('local trading terminal', () => {
   });
 
   test('preserves the selected funding period after viewing pair details', async ({ page }) => {
+    const requestedPaths: string[] = [];
+    page.on('request', (request) => requestedPaths.push(`${request.method()} ${new URL(request.url()).pathname}`));
     await page.goto('/funding-rates');
     const riskDialog = page.getByRole('dialog', { name: 'Risk disclaimer' });
     await riskDialog.waitFor({ state: 'visible', timeout: 1_000 }).catch(() => undefined);
@@ -607,10 +609,20 @@ test.describe.serial('local trading terminal', () => {
     await expect(thirtyDays).toHaveAttribute('aria-pressed', 'true');
     await page.locator('.funding-clickable-row').first().click();
     await expect(page).toHaveURL(/\/funding-rates\/[A-Z0-9]+$/);
+    await expect(page.locator('.funding-detail-chart-wrap details.chart-data')).toHaveCount(0);
+    await expect.poll(() => requestedPaths.filter((path) => path === 'POST /api/markets/funding-history/series').length).toBe(1);
     await page.getByRole('button', { name: 'Back to funding rates' }).click();
 
     await expect(page).toHaveURL(/\/funding-rates$/);
     await expect(page.getByRole('button', { name: 'Cumulative 30d', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    expect(requestedPaths.filter((path) => path === 'GET /api/markets/funding-overview')).toHaveLength(1);
+    expect(requestedPaths).not.toEqual(expect.arrayContaining([
+      'GET /api/markets/catalog',
+      'GET /api/trading/snapshot',
+      'GET /api/strategies',
+      'GET /api/onboarding/connection',
+      'GET /api/crossex/fees',
+    ]));
   });
 
   test('opens a paired position with the funding-arbitrage pair preconfigured', async ({ page }) => {

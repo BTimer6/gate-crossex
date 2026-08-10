@@ -416,7 +416,7 @@ function App() {
     setFavorites((current) => current.includes(symbol) ? current.filter((item) => item !== symbol) : [...current, symbol]);
   }, []);
 
-  async function refreshTrading() {
+  const refreshTrading = useCallback(async () => {
     const snapshot = await api.tradingSnapshot();
     setTradingSnapshot(snapshot);
     setBalances((current) => {
@@ -424,7 +424,7 @@ function App() {
       for (const balance of snapshot.balances) next[`${balance.venue}:${balance.coin}`] = balance;
       return next;
     });
-  }
+  }, []);
   const refreshPositions = useCallback(async () => {
     setTradingSnapshot(await api.positionsSnapshot());
   }, []);
@@ -433,7 +433,9 @@ function App() {
     setAuthenticatedPortfolio(next);
     if (next.live?.stream) setAccountStream(next.live.stream);
   }
-  async function refreshStrategies() { setStrategies((await api.strategies()).strategies); }
+  const refreshStrategies = useCallback(async () => {
+    setStrategies((await api.strategies()).strategies);
+  }, []);
 
   const watchMarket = useCallback((symbol: string, interval: CandleInterval) => {
     // The trade view can request a watch before the stream handle exists; remember it for the
@@ -486,15 +488,26 @@ function App() {
   }, []);
 
   useEffect(() => {
-    void api.marketCatalog().then((response) => setCatalog(response.assets)).catch(reportBackendConnectivityError);
-    void refreshTrading().catch(reportBackendConnectivityError);
-    void refreshStrategies().catch(reportBackendConnectivityError);
     void api.tradingMode().then((response) => setTradingMode(response.mode)).catch(reportBackendConnectivityError);
-    void api.connection().then(setConnection).catch(reportBackendConnectivityError);
+  }, [reportBackendConnectivityError]);
+
+  useEffect(() => {
+    if (workspace === 'Funding Rates') return;
+    if (workspace === 'Trade' || workspace === 'Strategy') {
+      void api.marketCatalog().then((response) => setCatalog(response.assets)).catch(reportBackendConnectivityError);
+    }
+    void refreshTrading().catch(reportBackendConnectivityError);
+    if (workspace === 'Strategy') void refreshStrategies().catch(reportBackendConnectivityError);
+    if (workspace !== 'Trade' && workspace !== 'Strategy') return;
     void api.fees()
       .then((response) => setFees(response.fees))
       .catch(reportBackendConnectivityError)
       .finally(() => setFeesReady(true));
+  }, [workspace, refreshTrading, refreshStrategies, reportBackendConnectivityError]);
+
+  const terminalStreamEnabled = workspace !== 'Funding Rates';
+  useEffect(() => {
+    if (!terminalStreamEnabled) return;
     const handle = connectTerminalStream((message) => {
       if (message.type === 'market.snapshot') setMarketSnapshot((current) => {
         if (!current) return message.payload;
@@ -626,7 +639,7 @@ function App() {
       window.clearInterval(flushTimer);
     };
      
-  }, [markBackendUnavailable, reportBackendConnectivityError]);
+  }, [terminalStreamEnabled, markBackendUnavailable, reportBackendConnectivityError]);
 
   const refreshMarketSnapshot = useCallback(async () => {
     const snapshot = await api.markets();
@@ -755,12 +768,12 @@ function App() {
       return <StrategyView mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
     }
     if (workspace === 'Funding Rates') return fundingDetailAsset
-      ? <FundingDetailView asset={fundingDetailAsset} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
+      ? <FundingDetailView asset={fundingDetailAsset} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
     if (workspace === 'Portfolio') return <PortfolioView tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshPositions, refreshMarketSnapshot, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -905,7 +918,7 @@ function App() {
         {content}
       </Suspense>
     </main>
-    <footer className="statusbar"><div><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></div><div><span>UTC {clock}</span><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><button onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API</button></div></footer>
+    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><span>UTC {clock}</span><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><button onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API</button></div></footer>
     {tradingMode !== null && (tradingMode === 'unset' || modeDialogOpen) && <TradingModeGate
       mode={tradingMode}
       credentialEntryPath={connection?.secureEntryPath ?? '/secure/credentials'}

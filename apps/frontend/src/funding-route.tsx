@@ -152,6 +152,7 @@ const OI_FILTER_PRESETS = [
 ];
 const FUNDING_PAGE_SIZES = [25, 50, 100];
 const DEFAULT_MIN_AVG_OI_MILLIONS = '5';
+const FUNDING_OVERVIEW_POLL_MS = 30_000;
 
 type FundingDetailDuration = 1 | 7 | 30;
 type FundingDetailMode = 'settlement' | 'cumulative';
@@ -170,11 +171,17 @@ interface FundingDetailVenueRow {
   fetchedAt: string;
 }
 
-export function FundingDetailView({ asset, onBack }: { asset: string; onBack: () => void }) {
+export function FundingDetailView({ asset, onBack, fundingOverview, onFundingOverview }: {
+  asset: string;
+  onBack: () => void;
+  fundingOverview: FundingOverviewResponse | null;
+  onFundingOverview: (overview: FundingOverviewResponse) => void;
+}) {
   const { t, language, theme } = useLanguage();
   const [duration, setDuration] = useState<FundingDetailDuration>(30);
   const [mode, setMode] = useState<FundingDetailMode>('cumulative');
-  const [venues, setVenues] = useState<FundingOverviewVenueEntry[]>([]);
+  const [venues, setVenues] = useState<FundingOverviewVenueEntry[]>(() =>
+    fundingOverview?.assets.find((entry) => entry.asset === asset)?.venues ?? []);
   const [seriesBySymbol, setSeriesBySymbol] = useState<Record<string, FundingHistorySeriesEntry>>({});
   const [rangeFrom, setRangeFrom] = useState<number | null>(null);
   const [pending, setPending] = useState(0);
@@ -184,9 +191,20 @@ export function FundingDetailView({ asset, onBack }: { asset: string; onBack: ()
   useEffect(() => {
     let cancelled = false;
     setFailed(false);
+    const cached = fundingOverview?.assets.find((entry) => entry.asset === asset);
+    if (cached) {
+      setVenues(cached.venues);
+      return () => { cancelled = true; };
+    }
+    if (fundingOverview) {
+      setVenues([]);
+      setFailed(true);
+      return () => { cancelled = true; };
+    }
     void api.fundingOverview()
       .then((response) => {
         if (cancelled) return;
+        onFundingOverview(response);
         const selected = response.assets.find((entry) => entry.asset === asset);
         if (!selected) {
           setFailed(true);
@@ -197,7 +215,7 @@ export function FundingDetailView({ asset, onBack }: { asset: string; onBack: ()
       })
       .catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; };
-  }, [asset]);
+  }, [asset, fundingOverview, onFundingOverview]);
 
   useEffect(() => {
     if (venues.length === 0) return;
@@ -206,17 +224,15 @@ export function FundingDetailView({ asset, onBack }: { asset: string; onBack: ()
     setRangeFrom(null);
     setPending(venues.length);
     setFailed(false);
-    for (const venue of venues) {
-      void api.fundingHistorySeries([venue.symbol], duration)
-        .then((response) => {
-          if (cancelled) return;
-          const entry = response.entries[0];
-          if (entry) setSeriesBySymbol((current) => ({ ...current, [entry.symbol]: entry }));
-          setRangeFrom((current) => current === null ? response.from : Math.min(current, response.from));
-        })
-        .catch(() => { if (!cancelled) setFailed(true); })
-        .finally(() => { if (!cancelled) setPending((current) => Math.max(0, current - 1)); });
-    }
+    const symbols = [...new Set(venues.map((venue) => venue.symbol))];
+    void api.fundingHistorySeries(symbols, duration)
+      .then((response) => {
+        if (cancelled) return;
+        setSeriesBySymbol(Object.fromEntries(response.entries.map((entry) => [entry.symbol, entry])));
+        setRangeFrom(response.from);
+      })
+      .catch(() => { if (!cancelled) setFailed(true); })
+      .finally(() => { if (!cancelled) setPending(0); });
     return () => { cancelled = true; };
   }, [duration, venues]);
 
@@ -296,6 +312,7 @@ export function FundingDetailView({ asset, onBack }: { asset: string; onBack: ()
             theme={theme}
             locale={locale}
             placeholder={pending > 0 ? t('Loading venue histories…') : t('Funding history unavailable.')}
+            showDataTable={false}
           />
         </Suspense>
         <div className="funding-detail-legend">{chartSeries.map((item) => {
@@ -345,15 +362,18 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
   const [historyRefreshTick, setHistoryRefreshTick] = useState(0);
   const historySymbolsRef = useRef<string[]>([]);
   const marketFallbackRequestedRef = useRef(false);
+  const initialOverviewRef = useRef(fundingOverview);
   const sortRequestRef = useRef(0);
   const [preparingSort, setPreparingSort] = useState<FundingSortKey | null>(null);
   const [minOiMillionsText, setMinOiMillionsText] = useState(DEFAULT_MIN_AVG_OI_MILLIONS);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
-  // Poll the all-pairs overview while this page is mounted; the backend fetches nothing otherwise.
+  // Poll the all-pairs overview while this page is mounted. Returning from a detail page can reuse
+  // the parent cache until its normal refresh boundary instead of immediately requesting it again.
   useEffect(() => {
     let cancelled = false;
+    let timer: number | undefined;
     const load = () => {
       api.fundingOverview()
         .then((response) => { if (!cancelled) { onFundingOverview(response); setOverviewState('live'); } })
@@ -364,11 +384,20 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
             marketFallbackRequestedRef.current = true;
             void onMarketFallback().catch(() => undefined);
           }
+        })
+        .finally(() => {
+          if (!cancelled) timer = window.setTimeout(load, FUNDING_OVERVIEW_POLL_MS);
         });
     };
-    load();
-    const timer = window.setInterval(load, 30_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    const cachedAt = Date.parse(initialOverviewRef.current?.fetchedAt ?? '');
+    const initialDelay = Number.isFinite(cachedAt)
+      ? Math.min(FUNDING_OVERVIEW_POLL_MS, Math.max(0, FUNDING_OVERVIEW_POLL_MS - (Date.now() - cachedAt)))
+      : 0;
+    timer = window.setTimeout(load, initialDelay);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [onFundingOverview, onMarketFallback]);
 
   const overview = fundingOverview;
