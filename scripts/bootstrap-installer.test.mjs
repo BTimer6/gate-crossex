@@ -8,7 +8,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -138,6 +137,13 @@ if (process.argv[2] === 'ci') {
   return archive;
 }
 
+function assertWindowsWorkspaceResolution(installRoot, label) {
+  assert.equal(
+    readFileSync(join(installRoot, 'node_modules/@gate-crossex/bootstrap-fixture/index.js'), 'utf8'),
+    `export default '${label}';\n`,
+  );
+}
+
 test('Unix bootstrap installs atomically, updates, and preserves local state', {
   skip: process.platform === 'win32' ? 'Unix bootstrap test' : false,
 }, () => {
@@ -232,10 +238,7 @@ test('Windows bootstrap installs, updates, and preserves local state', {
     assert.equal(readFileSync(join(installRoot, 'fixture-version.txt'), 'utf8').trim(), 'first');
     assert.equal(existsSync(join(installRoot, '.runtime/node.exe')), true);
     assert.equal(existsSync(join(installRoot, 'node_modules/.bin/tsx.cmd')), true);
-    assert.equal(
-      realpathSync.native(join(installRoot, 'node_modules/@gate-crossex/bootstrap-fixture')).toLowerCase(),
-      realpathSync.native(join(installRoot, 'packages/bootstrap-fixture')).toLowerCase(),
-    );
+    assertWindowsWorkspaceResolution(installRoot, 'first');
 
     writeFileSync(join(installRoot, '.local-data/preserved.txt'), 'local state\n');
     writeFileSync(join(installRoot, '.env'), 'SECRET=preserved\n');
@@ -246,10 +249,7 @@ test('Windows bootstrap installs, updates, and preserves local state', {
     assert.equal(readFileSync(join(installRoot, '.local-data/preserved.txt'), 'utf8').trim(), 'local state');
     assert.equal(readFileSync(join(installRoot, '.env'), 'utf8').trim(), 'SECRET=preserved');
     assert.equal(readFileSync(join(installRoot, 'logs/preserved.log'), 'utf8').trim(), 'log');
-    assert.equal(
-      realpathSync.native(join(installRoot, 'node_modules/@gate-crossex/bootstrap-fixture')).toLowerCase(),
-      realpathSync.native(join(installRoot, 'packages/bootstrap-fixture')).toLowerCase(),
-    );
+    assertWindowsWorkspaceResolution(installRoot, 'second');
 
     // Windows PowerShell can keep the process working directory even after
     // run.ps1 calls Set-Location. Relative .NET file access must still use the
