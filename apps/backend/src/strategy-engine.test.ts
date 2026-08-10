@@ -303,7 +303,9 @@ describe('strategy engine', () => {
     });
     expect(record).toMatchObject({ status: 'RUNNING', kind: 'position', config: { closePlan: { orderCount: 3, intervalSeconds: 5 } } });
 
-    now += 100;
+    // Strategy timestamps use the wall clock. Anchor the injected clock after creation so slower
+    // runners cannot leave the first close slice scheduled in the future.
+    now = Date.parse(record.createdAt) + 100;
     const firstTick = engine.tick();
     await waitFor(() => gateway.createdOrders.length === 1);
     expect(gateway.createdOrders[0]).toMatchObject({ symbol, side: 'SELL', qty: '0.03333333', reduce_only: 'true' });
@@ -354,7 +356,7 @@ describe('strategy engine', () => {
       },
     });
 
-    now += 100;
+    now = Date.parse(record.createdAt) + 100;
     const firstTick = engine.tick();
     await waitFor(() => gateway.createdOrders.length === 2);
     expect(gateway.createdOrders).toEqual(expect.arrayContaining([
