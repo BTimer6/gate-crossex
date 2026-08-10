@@ -1,5 +1,5 @@
 import { Fragment, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { contiguousCandleTail } from '@gate-crossex/shared-types';
+import { contiguousCandleTail, type CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
   ApiError,
@@ -45,10 +45,13 @@ import {
   groupLevels,
   isPositiveDecimal,
   liveMarketFor,
+  maxPositionValueAtLeverage,
   powerOfTenText,
   priceText,
+  projectedPositionValue,
   quoteFor,
   signedAmount,
+  signedPortfolioQuantity,
   symbolParts,
   ticketIssues,
   useDialogFocus,
@@ -271,6 +274,8 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [officialFundingSnapshot, setOfficialFundingSnapshot] = useState<PublicMarketSnapshot | null>(null);
   const [sizeUnits, setSizeUnits] = useState<Record<string, string> | null>(null);
   const [maxLeverage, setMaxLeverage] = useState<string | null>(null);
+  const [riskTiers, setRiskTiers] = useState<CrossExRiskLimitTier[] | null>(null);
+  const [riskTiersLoaded, setRiskTiersLoaded] = useState(false);
   const [currentLeverage, setCurrentLeverage] = useState<string | null>(null);
   const [leverageOpen, setLeverageOpen] = useState(false);
   const [leverageDraft, setLeverageDraft] = useState('1');
@@ -312,7 +317,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const sizeMultiplier = sizeUnitText !== undefined && isPositiveDecimal(sizeUnitText) ? Number(sizeUnitText) : null;
   const effectivePrice = orderType === 'Market' ? displayedPrice : Number(price) || 0;
   const total = (effectivePrice * (Number(amount) || 0)).toFixed(2);
-  const issues = useMemo(() => ticketIssues({ orderType, price, amount, referencePrice: displayedPrice, quote, instrument, t }),
+  const ticketValidationIssues = useMemo(() => ticketIssues({ orderType, price, amount, referencePrice: displayedPrice, quote, instrument, t }),
     [orderType, price, amount, displayedPrice, quote, instrument, t]);
   const availableBalance = balanceFor(balances, authenticatedPortfolio, exchangeId);
   const sharedMarginMode = usesSharedCrossExMargin(authenticatedPortfolio);
@@ -329,6 +334,15 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const leverageCeiling = Math.max(1, Math.floor(Number(maxLeverage ?? portfolioPosition?.maxLeverage ?? leverageText) || 1));
   const leverageValue = Math.min(leverageCeiling, Math.max(1, Number(leverageText) || 1));
   const maxQuantityReference = orderType === 'Limit' && isPositiveDecimal(price) ? Number(price) : displayedPrice;
+  const selectedMaxPositionValue = maxPositionValueAtLeverage(riskTiers, leverageValue);
+  const existingSignedQuantity = signedPortfolioQuantity(portfolioPosition);
+  const orderDirection = side === 'Buy' ? 1 : -1;
+  const riskMaximumQuantity = selectedMaxPositionValue !== null && maxQuantityReference > 0
+    ? selectedMaxPositionValue / maxQuantityReference
+    : null;
+  const riskMaximumOrderQuantity = riskMaximumQuantity === null
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, riskMaximumQuantity - orderDirection * existingSignedQuantity);
   const instrumentSizeCap = orderType === 'Market' ? instrument?.maxMarketSize : instrument?.maxLimitSize;
   const maxOrderQuantity = (() => {
     if (reduceOnly) {
@@ -339,10 +353,30 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
     if (availableBalance === null || !Number.isFinite(available) || available < 0 || maxQuantityReference <= 0) return '';
     const marginMaximum = (available * leverageValue) / maxQuantityReference;
     const venueMaximum = instrumentSizeCap && isPositiveDecimal(instrumentSizeCap) ? Number(instrumentSizeCap) : Number.POSITIVE_INFINITY;
-    const maximum = Math.min(marginMaximum, venueMaximum);
+    const maximum = Math.min(marginMaximum, venueMaximum, riskMaximumOrderQuantity);
     return Number.isFinite(maximum) ? floorToStep(maximum, instrument?.lotSize ?? null) : '';
   })();
   const leveragePresets = [...new Set([1, 3, 5, 10, 20, leverageCeiling])].filter((value) => value <= leverageCeiling).sort((a, b) => a - b);
+  const projectedOrderPositionValue = projectedPositionValue(
+    existingSignedQuantity,
+    orderDirection * (Number(amount) || 0),
+    maxQuantityReference,
+  );
+  const riskLimitExceeded = !reduceOnly && selectedMaxPositionValue !== null
+    && projectedOrderPositionValue !== null && projectedOrderPositionValue > selectedMaxPositionValue;
+  const riskLimitUnavailable = !reduceOnly && amount !== ''
+    && (!riskTiersLoaded || selectedMaxPositionValue === null);
+  const issues = [
+    ...ticketValidationIssues,
+    ...(riskLimitExceeded
+      ? [`${t('Projected position exceeds the maximum at selected leverage')}: ${formatAmount(selectedMaxPositionValue ?? 0)} ${quote}`]
+      : riskLimitUnavailable ? [t('Unable to verify max position at selected leverage')] : []),
+  ];
+  const leverageDraftValue = Math.min(leverageCeiling, Math.max(1, Math.round(Number(leverageDraft) || 1)));
+  const draftMaxPositionValue = maxPositionValueAtLeverage(riskTiers, leverageDraftValue);
+  const draftMaxPositionQuantity = draftMaxPositionValue !== null && maxQuantityReference > 0
+    ? draftMaxPositionValue / maxQuantityReference
+    : null;
 
   function selectExchange(nextExchangeId: string) {
     if (nextExchangeId === exchangeId && pendingExchangeId === null) return;
@@ -590,14 +624,18 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   useEffect(() => {
     let cancelled = false;
     setMaxLeverage(null);
+    setRiskTiers(null);
+    setRiskTiersLoaded(false);
     setCurrentLeverage(null);
     setLeverageOpen(false);
     setLeverageError(null);
     void api.riskLimits(symbol).then((response) => {
       if (cancelled) return;
+      setRiskTiers(response.item.tiers);
+      setRiskTiersLoaded(true);
       const leverages = response.item.tiers.map((tier) => Number(tier.leverageMax)).filter(Number.isFinite);
       if (leverages.length) setMaxLeverage(String(Math.max(...leverages)));
-    }).catch(() => undefined);
+    }).catch(() => { if (!cancelled) setRiskTiersLoaded(true); });
     void api.leverage(symbol).then((response) => {
       if (!cancelled && response.leverage && isPositiveDecimal(response.leverage)) {
         setCurrentLeverage(response.leverage);
@@ -785,7 +823,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
             </button>
             {leverageOpen && <div className="leverage-popover" role="dialog" aria-label={t('Adjust leverage')}>
               <header><div><strong>{t('Adjust leverage')}</strong><span>{exchange.name} · {marketSymbol(asset, quote, 'perpetual')}</span></div><button onClick={() => setLeverageOpen(false)} aria-label={t('Close')}>✕</button></header>
-              <dl><div><dt>{t('Current leverage')}</dt><dd>{leverageValue}×</dd></div><div><dt>{t('Max leverage')}</dt><dd>{leverageCeiling}×</dd></div></dl>
+              <dl><div><dt>{t('Current leverage')}</dt><dd>{leverageValue}×</dd></div><div><dt>{t('Max leverage')}</dt><dd>{leverageCeiling}×</dd></div><div className="leverage-position-cap"><dt>{t('Max position at selected leverage')}</dt><dd>{draftMaxPositionValue !== null ? `${formatAmount(draftMaxPositionValue)} ${quote}` : '—'}{draftMaxPositionQuantity !== null && <small>≈ {formatAmount(draftMaxPositionQuantity, 6)} {asset}</small>}</dd></div></dl>
               <div className="leverage-stepper">
                 <button onClick={() => adjustLeverage(-1)} aria-label="Decrease leverage">−</button>
                 <label><input type="number" min="1" max={leverageCeiling} step="1" value={leverageDraft} onChange={(event) => setLeverageDraft(event.target.value)} aria-label={t('Leverage')} /><b>×</b></label>
@@ -821,6 +859,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
           <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available balance')}</dt><dd>{displayedBalance} {availableBalanceUnit}</dd></div>
           <div><dt>{t('Max order quantity')}</dt><dd><button className="max-quantity" onClick={() => { if (maxOrderQuantity) { setAmount(maxOrderQuantity); setAllocation(100); } }} disabled={!maxOrderQuantity}>{maxOrderQuantity || '—'} {asset}</button></dd></div>
           <div><dt>{t('Leverage')}</dt><dd><button className="summary-leverage" onClick={openLeverageEditor}>{leverageValue}×</button></dd></div>
+          <div><dt>{t('Max position at selected leverage')}</dt><dd>{selectedMaxPositionValue !== null ? `${formatAmount(selectedMaxPositionValue)} ${quote}` : '—'}</dd></div>
           <div><dt>{t('Est. liquidation price')}</dt><dd>{t('Available after execution')}</dd></div>
           <div><dt>{t('Maker fee')}</dt><dd>{makerFeeText}</dd></div>
           <div><dt>{t('Taker fee')}</dt><dd>{takerFeeText}</dd></div>
@@ -845,6 +884,8 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
           <div><dt>{t('Amount')}</dt><dd>{amount} {asset}</dd></div>
           <div><dt>{t('Total')}</dt><dd>≈ {total} {quote}</dd></div>
           <div><dt>{t('Leverage')}</dt><dd>{leverageValue}×</dd></div>
+          <div><dt>{t('Max position at selected leverage')}</dt><dd>{selectedMaxPositionValue !== null ? `${formatAmount(selectedMaxPositionValue)} ${quote}` : '—'}</dd></div>
+          <div><dt>{t('Projected position')}</dt><dd>{projectedOrderPositionValue !== null ? `${formatAmount(projectedOrderPositionValue)} ${quote}` : '—'}</dd></div>
           <div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div>
         </dl>
         <label className="disclaimer-agree confirm-skip">

@@ -5,7 +5,7 @@ export type Theme = 'dark' | 'light';
 
 const chinese: Record<string, string> = {
   Trade: '交易', Strategy: '策略', 'Funding Rates': '资金费率', Portfolio: '资产', Settings: '设置', 'Main navigation': '主导航', More: '更多', 'More tools': '更多工具',
-  'Trading fee comparison': '交易费率对比', 'Compare account fees by ticker': '按代币对比账户费率',
+  'Trading fee comparison': '交易手续费查询', 'Compare account fees by ticker': '按代币对比账户费率',
   'Trading tools': '交易工具', 'Enter a ticker to compare fees and estimated costs across every exchange that supports its perpetual contract.': '输入代币代码，对比所有支持该永续合约的交易所费率和预估成本。',
   'Current CrossEx account rates': '当前 CrossEx 账户费率', Ticker: '代币代码', 'Trade notional': '名义价值', 'Supported exchanges': '支持的交易所',
   'Perpetual contract': '永续合约', 'Sorted by lowest taker fee': '按吃单费率从低到高排序', 'Refresh rates': '刷新费率', 'Loading rates…': '加载中…',
@@ -29,7 +29,13 @@ const chinese: Record<string, string> = {
   'CrossEx available': 'CrossEx 可用', 'Available balance': '可用余额', 'Shared margin': '共享保证金', 'Max order quantity': '最大下单数量', Limit: '限价', Market: '市价', Price: '价格', Amount: '数量', Total: '总额', 'Reduce only': '只减仓', Execution: '执行',
   Leverage: '杠杆', 'SKHY leverage': 'SKHY 杠杆', 'SKHYNIX leverage': 'SKHYNIX 杠杆',
   'Adjust leverage': '调整杠杆', 'Current leverage': '当前杠杆', 'Apply leverage': '应用杠杆',
-  'Leverage updated': '杠杆已更新', 'Leverage rejected': '杠杆调整失败', 'Set leverage': '设置杠杆',
+    'Leverage updated': '杠杆已更新', 'Leverage rejected': '杠杆调整失败', 'Set leverage': '设置杠杆',
+    'Max position at selected leverage': '所选杠杆下最大仓位', 'Projected position': '预计最终仓位',
+    'Projected position exceeds the maximum at selected leverage': '预计最终仓位超过所选杠杆下的上限',
+    'Unable to verify max position at selected leverage': '暂时无法验证所选杠杆下的最大仓位',
+    'Configured position exceeds the maximum at selected leverage': '配置仓位超过所选杠杆下的上限',
+    'Configured position fits the leverage-tier limits': '配置仓位符合杠杆风险档位限制',
+    'Position exceeds leverage limit': '仓位超过杠杆上限', 'Loading position limits…': '正在加载仓位限制…',
   'Estimated margin': '预估保证金', 'Insufficient margin': '保证金不足', 'Invalid leverage': '杠杆无效',
   'Configured maximum exposure exceeds the available margin.': '配置的最大敞口超过可用保证金。',
   'Preflight estimate includes a 10% reserve': '预检估算已包含 10% 预留',

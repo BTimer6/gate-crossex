@@ -1,6 +1,7 @@
 /* Shared route primitives intentionally combine hooks, render helpers, and constants. */
 /* eslint-disable react-refresh/only-export-components */
 import { useLayoutEffect, useRef } from 'react';
+import type { CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import type { AuthenticatedPortfolioSnapshot, CandleInterval, CrossExInstrument, LiveBalance, LiveMarket, MarketSnapshot, StrategyConfig } from './api.js';
 import { exchangeLogoFor, type ExchangeLogoId } from './exchange-logos.js';
 import { compactPrice } from './number-format.js';
@@ -158,6 +159,36 @@ export function signedPortfolioQuantity(position: { positionSide: string; quanti
 
 export function incrementalExposure(existingQuantity: number, plannedQuantity: number): number {
   return Math.max(0, Math.abs(existingQuantity + plannedQuantity) - Math.abs(existingQuantity));
+}
+
+/**
+ * Risk tiers lower the permitted leverage as position notional grows. At a selected leverage the
+ * largest usable position is the furthest tier boundary whose leverage ceiling still permits it.
+ */
+export function maxPositionValueAtLeverage(
+  tiers: CrossExRiskLimitTier[] | null | undefined,
+  leverage: number,
+): number | null {
+  if (!tiers || !Number.isFinite(leverage) || leverage <= 0) return null;
+  const eligibleValues = tiers.flatMap((tier) => {
+    const tierLeverage = Number(tier.leverageMax);
+    const maxPositionValue = Number(tier.maxRiskLimitValue);
+    return Number.isFinite(tierLeverage) && tierLeverage >= leverage
+      && Number.isFinite(maxPositionValue) && maxPositionValue > 0
+      ? [maxPositionValue]
+      : [];
+  });
+  return eligibleValues.length > 0 ? Math.max(...eligibleValues) : null;
+}
+
+/** Final absolute notional after applying a signed order/strategy quantity. */
+export function projectedPositionValue(
+  existingQuantity: number,
+  plannedQuantity: number,
+  referencePrice: number,
+): number | null {
+  if (![existingQuantity, plannedQuantity, referencePrice].every(Number.isFinite) || referencePrice <= 0) return null;
+  return Math.abs(existingQuantity + plannedQuantity) * referencePrice;
 }
 
 export function usesSharedCrossExMargin(portfolio: AuthenticatedPortfolioSnapshot | null): boolean {

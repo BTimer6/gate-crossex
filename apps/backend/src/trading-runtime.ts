@@ -4,7 +4,7 @@ import { Decimal } from 'decimal.js';
 import { z } from 'zod';
 import type { LiveBalance, PortfolioFill, PortfolioFuturesPosition } from '@gate-crossex/shared-types';
 import { DEFAULT_CREDENTIAL_PROFILE, type CredentialVault } from './credential-vault.js';
-import { CrossExOrderRequestSchema, GateApiError, type GateCrossExAccount, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
+import { CrossExOrderRequestSchema, GateApiError, type GateCrossExAccount, type GateCrossExRiskLimit, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import type { PrivateCrossExEvent } from './private-stream.js';
 import type { TradingSession } from './trading-session.js';
 
@@ -185,6 +185,22 @@ function isDefinitiveSubmitRejection(error: unknown): boolean {
   return error instanceof GateApiError && error.statusCode >= 400 && error.statusCode < 500;
 }
 
+function maxRiskPositionValueAtLeverage(
+  limit: GateCrossExRiskLimit | undefined,
+  leverage: Decimal,
+): Decimal | null {
+  const eligible = (limit?.tiers ?? []).flatMap((tier) => {
+    try {
+      const tierLeverage = new Decimal(tier.leverage_max);
+      const maxPositionValue = new Decimal(tier.max_risk_limit_value);
+      return tierLeverage.gte(leverage) && maxPositionValue.gt(0) ? [maxPositionValue] : [];
+    } catch {
+      return [];
+    }
+  });
+  return eligible.length > 0 ? Decimal.max(...eligible) : null;
+}
+
 export interface PlaceOrderMetadata {
   strategyId: string;
   strategyLeg: 'left' | 'right' | `close-${number}`;
@@ -280,6 +296,7 @@ export class TradingRuntime {
     let account: GateCrossExAccount | null = null;
     let isolatedAccounts: GateCrossExAccount[] = [];
     let positions;
+    let riskLimits: GateCrossExRiskLimit[];
     try {
       try {
         account = await tradingGateway.queryAccount(credentials);
@@ -301,6 +318,7 @@ export class TradingRuntime {
       // Margin relief is based on a fresh exchange position snapshot. A cached portfolio could
       // incorrectly classify an exposure-increasing order as a close after the position changed.
       positions = await tradingGateway.queryPositions(credentials);
+      riskLimits = await this.gateway.queryRiskLimits([...new Set(legs.map((leg) => leg.symbol))]);
     } catch (error) {
       if (error instanceof GateApiError && error.statusCode === 429) {
         throw new TradingRuntimeError('strategy_preflight_rate_limited', 429);
@@ -308,6 +326,7 @@ export class TradingRuntime {
       throw new TradingRuntimeError('strategy_margin_preflight_unavailable', 503);
     }
     const reserveFactor = new Decimal('1.10');
+    const riskLimitBySymbol = new Map(riskLimits.map((limit) => [limit.symbol, limit]));
     const requiredByVenue = new Map<string, Decimal>();
     let requiredMargin = new Decimal(0);
     for (const leg of legs) {
@@ -322,6 +341,17 @@ export class TradingRuntime {
       })();
       const plannedQuantity = new Decimal(leg.estimatedQuantity)
         .mul(leg.side === 'BUY' ? 1 : -1);
+      const maxPositionValue = maxRiskPositionValueAtLeverage(
+        riskLimitBySymbol.get(leg.symbol),
+        new Decimal(leg.leverage),
+      );
+      if (!maxPositionValue) {
+        throw new TradingRuntimeError('strategy_position_limit_unavailable', 503, leg.symbol);
+      }
+      const projectedPositionValue = existingQuantity.plus(plannedQuantity).abs().mul(leg.estimatedPrice);
+      if (projectedPositionValue.gt(maxPositionValue)) {
+        throw new TradingRuntimeError('strategy_position_exceeds_leverage_limit', 409, leg.symbol);
+      }
       // Closing or reducing an opposite position consumes no additional margin. If the order
       // crosses through zero, reserve only for the increase beyond the position already carried.
       const incrementalExposure = Decimal.max(
@@ -694,7 +724,11 @@ export class TradingRuntime {
     }
   }
 
-  async createOrder(raw: unknown, metadata?: PlaceOrderMetadata): Promise<ExecutionOrder> {
+  async createOrder(
+    raw: unknown,
+    metadata?: PlaceOrderMetadata,
+    referencePrice?: string,
+  ): Promise<ExecutionOrder> {
     const input = CreateOrderInputSchema.parse(raw);
     if (!this.session.liveTradingEnabled && !metadata?.riskReducing) {
       throw new TradingRuntimeError('live_trading_locked', 403);
@@ -703,6 +737,43 @@ export class TradingRuntime {
     if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
     const tradingGateway = this.gateway as Partial<TradingCrossExGateway>;
     if (!tradingGateway.createOrder) throw new TradingRuntimeError('live_gateway_unavailable', 503);
+    if (!metadata && referencePrice !== undefined && !input.reduceOnly) {
+      if (!referencePrice || !decimalText.safeParse(referencePrice).success
+        || !tradingGateway.queryPositions || !tradingGateway.queryLeverages) {
+        throw new TradingRuntimeError('order_position_limit_unavailable', 503);
+      }
+      let positions;
+      let leverages: Record<string, string>;
+      let limits: GateCrossExRiskLimit[];
+      try {
+        [positions, leverages, limits] = await Promise.all([
+          tradingGateway.queryPositions(credentials),
+          tradingGateway.queryLeverages(credentials, [input.symbol]),
+          this.gateway.queryRiskLimits([input.symbol]),
+        ]);
+      } catch (error) {
+        if (error instanceof GateApiError && error.statusCode === 429) {
+          throw new TradingRuntimeError('order_position_preflight_rate_limited', 429);
+        }
+        throw new TradingRuntimeError('order_position_limit_unavailable', 503);
+      }
+      const leverage = leverages[input.symbol];
+      const maxPositionValue = leverage
+        ? maxRiskPositionValueAtLeverage(limits.find((limit) => limit.symbol === input.symbol), new Decimal(leverage))
+        : null;
+      if (!maxPositionValue) throw new TradingRuntimeError('order_position_limit_unavailable', 503);
+      const existingPosition = positions.find((position) => position.symbol === input.symbol);
+      const existingQuantity = (() => {
+        if (!existingPosition) return new Decimal(0);
+        const quantity = new Decimal(existingPosition.position_qty).abs();
+        return existingPosition.position_side.toUpperCase() === 'SHORT' ? quantity.negated() : quantity;
+      })();
+      const plannedQuantity = new Decimal(input.quantity).mul(input.side === 'BUY' ? 1 : -1);
+      const projectedPositionValue = existingQuantity.plus(plannedQuantity).abs().mul(referencePrice);
+      if (projectedPositionValue.gt(maxPositionValue)) {
+        throw new TradingRuntimeError('order_position_exceeds_leverage_limit', 409);
+      }
+    }
     const clientOrderId = `gct-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const gateInput = CrossExOrderRequestSchema.parse({ text: clientOrderId, symbol: input.symbol, side: input.side,
       type: input.type, time_in_force: input.timeInForce, qty: input.quantity, price: input.price,

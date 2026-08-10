@@ -1133,7 +1133,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     },
   }, async (request, reply) => {
     try {
-      return await tradingRuntime.createOrder(request.body);
+      const orderIntent = z.object({
+        symbol: z.string(), side: z.enum(['BUY', 'SELL']), type: z.enum(['LIMIT', 'MARKET']),
+        price: z.string().optional(),
+      }).safeParse(request.body);
+      const liveReference = orderIntent.success ? marketHub.market(orderIntent.data.symbol) : null;
+      const referencePrice = orderIntent.success
+        ? orderIntent.data.type === 'LIMIT'
+          ? orderIntent.data.price
+          : orderIntent.data.side === 'BUY' ? liveReference?.askPrice : liveReference?.bidPrice
+        : undefined;
+      // An empty reference deliberately fails closed inside the runtime when the live market is
+      // unavailable; the endpoint must never silently bypass the position-tier review.
+      return await tradingRuntime.createOrder(request.body, undefined, referencePrice ?? '');
     } catch (error) {
       if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_order', issues: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) });
       if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });

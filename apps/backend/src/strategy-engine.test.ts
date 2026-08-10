@@ -21,6 +21,7 @@ class ScriptedGateway implements TradingCrossExGateway {
   readonly accountQueries: Array<string | null> = [];
   positions: GateCrossExPortfolio['positions'] = [];
   leverages: Record<string, string> = {};
+  riskLimits: Record<string, GateCrossExRiskLimit['tiers']> = {};
   availableMargin = '1000000';
   accountAssets: GateCrossExAccount['assets'] = [];
   accountMode: 'CROSS_EXCHANGE' | 'ISOLATED_EXCHANGE' = 'CROSS_EXCHANGE';
@@ -53,7 +54,15 @@ class ScriptedGateway implements TradingCrossExGateway {
   async queryPositions(): Promise<GateCrossExPortfolio['positions']> { return this.positions; }
   async queryPortfolio(): Promise<GateCrossExPortfolio> { throw new GateApiError(0, 'NOT_SCRIPTED'); }
   async querySymbols(): Promise<GateCrossExSymbol[]> { return []; }
-  async queryRiskLimits(): Promise<GateCrossExRiskLimit[]> { return []; }
+  async queryRiskLimits(symbols: string[]): Promise<GateCrossExRiskLimit[]> {
+    return symbols.map((symbol) => ({
+      symbol,
+      tiers: this.riskLimits[symbol] ?? [{
+        tier: '1', min_risk_limit_value: '0', max_risk_limit_value: '1000000000',
+        quick_cal_amount: '0', leverage_max: '200', maintenance_rate: '0.001',
+      }],
+    }));
+  }
   async queryLeverages(_credentials: GateCredentials, symbols: string[]): Promise<Record<string, string>> {
     this.leverageQueries.push([...symbols]);
     return Object.fromEntries(symbols.flatMap((symbol) => (
@@ -1401,6 +1410,28 @@ describe('strategy engine', () => {
       entryPremiumPct: '35', takeProfitPremiumPct: '24', maxPosition: '0.5', perOrderQuantity: '0.1',
       reduceOnly: false, executionMethod: 'TAKER_TAKER',
     })).rejects.toMatchObject({ code: 'insufficient_strategy_margin', statusCode: 409 });
+
+    expect(runtime.listStrategies()).toHaveLength(0);
+    expect(gateway.leverageUpdates).toHaveLength(0);
+    expect(gateway.createdOrders).toHaveLength(0);
+  });
+
+  it('rejects a strategy whose projected position exceeds the tier allowed by selected leverage', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    gateway.riskLimits.GATE_FUTURE_SKHY_USDT = [
+      { tier: '1', min_risk_limit_value: '0', max_risk_limit_value: '100', quick_cal_amount: '0', leverage_max: '20', maintenance_rate: '0.01' },
+      { tier: '2', min_risk_limit_value: '100', max_risk_limit_value: '500', quick_cal_amount: '0', leverage_max: '10', maintenance_rate: '0.02' },
+    ];
+    markets.set('GATE_FUTURE_SKHY_USDT', '229.9', '230');
+    markets.set('BINANCE_FUTURE_SKHYNIX_USDT', '1699', '1700');
+
+    await expect(engine.startStrategy({
+      kind: 'premium', asset: 'SKHY', hedgeAsset: 'SKHYNIX', adrRatio: '10',
+      leftVenue: 'GATE', rightVenue: 'BINANCE', leftSide: 'SELL', rightSide: 'BUY',
+      leftLeverage: '20', rightLeverage: '10',
+      entryPremiumPct: '35', takeProfitPremiumPct: '24', maxPosition: '0.5', perOrderQuantity: '0.1',
+      reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    })).rejects.toMatchObject({ code: 'strategy_position_exceeds_leverage_limit', statusCode: 409 });
 
     expect(runtime.listStrategies()).toHaveLength(0);
     expect(gateway.leverageUpdates).toHaveLength(0);
