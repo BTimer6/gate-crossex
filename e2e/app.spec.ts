@@ -192,7 +192,7 @@ test.describe.serial('local trading terminal', () => {
     await expect(lighterOpportunity).toHaveAttribute('aria-checked', 'true');
     await expect(page.getByText('Direct CrossEx execution unavailable')).toBeVisible();
     await expect(page.getByRole('textbox', { name: 'Position size' })).toBeDisabled();
-    await expect(lighterOpportunity).toContainText('OKX 10× · Lighter 10×');
+    await expect(lighterOpportunity).toContainText('OKX 50× · Lighter 50×');
     await opportunities.getByRole('radio', { name: /OKX ↔ Hyperliquid/ }).click();
     const firstStep = page.locator('.boros-step').first();
     await expect(page.locator('.boros-view > .boros-kpis')).toHaveCount(0);
@@ -234,7 +234,7 @@ test.describe.serial('local trading terminal', () => {
     const initialOpportunityApr = await selectedOpportunityApr.textContent();
     expect(initialReturn).toMatch(/%$/);
     expect(initialOpportunityApr).toMatch(/%$/);
-    await expect(opportunities.getByRole('radio', { name: /OKX ↔ Hyperliquid/ })).toContainText('OKX 10× · Hyperliquid 10×');
+    await expect(opportunities.getByRole('radio', { name: /OKX ↔ Hyperliquid/ })).toContainText('OKX 50× · Hyperliquid 40×');
     await expect(page.getByRole('link', { name: /Open long market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/185?direction=long');
     await expect(page.getByRole('link', { name: /Open short market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/102?direction=short');
 
@@ -304,8 +304,8 @@ test.describe.serial('local trading terminal', () => {
     await openPositions.click();
     const confirmExecution = page.getByRole('dialog', { name: 'Confirm CrossEx positions' });
     await expect(confirmExecution).toBeVisible();
-    await expect(confirmExecution).toContainText('0.1 ETH · OKX_FUTURE_ETH_USDT · 10×');
-    await expect(confirmExecution).toContainText('0.1 ETH · HYPERLIQUID_FUTURE_ETH_USDC · 10×');
+    await expect(confirmExecution).toContainText('0.1 ETH · OKX_FUTURE_ETH_USDT · 50×');
+    await expect(confirmExecution).toContainText('0.1 ETH · HYPERLIQUID_FUTURE_ETH_USDC · 40×');
     await expect(confirmExecution).toContainText('0.05 ETH');
     await expect(confirmExecution).toContainText('Maker–Taker · Hyperliquid maker');
     await expect(confirmExecution).toContainText('Entry threshold');
@@ -314,7 +314,7 @@ test.describe.serial('local trading terminal', () => {
     await confirmExecution.getByRole('button', { name: 'Go back' }).click();
     await expect(confirmExecution).toHaveCount(0);
     const strategySummary = page.getByLabel('Strategy summary');
-    await expect(strategySummary).toContainText('OKX 10× · Hyperliquid 10×');
+    await expect(strategySummary).toContainText('OKX 50× · Hyperliquid 40×');
     await expect(strategySummary).toContainText('Net fixed APR');
     await expect(strategySummary).toContainText('Return after fees');
     await expect(strategySummary).not.toContainText('Gross fixed APR');
@@ -340,8 +340,8 @@ test.describe.serial('local trading terminal', () => {
     await expect(aprDetails.getByText('Perpetual margin', { exact: true })).toBeVisible();
     await expect(aprDetails.getByText('Allocated capital', { exact: true })).toBeVisible();
     await expect(aprDetails.getByText('Net annual profit', { exact: true })).toBeVisible();
-    await expect(aprDetails).toContainText('OKX 10× · Hyperliquid 10×');
-    await expect(aprDetails).toContainText('Uses 10× leverage, capped by Gate CrossEx risk limits, and expected fees.');
+    await expect(aprDetails).toContainText('OKX 50× · Hyperliquid 40×');
+    await expect(aprDetails).toContainText('Uses Gate CrossEx risk-limit leverage and expected fees.');
     await expect(aprDetails.getByText(/Net fixed APR = Return after fees ÷ Time to maturity/)).toBeVisible();
     await expect(economics.getByText('Profit before fees')).toBeVisible();
     await expect(economics.getByText('Profit after fees')).toBeVisible();

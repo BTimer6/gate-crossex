@@ -881,6 +881,42 @@ describe('local backend', () => {
     expect(stop.json()).toMatchObject({ id, status: 'STOPPED' });
   });
 
+  it('serves logs and accepts stop requests for CLOSE strategy ids', async () => {
+    const { app, database } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'CLOSE-ABC12345';
+    const now = new Date().toISOString();
+    const symbol = 'BINANCE_FUTURE_BTC_USDT';
+    const config = {
+      kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'BINANCE',
+      leftSide: 'SELL', rightSide: 'BUY', totalAmount: '0.1', perOrderQuantity: '0.05',
+      reduceOnly: true, executionMethod: 'TAKER_TAKER',
+      closePlan: {
+        orderCount: 2,
+        intervalSeconds: 30,
+        targets: [{ symbol, side: 'SELL', quantity: '0.1', positionSide: 'NONE' }],
+      },
+    };
+    database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
+      filled_quantity, filled_left, filled_right, open_position, created_at, updated_at, stopped_at)
+      VALUES (?, 'position', 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, NULL)`)
+      .run(id, JSON.stringify(config), now, now);
+    database.prepare(`INSERT INTO execution_strategy_logs
+      (id, strategy_id, level, event, condition_text, quantity, result_text, created_at)
+      VALUES ('log-close', ?, 'info', 'Close strategy started', '2 slices', '0.1', 'Monitoring', ?)`)
+      .run(id, now);
+
+    const host = { host: '127.0.0.1:17840' };
+    const logs = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs`, headers: host });
+    expect(logs.statusCode).toBe(200);
+    expect(logs.json().logs).toEqual([expect.objectContaining({ event: 'Close strategy started' })]);
+
+    const stop = await app.inject({ method: 'POST', url: `/api/strategies/${id}/stop`, headers: {
+      ...host, 'x-gct-trading-intent': 'stop-strategy',
+    } });
+    expect(stop.statusCode).toBe(200);
+    expect(stop.json()).toMatchObject({ id, status: 'STOPPED' });
+  });
+
   it('serves merged candle series with venue backfill and validates parameters', async () => {
     const { app, publicMarketGateway } = await createTestApp();
     const headers = { host: '127.0.0.1:17840' };

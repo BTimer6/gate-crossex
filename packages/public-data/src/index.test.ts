@@ -500,6 +500,23 @@ describe('bulk venue funding stats', () => {
     }]);
   });
 
+  it('keeps Gate funding available when contract metadata is unavailable', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => {
+      if (String(url).endsWith('/contracts')) return Promise.reject(new Error('contract metadata unavailable'));
+      return response([
+        { contract: 'BTC_USDT', funding_rate: '0.000015', mark_price: '50000', last: '50025', change_percentage: '1.25', total_size: '1000000', quanto_multiplier: '0.0001' },
+      ]);
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const stats = await client.queryVenueFundingStats('GATE');
+
+    expect(stats).toEqual([{
+      venue: 'GATE', base: 'BTC', quote: 'USDT', fundingRate: '0.000015', fundingIntervalHours: 8, fundingRate8h: '0.000015',
+      nextFundingAt: null, openInterestValue: '5000000', lastPrice: '50025', change24h: '0.0125',
+    }]);
+  });
+
   it('joins Binance funding with bulk 24h tickers and skips dated futures', async () => {
     const fetchMock = vi.fn((url: string | URL | Request) => {
       const value = String(url);
@@ -525,6 +542,21 @@ describe('bulk venue funding stats', () => {
       { venue: 'BINANCE', base: 'BTC', quote: 'USDT', fundingRate: '0.00000219', fundingIntervalHours: 1, fundingRate8h: '0.00001752', nextFundingAt: '2026-07-23T08:00:00.000Z', openInterestValue: null, lastPrice: '50010', change24h: '-0.015' },
       { venue: 'BINANCE', base: 'ETH', quote: 'USDC', fundingRate: '0.0001', fundingIntervalHours: 4, fundingRate8h: '0.0002', nextFundingAt: null, openInterestValue: null, lastPrice: '2500', change24h: '0.02' },
     ]);
+  });
+
+  it('keeps Binance funding available when ticker and interval metadata are unavailable', async () => {
+    const fetchMock = vi.fn((url: string | URL | Request) => String(url).endsWith('/premiumIndex')
+      ? response([{ symbol: 'BTCUSDT', lastFundingRate: '0.00000219', nextFundingTime: 1_784_793_600_000, time: 1 }])
+      : Promise.reject(new Error('optional metadata unavailable')));
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch);
+
+    const stats = await client.queryVenueFundingStats('BINANCE');
+
+    expect(stats).toEqual([{
+      venue: 'BINANCE', base: 'BTC', quote: 'USDT', fundingRate: '0.00000219', fundingIntervalHours: 8,
+      fundingRate8h: '0.00000219', nextFundingAt: '2026-07-23T08:00:00.000Z', openInterestValue: null,
+      lastPrice: null, change24h: null,
+    }]);
   });
 
   it('joins OKX funding with bulk open interest and scales 4h cycles to 8h', async () => {

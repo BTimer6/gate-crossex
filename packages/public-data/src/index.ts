@@ -498,6 +498,14 @@ function parsePayload<T>(schema: z.ZodType<T>, payload: unknown): T {
   return parsed.data;
 }
 
+async function optionalPayload<T>(request: Promise<unknown>, schema: z.ZodType<T>, fallback: T): Promise<T> {
+  try {
+    return parsePayload(schema, await request);
+  } catch {
+    return fallback;
+  }
+}
+
 export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   private readonly hyperliquidMetadataStore: HyperliquidPerpMetadataStore | undefined;
   private readonly hyperliquidMetadataFreshMs: number;
@@ -1026,11 +1034,15 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   private async queryGateFundingStats(): Promise<VenueFundingStat[]> {
-    const [payload, contractsPayload] = await Promise.all([
+    const [payload, contractRows] = await Promise.all([
       fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/tickers', 8_000_000),
-      fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/contracts', 8_000_000),
+      optionalPayload(
+        fetchJson(this.fetchImplementation, 'https://api.gateio.ws/api/v4/futures/usdt/contracts', 8_000_000),
+        GateContractListSchema,
+        [],
+      ),
     ]);
-    const contracts = new Map(parsePayload(GateContractListSchema, contractsPayload).map((contract) => [contract.name, contract]));
+    const contracts = new Map(contractRows.map((contract) => [contract.name, contract]));
     const rows = parsePayload(z.array(z.unknown()), payload);
     const stats: VenueFundingStat[] = [];
     for (const rawRow of rows) {
@@ -1063,19 +1075,28 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
   }
 
   private async queryBinanceFundingStats(): Promise<VenueFundingStat[]> {
-    const [fundingPayload, tickerPayload, fundingInfoPayload] = await Promise.all([
+    const optionalRowsSchema = z.array(z.unknown());
+    const [fundingPayload, tickerRows, fundingInfoRows] = await Promise.all([
       fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/premiumIndex', 4_000_000),
-      fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/ticker/24hr', 8_000_000),
-      fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/fundingInfo', 4_000_000),
+      optionalPayload(
+        fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/ticker/24hr', 8_000_000),
+        optionalRowsSchema,
+        [],
+      ),
+      optionalPayload(
+        fetchJson(this.fetchImplementation, 'https://fapi.binance.com/fapi/v1/fundingInfo', 4_000_000),
+        optionalRowsSchema,
+        [],
+      ),
     ]);
     const rows = parsePayload(z.array(z.unknown()), fundingPayload);
     const tickers = new Map<string, z.infer<typeof BinanceTicker24hRowSchema>>();
-    for (const rawRow of parsePayload(z.array(z.unknown()), tickerPayload)) {
+    for (const rawRow of tickerRows) {
       const row = BinanceTicker24hRowSchema.safeParse(rawRow);
       if (row.success) tickers.set(row.data.symbol, row.data);
     }
     const fundingIntervals = new Map<string, number>();
-    for (const rawRow of parsePayload(z.array(z.unknown()), fundingInfoPayload)) {
+    for (const rawRow of fundingInfoRows) {
       const row = BinanceFundingInfoRowSchema.safeParse(rawRow);
       if (row.success) fundingIntervals.set(row.data.symbol, fundingIntervalHours(row.data.fundingIntervalHours));
     }
