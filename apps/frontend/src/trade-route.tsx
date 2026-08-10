@@ -1,5 +1,5 @@
 import { Fragment, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { contiguousCandleTail } from '@gate-crossex/shared-types';
+import { contiguousCandleTail, type CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
   ApiError,
@@ -45,10 +45,13 @@ import {
   groupLevels,
   isPositiveDecimal,
   liveMarketFor,
+  maxPositionValueAtLeverage,
   powerOfTenText,
   priceText,
+  projectedPositionValue,
   quoteFor,
   signedAmount,
+  signedPortfolioQuantity,
   symbolParts,
   ticketIssues,
   useDialogFocus,
@@ -58,6 +61,9 @@ import {
   type Side,
 } from './route-shared.js';
 import { aggregatePositionFundingFee, positionFundingFee } from './position-funding-fees.js';
+import { positionGroupKey, positionGroupLabel } from './position-grouping.js';
+import { PositionCloseDialog } from './position-close-dialog.js';
+import { numericFutureFeeRate } from './fee-rates.js';
 import { useLanguage } from './i18n.js';
 
 const CandleChart = lazy(() => import('./charts.js').then((module) => ({ default: module.CandleChart })));
@@ -268,6 +274,8 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [officialFundingSnapshot, setOfficialFundingSnapshot] = useState<PublicMarketSnapshot | null>(null);
   const [sizeUnits, setSizeUnits] = useState<Record<string, string> | null>(null);
   const [maxLeverage, setMaxLeverage] = useState<string | null>(null);
+  const [riskTiers, setRiskTiers] = useState<CrossExRiskLimitTier[] | null>(null);
+  const [riskTiersLoaded, setRiskTiersLoaded] = useState(false);
   const [currentLeverage, setCurrentLeverage] = useState<string | null>(null);
   const [leverageOpen, setLeverageOpen] = useState(false);
   const [leverageDraft, setLeverageDraft] = useState('1');
@@ -309,15 +317,16 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const sizeMultiplier = sizeUnitText !== undefined && isPositiveDecimal(sizeUnitText) ? Number(sizeUnitText) : null;
   const effectivePrice = orderType === 'Market' ? displayedPrice : Number(price) || 0;
   const total = (effectivePrice * (Number(amount) || 0)).toFixed(2);
-  const issues = useMemo(() => ticketIssues({ orderType, price, amount, referencePrice: displayedPrice, quote, instrument, t }),
+  const ticketValidationIssues = useMemo(() => ticketIssues({ orderType, price, amount, referencePrice: displayedPrice, quote, instrument, t }),
     [orderType, price, amount, displayedPrice, quote, instrument, t]);
   const availableBalance = balanceFor(balances, authenticatedPortfolio, exchangeId);
   const sharedMarginMode = usesSharedCrossExMargin(authenticatedPortfolio);
   const availableBalanceUnit = balanceUnitFor(authenticatedPortfolio, exchangeId);
   const displayedBalance = availableBalance ? Number(availableBalance).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—';
-  const venueFee = fees.find((fee) => fee.venue === exchangeId.toUpperCase());
-  const takerFeeText = venueFee ? `${(Number(venueFee.futureTakerFee) * 100).toFixed(4)}%` : t('Exchange setting');
-  const makerFeeText = venueFee ? `${(Number(venueFee.futureMakerFee) * 100).toFixed(4)}%` : t('Exchange setting');
+  const takerFeeRate = numericFutureFeeRate(fees, exchangeId, symbol, 'taker');
+  const makerFeeRate = numericFutureFeeRate(fees, exchangeId, symbol, 'maker');
+  const takerFeeText = takerFeeRate !== undefined ? `${(takerFeeRate * 100).toFixed(4)}%` : t('Exchange setting');
+  const makerFeeText = makerFeeRate !== undefined ? `${(makerFeeRate * 100).toFixed(4)}%` : t('Exchange setting');
   const referenceCandle = chartReady ? hoveredCandle ?? candles[candles.length - 1] ?? null : null;
   const isFavorite = favorites.includes(symbol);
   const portfolioPosition = authenticatedPortfolio?.snapshot.futuresPositions?.find((position) => position.symbol === symbol);
@@ -325,6 +334,15 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const leverageCeiling = Math.max(1, Math.floor(Number(maxLeverage ?? portfolioPosition?.maxLeverage ?? leverageText) || 1));
   const leverageValue = Math.min(leverageCeiling, Math.max(1, Number(leverageText) || 1));
   const maxQuantityReference = orderType === 'Limit' && isPositiveDecimal(price) ? Number(price) : displayedPrice;
+  const selectedMaxPositionValue = maxPositionValueAtLeverage(riskTiers, leverageValue);
+  const existingSignedQuantity = signedPortfolioQuantity(portfolioPosition);
+  const orderDirection = side === 'Buy' ? 1 : -1;
+  const riskMaximumQuantity = selectedMaxPositionValue !== null && maxQuantityReference > 0
+    ? selectedMaxPositionValue / maxQuantityReference
+    : null;
+  const riskMaximumOrderQuantity = riskMaximumQuantity === null
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, riskMaximumQuantity - orderDirection * existingSignedQuantity);
   const instrumentSizeCap = orderType === 'Market' ? instrument?.maxMarketSize : instrument?.maxLimitSize;
   const maxOrderQuantity = (() => {
     if (reduceOnly) {
@@ -335,10 +353,30 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
     if (availableBalance === null || !Number.isFinite(available) || available < 0 || maxQuantityReference <= 0) return '';
     const marginMaximum = (available * leverageValue) / maxQuantityReference;
     const venueMaximum = instrumentSizeCap && isPositiveDecimal(instrumentSizeCap) ? Number(instrumentSizeCap) : Number.POSITIVE_INFINITY;
-    const maximum = Math.min(marginMaximum, venueMaximum);
+    const maximum = Math.min(marginMaximum, venueMaximum, riskMaximumOrderQuantity);
     return Number.isFinite(maximum) ? floorToStep(maximum, instrument?.lotSize ?? null) : '';
   })();
   const leveragePresets = [...new Set([1, 3, 5, 10, 20, leverageCeiling])].filter((value) => value <= leverageCeiling).sort((a, b) => a - b);
+  const projectedOrderPositionValue = projectedPositionValue(
+    existingSignedQuantity,
+    orderDirection * (Number(amount) || 0),
+    maxQuantityReference,
+  );
+  const riskLimitExceeded = !reduceOnly && selectedMaxPositionValue !== null
+    && projectedOrderPositionValue !== null && projectedOrderPositionValue > selectedMaxPositionValue;
+  const riskLimitUnavailable = !reduceOnly && amount !== ''
+    && (!riskTiersLoaded || selectedMaxPositionValue === null);
+  const issues = [
+    ...ticketValidationIssues,
+    ...(riskLimitExceeded
+      ? [`${t('Projected position exceeds the maximum at selected leverage')}: ${formatAmount(selectedMaxPositionValue ?? 0)} ${quote}`]
+      : riskLimitUnavailable ? [t('Unable to verify max position at selected leverage')] : []),
+  ];
+  const leverageDraftValue = Math.min(leverageCeiling, Math.max(1, Math.round(Number(leverageDraft) || 1)));
+  const draftMaxPositionValue = maxPositionValueAtLeverage(riskTiers, leverageDraftValue);
+  const draftMaxPositionQuantity = draftMaxPositionValue !== null && maxQuantityReference > 0
+    ? draftMaxPositionValue / maxQuantityReference
+    : null;
 
   function selectExchange(nextExchangeId: string) {
     if (nextExchangeId === exchangeId && pendingExchangeId === null) return;
@@ -586,14 +624,18 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   useEffect(() => {
     let cancelled = false;
     setMaxLeverage(null);
+    setRiskTiers(null);
+    setRiskTiersLoaded(false);
     setCurrentLeverage(null);
     setLeverageOpen(false);
     setLeverageError(null);
     void api.riskLimits(symbol).then((response) => {
       if (cancelled) return;
+      setRiskTiers(response.item.tiers);
+      setRiskTiersLoaded(true);
       const leverages = response.item.tiers.map((tier) => Number(tier.leverageMax)).filter(Number.isFinite);
       if (leverages.length) setMaxLeverage(String(Math.max(...leverages)));
-    }).catch(() => undefined);
+    }).catch(() => { if (!cancelled) setRiskTiersLoaded(true); });
     void api.leverage(symbol).then((response) => {
       if (!cancelled && response.leverage && isPositiveDecimal(response.leverage)) {
         setCurrentLeverage(response.leverage);
@@ -781,7 +823,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
             </button>
             {leverageOpen && <div className="leverage-popover" role="dialog" aria-label={t('Adjust leverage')}>
               <header><div><strong>{t('Adjust leverage')}</strong><span>{exchange.name} · {marketSymbol(asset, quote, 'perpetual')}</span></div><button onClick={() => setLeverageOpen(false)} aria-label={t('Close')}>✕</button></header>
-              <dl><div><dt>{t('Current leverage')}</dt><dd>{leverageValue}×</dd></div><div><dt>{t('Max leverage')}</dt><dd>{leverageCeiling}×</dd></div></dl>
+              <dl><div><dt>{t('Current leverage')}</dt><dd>{leverageValue}×</dd></div><div><dt>{t('Max leverage')}</dt><dd>{leverageCeiling}×</dd></div><div className="leverage-position-cap"><dt>{t('Max position at selected leverage')}</dt><dd>{draftMaxPositionValue !== null ? `${formatAmount(draftMaxPositionValue)} ${quote}` : '—'}{draftMaxPositionQuantity !== null && <small>≈ {formatAmount(draftMaxPositionQuantity, 6)} {asset}</small>}</dd></div></dl>
               <div className="leverage-stepper">
                 <button onClick={() => adjustLeverage(-1)} aria-label="Decrease leverage">−</button>
                 <label><input type="number" min="1" max={leverageCeiling} step="1" value={leverageDraft} onChange={(event) => setLeverageDraft(event.target.value)} aria-label={t('Leverage')} /><b>×</b></label>
@@ -817,6 +859,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
           <div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available balance')}</dt><dd>{displayedBalance} {availableBalanceUnit}</dd></div>
           <div><dt>{t('Max order quantity')}</dt><dd><button className="max-quantity" onClick={() => { if (maxOrderQuantity) { setAmount(maxOrderQuantity); setAllocation(100); } }} disabled={!maxOrderQuantity}>{maxOrderQuantity || '—'} {asset}</button></dd></div>
           <div><dt>{t('Leverage')}</dt><dd><button className="summary-leverage" onClick={openLeverageEditor}>{leverageValue}×</button></dd></div>
+          <div><dt>{t('Max position at selected leverage')}</dt><dd>{selectedMaxPositionValue !== null ? `${formatAmount(selectedMaxPositionValue)} ${quote}` : '—'}</dd></div>
           <div><dt>{t('Est. liquidation price')}</dt><dd>{t('Available after execution')}</dd></div>
           <div><dt>{t('Maker fee')}</dt><dd>{makerFeeText}</dd></div>
           <div><dt>{t('Taker fee')}</dt><dd>{takerFeeText}</dd></div>
@@ -824,7 +867,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
       </aside>
     </section>
 
-    <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} bottomTab={bottomTab} setBottomTab={setBottomTab} expandedPosition={expandedPosition} setExpandedPosition={setExpandedPosition} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
+    <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} instruments={instrumentCatalog} bottomTab={bottomTab} setBottomTab={setBottomTab} expandedPosition={expandedPosition} setExpandedPosition={setExpandedPosition} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
     {confirming && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => setConfirming(false)}>
       <section ref={confirmDialogRef} tabIndex={-1} className="confirm-order-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-order-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>
@@ -841,6 +884,8 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
           <div><dt>{t('Amount')}</dt><dd>{amount} {asset}</dd></div>
           <div><dt>{t('Total')}</dt><dd>≈ {total} {quote}</dd></div>
           <div><dt>{t('Leverage')}</dt><dd>{leverageValue}×</dd></div>
+          <div><dt>{t('Max position at selected leverage')}</dt><dd>{selectedMaxPositionValue !== null ? `${formatAmount(selectedMaxPositionValue)} ${quote}` : '—'}</dd></div>
+          <div><dt>{t('Projected position')}</dt><dd>{projectedOrderPositionValue !== null ? `${formatAmount(projectedOrderPositionValue)} ${quote}` : '—'}</dd></div>
           <div><dt>{t('Reduce only')}</dt><dd>{t(reduceOnly ? 'Yes' : 'No')}</dd></div>
         </dl>
         <label className="disclaimer-agree confirm-skip">
@@ -871,9 +916,10 @@ function EmptyTable({ label }: { label: string }) {
   return <div className="empty-state"><span>◎</span><strong>{t(`No ${label.toLowerCase()}`)}</strong><p>{t('The backend will add rows here as executions occur.')}</p></div>;
 }
 
-function ExecutionTables({ snapshot, portfolio, bottomTab, setBottomTab, expandedPosition, setExpandedPosition, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
+function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBottomTab, expandedPosition, setExpandedPosition, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
   snapshot: TradingSnapshot | null;
   portfolio: AuthenticatedPortfolioSnapshot | null;
+  instruments: CrossExInstrument[] | null;
   bottomTab: string;
   setBottomTab: (tab: string) => void;
   expandedPosition: string | null;
@@ -887,15 +933,13 @@ function ExecutionTables({ snapshot, portfolio, bottomTab, setBottomTab, expande
   const { t } = useLanguage();
   const [cancellingIds, setCancellingIds] = useState<string[]>([]);
   const [closeTargets, setCloseTargets] = useState<Position[] | null>(null);
-  const [closingPosition, setClosingPosition] = useState(false);
-  const closeDialogRef = useDialogFocus(Boolean(closeTargets), closingPosition ? undefined : () => setCloseTargets(null));
   const positions = snapshot?.positions.filter((position) => Number(position.quantity) !== 0) ?? [];
   const orders = snapshot?.orders ?? [];
   const openOrders = orders.filter((order) => OPEN_ORDER_STATES.includes(order.state));
   const fills = snapshot?.fills ?? [];
   const groups = Object.values(positions.reduce<Record<string, Position[]>>((result, position) => {
     const asset = symbolParts(position.symbol).asset;
-    (result[asset] ??= []).push(position);
+    (result[positionGroupKey(asset)] ??= []).push(position);
     return result;
   }, {}));
   const tabs = [`Positions (${positions.length})`, `Open orders (${openOrders.length})`, 'Order history', 'Trade history'];
@@ -905,7 +949,6 @@ function ExecutionTables({ snapshot, portfolio, bottomTab, setBottomTab, expande
   const fundingFeeCell = (value: number | null, quote: string) => <td className={value !== null && value > 0 ? 'positive' : value !== null && value < 0 ? 'negative' : ''}>
     {value === null ? '—' : `${signedAmount(value)} ${quote}`}
   </td>;
-  const closeVenueCount = closeTargets ? new Set(closeTargets.map((position) => symbolParts(position.symbol).venue)).size : 0;
   useEffect(() => {
     if (!active.startsWith('Positions') || positions.length === 0) return;
     let refreshInProgress = false;
@@ -922,44 +965,6 @@ function ExecutionTables({ snapshot, portfolio, bottomTab, setBottomTab, expande
       return;
     }
     setCloseTargets(targets);
-  };
-  const closePositions = async () => {
-    if (!closeTargets || closingPosition) return;
-    const targets = closeTargets;
-    setClosingPosition(true);
-    const positionMode = portfolio?.snapshot.account.positionMode;
-    const results = await Promise.allSettled(targets.map((position) => {
-      const portfolioPosition = portfolio?.snapshot.futuresPositions?.find((item) => item.positionId === position.position_id);
-      const signedQuantity = Number(position.quantity);
-      const inferredSide = signedQuantity >= 0 ? 'LONG' : 'SHORT';
-      const positionSide = positionMode === 'DUAL'
-        ? (portfolioPosition?.positionSide === 'LONG' || portfolioPosition?.positionSide === 'SHORT' ? portfolioPosition.positionSide : inferredSide)
-        : 'NONE';
-      return api.createOrder({
-        symbol: position.symbol,
-        side: signedQuantity >= 0 ? 'SELL' : 'BUY',
-        type: 'MARKET',
-        timeInForce: 'IOC',
-        quantity: position.quantity.trim().replace(/^-/, ''),
-        reduceOnly: true,
-        positionSide,
-      });
-    }));
-    const failures = results.filter((result) => result.status === 'rejected');
-    try {
-      await onTradingChanged();
-    } catch {
-      // The private execution stream will still reconcile accepted close orders.
-    }
-    if (failures.length === 0) {
-      notify('ok', t('Close order submitted'), `${targets.length} · ${t('Market reduce-only')}`);
-    } else {
-      const firstFailure = failures[0] as PromiseRejectedResult;
-      const detail = firstFailure.reason instanceof ApiError ? firstFailure.reason.message : t('Backend unavailable');
-      notify('error', t(failures.length === targets.length ? 'Position close failed' : 'Some positions failed to close'), detail);
-    }
-    setClosingPosition(false);
-    setCloseTargets(null);
   };
   // A silently failed cancel looks identical to a dead order — surface the failure and keep the
   // row locked while the request is in flight so a double click cannot fire twice.
@@ -980,6 +985,9 @@ function ExecutionTables({ snapshot, portfolio, bottomTab, setBottomTab, expande
     <div className="positions-head"><div className="panel-tabs">{tabs.map((tab) => { const match = tab.match(/^(.+?)( \(\d+\))?$/); return <button className={active === tab ? 'active' : ''} onClick={() => setBottomTab(tab)} key={tab}>{t(match?.[1] ?? tab)}{match?.[2] ?? ''}</button>; })}</div></div>
     {active.startsWith('Positions') && (groups.length ? <div className="positions-table table-wrap"><table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th><th>{t('Close position')}</th></tr></thead><tbody>{groups.map((legs) => {
       const asset = symbolParts(legs[0].symbol).asset;
+      const assets = [...new Set(legs.map((leg) => symbolParts(leg.symbol).asset))];
+      const mixedAssets = assets.length > 1;
+      const groupLabel = positionGroupLabel(assets);
       const quantity = legs.reduce((sum, leg) => sum + Number(leg.quantity), 0);
       const grossQuantity = legs.reduce((sum, leg) => sum + Math.abs(Number(leg.quantity)), 0);
       const grossNotional = legs.reduce((sum, leg) => sum + notionalFor(leg), 0);
@@ -987,38 +995,35 @@ function ExecutionTables({ snapshot, portfolio, bottomTab, setBottomTab, expande
       const pnl = legs.reduce((sum, leg) => sum + (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity), 0);
       const weightedEntryPrice = legs.reduce((sum, leg) => sum + Number(leg.entry_price) * Math.abs(Number(leg.quantity)), 0) / grossQuantity;
       const weightedMarkPrice = legs.reduce((sum, leg) => sum + Number(leg.mark_price) * Math.abs(Number(leg.quantity)), 0) / grossQuantity;
-      const fullyHedged = grossQuantity > 0 && Math.abs(quantity) <= Math.max(1e-12, grossQuantity * 1e-9);
-      const key = `${asset}-PERP`;
+      const fullyHedged = mixedAssets
+        ? legs.some((leg) => Number(leg.quantity) > 0) && legs.some((leg) => Number(leg.quantity) < 0)
+        : grossQuantity > 0 && Math.abs(quantity) <= Math.max(1e-12, grossQuantity * 1e-9);
+      const key = `${positionGroupKey(asset)}-PERP`;
       if (legs.length === 1) {
         const leg = legs[0];
         const part = symbolParts(leg.symbol);
         return <tr key={key}><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small className={quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(quantity >= 0 ? 'Long' : 'Short')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{quantity.toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>;
       }
       const aggregateFundingFee = aggregatePositionFundingFee(legs, portfolioPositions);
-      return <Fragment key={key}><tr className="aggregate-row"><td><button className={expandedPosition === key ? 'expand-position expanded' : 'expand-position'} onClick={() => setExpandedPosition(expandedPosition === key ? null : key)}>›</button><strong>{asset} PERP</strong><small className={fullyHedged ? 'hedged-tag' : quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(fullyHedged ? 'Hedged' : quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{venueCount} {t(venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{quantity.toFixed(4)} {asset}</td><td>${formatAmount(grossNotional)}</td><td>{compactPrice(weightedEntryPrice)}</td><td>{compactPrice(weightedMarkPrice)}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT</td><td>{legs.reduce((sum, leg) => sum + Number(leg.realized_pnl), 0).toFixed(2)} USDT</td>{fundingFeeCell(aggregateFundingFee, 'USDT')}<td><button className="row-action close-position-action" onClick={() => requestClose(legs)}>{t('Close all')}</button></td></tr>{expandedPosition === key && legs.map((leg) => { const part = symbolParts(leg.symbol); const legPnl = (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity); return <tr className="position-leg" key={leg.symbol}><td><span className="leg-branch">↳</span><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{Number(leg.quantity).toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td className={legPnl >= 0 ? 'positive' : 'negative'}>{legPnl >= 0 ? '+' : ''}{legPnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>; })}</Fragment>;
+      return <Fragment key={key}><tr className="aggregate-row"><td><button className={expandedPosition === key ? 'expand-position expanded' : 'expand-position'} onClick={() => setExpandedPosition(expandedPosition === key ? null : key)}>›</button><strong>{groupLabel} PERP</strong><small className={fullyHedged ? 'hedged-tag' : quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(fullyHedged ? 'Hedged' : quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{venueCount} {t(venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{mixedAssets ? '—' : `${quantity.toFixed(4)} ${asset}`}</td><td>${formatAmount(grossNotional)}</td><td>{mixedAssets ? '—' : compactPrice(weightedEntryPrice)}</td><td>{mixedAssets ? '—' : compactPrice(weightedMarkPrice)}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT</td><td>{legs.reduce((sum, leg) => sum + Number(leg.realized_pnl), 0).toFixed(2)} USDT</td>{fundingFeeCell(aggregateFundingFee, 'USDT')}<td><button className="row-action close-position-action" onClick={() => requestClose(legs)}>{t('Close all')}</button></td></tr>{expandedPosition === key && legs.map((leg) => { const part = symbolParts(leg.symbol); const legPnl = (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity); return <tr className="position-leg" key={leg.symbol}><td><span className="leg-branch">↳</span><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{Number(leg.quantity).toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td className={legPnl >= 0 ? 'positive' : 'negative'}>{legPnl >= 0 ? '+' : ''}{legPnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>; })}</Fragment>;
     })}</tbody></table></div> : <EmptyTable label="positions" />)}
     {active.startsWith('Open orders') && (openOrders.length ? <OrderTable orders={openOrders} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
     {active === 'Order history' && (orders.length ? <OrderTable orders={orders} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
     {active === 'Trade history' && (fills.length ? <FillTable fills={fills} /> : <EmptyTable label="trade history" />)}
-    {closeTargets && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => { if (!closingPosition) setCloseTargets(null); }}>
-      <section ref={closeDialogRef} tabIndex={-1} className="confirm-order-modal close-position-modal" role="dialog" aria-modal="true" aria-labelledby="close-position-title" onMouseDown={(event) => event.stopPropagation()}>
-        <header>
-          <div><p className="eyebrow negative">{t('Close position')}</p><h2 id="close-position-title">{t('Confirm close position')}</h2><span className="confirm-market">{closeTargets.length === 1 ? marketSymbol(symbolParts(closeTargets[0].symbol).asset, symbolParts(closeTargets[0].symbol).quote, 'perpetual') : `${symbolParts(closeTargets[0].symbol).asset} PERP`} · {closeVenueCount} {t(closeVenueCount === 1 ? 'exchange' : 'exchanges')}</span></div>
-          <button className="disclaimer-close" aria-label={t('Close')} onClick={() => setCloseTargets(null)} disabled={closingPosition}>×</button>
-        </header>
-        <dl className="confirm-order-summary">
-          <div><dt>{t('Positions to close')}</dt><dd>{closeTargets.length}</dd></div>
-          <div><dt>{t('Size')}</dt><dd>{formatAmount(closeTargets.reduce((sum, position) => sum + Math.abs(Number(position.quantity)), 0), 4)} {symbolParts(closeTargets[0].symbol).asset}</dd></div>
-          <div><dt>{t('Position notional')}</dt><dd>${formatAmount(closeTargets.reduce((sum, position) => sum + notionalFor(position), 0))}</dd></div>
-          <div><dt>{t('Execution')}</dt><dd>{t('Market reduce-only')}</dd></div>
-        </dl>
-        <p className="close-position-warning">{t('Close position warning')}</p>
-        <div className="confirm-order-actions">
-          <button className="confirm-back" data-dialog-autofocus onClick={() => setCloseTargets(null)} disabled={closingPosition}>{t('Go back')}</button>
-          <button className="confirm-submit sell" onClick={() => void closePositions()} disabled={closingPosition}><strong>{closingPosition ? t('Closing position…') : t('Confirm close')}</strong><span>{t('Market reduce-only')}</span></button>
-        </div>
-      </section>
-    </div>}
+    {closeTargets && <PositionCloseDialog
+      targets={closeTargets.map((position) => ({
+        id: `${position.symbol}:${position.position_id}`,
+        positionId: position.position_id,
+        symbol: position.symbol,
+        quantity: position.quantity,
+        markPrice: position.mark_price,
+      }))}
+      portfolio={portfolio}
+      instruments={instruments}
+      onDismiss={() => setCloseTargets(null)}
+      onCompleted={onTradingChanged}
+      notify={notify}
+    />}
   </section>;
 }
 
