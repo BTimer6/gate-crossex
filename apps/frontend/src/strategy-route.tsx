@@ -21,7 +21,7 @@ import { cumulativeFundingHistory, cumulativeFundingPnl } from './cumulative-fun
 import { fundingPercentScaledTo8h } from './funding-rates.js';
 import { marketSymbol } from './market-symbol.js';
 import { usePairCandleHistory } from './pair-candle-history.js';
-import { assessMarketPairFreshness, candleTailIsFresh, candleTimestampIsFresh } from './market-freshness.js';
+import { assessMarketPairFreshness, candleTailIsFresh, candleTimestampIsFresh, lastKnownLiveMarketPair } from './market-freshness.js';
 import { buildPremiumHistory, mergeCandleHistory, premiumHistoryViewKey, type PremiumHistoryPoint } from './premium-history.js';
 import { buildPriceDifferenceHistory, type PriceDifferenceHistoryPoint } from './price-difference-history.js';
 import {
@@ -1059,7 +1059,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     hedge: Candle[];
     adrHasMore: boolean;
     hedgeHasMore: boolean;
-    status: 'loading' | 'live' | 'failed';
+    status: 'loading' | 'live' | 'stale' | 'empty' | 'failed';
   }>({ key: '', adr: [], hedge: [], adrHasMore: true, hedgeHasMore: true, status: 'loading' });
   const [hoveredPremium, setHoveredPremium] = useState<PremiumHistoryPoint | null>(null);
   const [freshnessNow, setFreshnessNow] = useState(Date.now());
@@ -1100,37 +1100,35 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     const interval = premiumHistoryInterval;
     const key = premiumHistoryKey;
     setPremiumCandles((current) => current.key === key
-      ? { ...current, status: current.adr.length > 0 && current.hedge.length > 0 ? 'live' : 'loading' }
+      ? current
       : { key, adr: [], hedge: [], adrHasMore: true, hedgeHasMore: true, status: 'loading' });
 
     const load = async () => {
       if (inFlight) return;
       inFlight = true;
-      try {
-        const [adrResponse, hedgeResponse] = await Promise.all([
-          api.candles(adrSymbol, interval, { limit: 300, fresh: true }),
-          api.candles(hedgeSymbol, interval, { limit: 300, fresh: true }),
-        ]);
-        if (!cancelled) setPremiumCandles((current) => {
-          if (current.key !== key) return current;
-          const adr = mergeCandleHistory(current.adr, adrResponse.candles);
-          const hedge = mergeCandleHistory(current.hedge, hedgeResponse.candles);
-          return {
-            key,
-            adr,
-            hedge,
-            adrHasMore: adrResponse.hasMore,
-            hedgeHasMore: hedgeResponse.hasMore,
-            status: candleTailIsFresh(adr, interval) && candleTailIsFresh(hedge, interval) ? 'live' : 'loading',
-          };
-        });
-      } catch {
-        if (!cancelled) setPremiumCandles((current) => current.key === key
-          ? { ...current, adr: [], hedge: [], status: 'failed' }
-          : current);
-      } finally {
-        inFlight = false;
-      }
+      const [adrResult, hedgeResult] = await Promise.allSettled([
+        api.candles(adrSymbol, interval, { limit: 300, fresh: true }),
+        api.candles(hedgeSymbol, interval, { limit: 300, fresh: true }),
+      ]);
+      if (!cancelled) setPremiumCandles((current) => {
+        if (current.key !== key) return current;
+        const adrResponse = adrResult.status === 'fulfilled' ? adrResult.value : null;
+        const hedgeResponse = hedgeResult.status === 'fulfilled' ? hedgeResult.value : null;
+        const adr = adrResponse ? mergeCandleHistory(current.adr, adrResponse.candles) : current.adr;
+        const hedge = hedgeResponse ? mergeCandleHistory(current.hedge, hedgeResponse.candles) : current.hedge;
+        const hasPair = adr.length > 0 && hedge.length > 0;
+        return {
+          key,
+          adr,
+          hedge,
+          adrHasMore: adrResponse?.hasMore ?? current.adrHasMore,
+          hedgeHasMore: hedgeResponse?.hasMore ?? current.hedgeHasMore,
+          status: hasPair
+            ? candleTailIsFresh(adr, interval) && candleTailIsFresh(hedge, interval) ? 'live' : 'stale'
+            : adrResult.status === 'rejected' || hedgeResult.status === 'rejected' ? 'failed' : 'empty',
+        };
+      });
+      inFlight = false;
     };
 
     void load();
@@ -1155,10 +1153,12 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     premiumHistoryLoadingRef.current.add(key);
     premiumHistoryRequestedRef.current.add(requestKey);
 
-    void Promise.all([
+    void Promise.allSettled([
       loadAdr ? api.candles(adrSymbol, interval, { before: oldestAdr.startTime, limit: 300 }) : null,
       loadHedge ? api.candles(hedgeSymbol, interval, { before: oldestHedge.startTime, limit: 300 }) : null,
-    ]).then(([adrResponse, hedgeResponse]) => {
+    ]).then(([adrResult, hedgeResult]) => {
+      const adrResponse = adrResult.status === 'fulfilled' ? adrResult.value : null;
+      const hedgeResponse = hedgeResult.status === 'fulfilled' ? hedgeResult.value : null;
       setPremiumCandles((current) => current.key === key ? {
         ...current,
         adr: adrResponse ? mergeCandleHistory(current.adr, adrResponse.candles) : current.adr,
@@ -1166,9 +1166,10 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         adrHasMore: adrResponse ? adrResponse.candles.length > 0 && adrResponse.hasMore : current.adrHasMore,
         hedgeHasMore: hedgeResponse ? hedgeResponse.candles.length > 0 && hedgeResponse.hasMore : current.hedgeHasMore,
       } : current);
-    }).catch(() => {
-      // Transient venue failures stay retryable on the next visible-range change.
-      premiumHistoryRequestedRef.current.delete(requestKey);
+      if (adrResult.status === 'rejected' || hedgeResult.status === 'rejected') {
+        // Transient venue failures stay retryable on the next visible-range change.
+        premiumHistoryRequestedRef.current.delete(requestKey);
+      }
     }).finally(() => {
       premiumHistoryLoadingRef.current.delete(key);
     });
@@ -1176,6 +1177,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
 
   const livePairFreshness = assessMarketPairFreshness(marketSnapshot, adrSymbol, hedgeSymbol, freshnessNow);
   const livePair = livePairFreshness.pair;
+  const displayPair = livePair ?? lastKnownLiveMarketPair(marketSnapshot, adrSymbol, hedgeSymbol);
   const livePairWaitMessage = t(livePairFreshness.reason === 'feed'
     ? 'Market feed is reconnecting.'
     : livePairFreshness.reason === 'missing'
@@ -1185,8 +1187,8 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         : livePairFreshness.reason === 'stale'
           ? 'A selected quote is stale; waiting for its next update.'
           : 'Fresh quotes arrived too far apart; synchronizing the pair…');
-  const adrLive = livePair?.left ?? null;
-  const hedgeLive = livePair?.right ?? null;
+  const adrLive = displayPair?.left ?? null;
+  const hedgeLive = displayPair?.right ?? null;
   const adrPrice = Number(adrLive?.lastPrice ?? 0);
   const hedgePrice = Number(hedgeLive?.lastPrice ?? 0);
   const ratioNumber = Number(adrRatio) || 0;
@@ -1212,9 +1214,10 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         premiumHistoryInterval,
         freshnessNow,
       ));
-  const premiumPoints = premiumHistoryTailIsFresh ? candidatePremiumPoints : [];
+  const premiumPoints = premiumHistoryIsCurrent ? candidatePremiumPoints : [];
+  const premiumHistoryHasData = premiumPoints.length > 0;
   const latestPremiumPoint = premiumPoints[premiumPoints.length - 1] ?? null;
-  const usableHoveredPremium = premiumHistoryTailIsFresh ? hoveredPremium : null;
+  const usableHoveredPremium = premiumHistoryHasData ? hoveredPremium : null;
   const displayedPremiumPoint = usableHoveredPremium ?? latestPremiumPoint;
   const displayedPremium = usableHoveredPremium?.value ?? premiumNow ?? latestPremiumPoint?.value ?? null;
   const displayedAdrPrice = usableHoveredPremium?.adrClose ?? (adrPrice > 0 ? adrPrice : latestPremiumPoint?.adrClose ?? null);
@@ -1222,12 +1225,18 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const displayedFairValue = displayedHedgePrice !== null && ratioNumber > 0 ? displayedHedgePrice / ratioNumber : null;
   const displayedGap = displayedAdrPrice !== null && displayedFairValue !== null ? displayedAdrPrice - displayedFairValue : null;
   const historySeriesKey = premiumHistoryViewKey(premiumHistoryKey, premiumRange, adrRatio);
-  // A failed or stale refresh intentionally remains "loading"; cached points are never painted
-  // as though they were live.
-  const historyStatus: 'loading' | 'live' = premiumHistoryTailIsFresh ? 'live' : 'loading';
+  const historyStatus: 'loading' | 'live' | 'stale' | 'empty' | 'failed' = !premiumHistoryIsCurrent
+    ? 'loading'
+    : premiumHistoryTailIsFresh
+      ? 'live'
+      : premiumHistoryHasData
+        ? 'stale'
+        : premiumCandles.status === 'failed' ? 'failed' : premiumCandles.status;
   const historyPlaceholder = historyStatus === 'loading'
     ? t('Loading premium history…')
-    : t('No overlapping candles for this venue pair.');
+    : historyStatus === 'failed'
+      ? t('Premium history unavailable')
+      : t('No overlapping candles for this venue pair.');
   const shortPremium = !directionFlipped;
   const adrSide = shortPremium ? 'Sell' : 'Buy';
   const hedgeSide = shortPremium ? 'Buy' : 'Sell';
@@ -1384,7 +1393,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
               <small>{t('Selected venue pair')}</small>
             </div>
             <div className="premium-history-controls">
-              <span className={`premium-live-badge ${historyStatus === 'live' ? '' : 'loading'}`}><i /> {t(historyStatus === 'live' ? 'Live pair' : 'Loading')}</span>
+              <span className={`premium-live-badge ${historyStatus === 'live' ? '' : 'loading'}`}><i /> {t(historyStatus === 'live' ? 'Live pair' : historyStatus === 'stale' ? 'Stale history' : historyStatus === 'empty' ? 'No data' : historyStatus === 'failed' ? 'Unavailable' : 'Loading')}</span>
               <div role="group" aria-label={t('Historical premium')}>
                 {(Object.keys(PAIR_HISTORY_RANGES) as PairHistoryRange[]).map((range) =>
                   <button key={range} className={premiumRange === range ? 'active' : ''} onClick={() => setPremiumRange(range)}>{range}</button>)}

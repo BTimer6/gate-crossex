@@ -1376,7 +1376,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }, STREAM_STATUS_INTERVAL_MS);
     statusHeartbeat.unref?.();
     let watchReleases: Array<() => void> = [];
+    let quoteWatchRelease: (() => void) | null = null;
     const clearWatch = () => { for (const release of watchReleases.splice(0)) release(); };
+    const clearQuoteWatch = () => {
+      quoteWatchRelease?.();
+      quoteWatchRelease = null;
+    };
     safeSend({ type: 'mode.update', payload: { mode: tradingSession.current } });
     safeSend({ type: 'strategy.snapshot', payload: { strategies: tradingRuntime.listStrategies() } });
     safeSend({ type: 'execution.snapshot', payload: tradingRuntime.snapshot() });
@@ -1386,8 +1391,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       const watch = WatchMessageSchema.safeParse(parsedMessage);
       if (!watch.success) return;
       if (watch.data.type === 'watch.quotes') {
-        for (const symbol of watch.data.symbols) ensureMarketKnown(symbol);
-        marketSymbols = new Set(watch.data.symbols);
+        clearQuoteWatch();
+        const symbols = watch.data.symbols.filter((symbol) => ensureMarketKnown(symbol));
+        quoteWatchRelease = marketHub.watchQuotes(symbols);
+        marketSymbols = new Set(symbols);
         clearMarketBatch();
         if (marketSymbols.size > 0) {
           const snapshot = marketHub.snapshot();
@@ -1420,6 +1427,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     });
     socket.on('close', () => {
       clearWatch();
+      clearQuoteWatch();
       clearMarketBatch();
       clearVolatileBatches();
       clearInterval(statusHeartbeat);
