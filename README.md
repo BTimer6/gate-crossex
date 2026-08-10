@@ -20,8 +20,14 @@ CrossEx connects Gate.io, Binance, OKX, Bybit, Kraken, Hyperliquid, and Deribit 
   Live charts, order books, trades, funding rates, and open interest.
 - 跨平台资产、余额、持仓、订单、成交和账户流水。<br>
   Cross-venue portfolio, balances, positions, orders, fills, and account activity.
-- 直接下单、资金划转、配对对冲、价差机器人和 ADR 溢价策略。<br>
-  Direct orders, fund transfers, paired hedges, spread bots, and ADR premium strategies.
+- 直接下单、资金划转、配对对冲、价差机器人、ADR 溢价策略和 Boros 固定资金费率工作流。<br>
+  Direct orders, fund transfers, paired hedges, spread bots, ADR premium strategies, and a Boros fixed-rate workflow.
+- 按资产分组持仓，支持即时或定时分批只减仓平仓。<br>
+  Asset-grouped positions with immediate or timed reduce-only closing.
+- 按交易对比较账户手续费，并按各交易所原生结算周期显示和标准化资金费率。<br>
+  Account fee comparison by market, plus funding rates displayed and normalized using each venue's native settlement interval.
+- 策略启动和直接下单前验证保证金及杠杆风险档位上限。<br>
+  Margin and leverage-tier position-limit checks before strategy launches and direct orders.
 - 仅在你的电脑上运行，只绑定 `127.0.0.1`，不包含遥测或云端后端。<br>
   Runs on your computer, binds only to `127.0.0.1`, and has no telemetry or hosted backend.
 
@@ -148,6 +154,8 @@ Report vulnerabilities through [GitHub private vulnerability reporting](SECURITY
   [Architecture](docs/architecture.md)
 - [发布流程](docs/RELEASING.md)<br>
   [Release process](docs/RELEASING.md)
+- [更新日志](CHANGELOG.md)<br>
+  [Changelog](CHANGELOG.md)
 - [第三方声明](THIRD_PARTY_NOTICES.md)<br>
   [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [GNU AGPL-3.0-only 开源许可证](LICENSE)<br>
