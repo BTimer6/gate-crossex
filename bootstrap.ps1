@@ -219,7 +219,7 @@ function Install-GateCrossExSource {
         (Get-Content -LiteralPath $PackageJson -Raw | ConvertFrom-Json).name -ne 'gate-crossex-terminal') {
         throw 'The source archive does not identify itself as Gate CrossEx.'
     }
-    foreach ($Required in @('package-lock.json', 'bootstrap.ps1', 'run.ps1', 'scripts\launcher.mjs')) {
+    foreach ($Required in @('package-lock.json', 'bootstrap.ps1', 'run.ps1', 'scripts\launcher.mjs', 'scripts\check-for-update.mjs')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Script:NewRoot $Required))) {
             throw "The source archive is missing $Required."
         }

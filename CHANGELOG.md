@@ -2,6 +2,17 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [0.2.1] - 2026-08-10
+
+### Added
+
+- Added a bilingual interactive CLI update check that detects newer published GitHub releases and offers to run the existing update workflow before startup.
+
+### Changed
+
+- Update checks now skip non-interactive launches, development branches, pinned source refs, offline failures, and sessions with `GCT_SKIP_UPDATE_CHECK=1`.
+- Source bootstraps now validate that the update-check helper is present before activating a downloaded source tree.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

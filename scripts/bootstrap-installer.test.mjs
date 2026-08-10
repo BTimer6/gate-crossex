@@ -42,6 +42,7 @@ function makeSourceArchive(directory, label) {
   writeFileSync(join(source, 'bootstrap.sh'), '#!/bin/bash\nexit 0\n');
   writeExecutable(join(source, 'run'), '#!/bin/bash\nexit 0\n');
   writeFileSync(join(source, 'scripts/launcher.mjs'), '/* fixture */\n');
+  copyFileSync(join(root, 'scripts/check-for-update.mjs'), join(source, 'scripts/check-for-update.mjs'));
   writeFileSync(join(source, 'fixture-version.txt'), `${label}\n`);
   const archive = join(directory, `source-${label}.tar.gz`);
   execFileSync('tar', ['-czf', archive, '-C', dirname(source), source.split('/').at(-1)]);
@@ -91,6 +92,7 @@ function makeWindowsSourceArchive(directory, label) {
 import fixtureVersion from '@gate-crossex/bootstrap-fixture';
 if (fixtureVersion !== '${label}') throw new Error('workspace link resolved the wrong fixture');
 `);
+  copyFileSync(join(root, 'scripts/check-for-update.mjs'), join(source, 'scripts/check-for-update.mjs'));
   mkdirSync(join(source, 'packages/bootstrap-fixture'), { recursive: true });
   writeFileSync(join(source, 'packages/bootstrap-fixture/package.json'), `${JSON.stringify({
     name: '@gate-crossex/bootstrap-fixture',

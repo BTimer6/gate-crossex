@@ -122,6 +122,10 @@ Credentials remain in the OS keychain or an explicitly selected local `.env` fil
 
 Run these commands from `~/gate-crossex`, or from the custom folder selected during bootstrap.
 
+在交互式终端中启动时，Gate CrossEx 会快速检查 GitHub 上最新发布的版本。如果有新版本，它会在执行任何更新前询问你。拒绝更新或网络不可用不会阻止启动；设置 `GCT_SKIP_UPDATE_CHECK=1` 可禁用检查。开发分支、固定源码版本和非交互式启动不会检查更新。
+
+When started in an interactive terminal, Gate CrossEx briefly checks the latest published GitHub release. If a newer version exists, it asks before updating. Declining or being offline does not block startup; set `GCT_SKIP_UPDATE_CHECK=1` to disable the check. Development branches, pinned source refs, and non-interactive launches skip it.
+
 | 操作<br>Action | macOS 或 Linux<br>macOS or Linux | Windows PowerShell |
 | --- | --- | --- |
 | 更新<br>Update | `cd ~/gate-crossex && ./run update` | `Set-Location "$HOME\gate-crossex"; .\run.ps1 update` |
