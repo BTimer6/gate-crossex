@@ -605,12 +605,20 @@ export const PublicTradeSchema = z.object({
 });
 export type PublicTrade = z.infer<typeof PublicTradeSchema>;
 
+export const SymbolFeeRateSchema = z.object({
+  symbol: z.string(),
+  makerFee: z.string(),
+  takerFee: z.string(),
+});
+export type SymbolFeeRate = z.infer<typeof SymbolFeeRateSchema>;
+
 export const VenueFeeRateSchema = z.object({
   venue: z.string(),
   spotMakerFee: z.string(),
   spotTakerFee: z.string(),
   futureMakerFee: z.string(),
   futureTakerFee: z.string(),
+  specialFees: z.array(SymbolFeeRateSchema).optional(),
 });
 export type VenueFeeRate = z.infer<typeof VenueFeeRateSchema>;
 

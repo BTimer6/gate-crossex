@@ -58,6 +58,7 @@ import {
   type Side,
 } from './route-shared.js';
 import { aggregatePositionFundingFee, positionFundingFee } from './position-funding-fees.js';
+import { numericFutureFeeRate } from './fee-rates.js';
 import { useLanguage } from './i18n.js';
 
 const CandleChart = lazy(() => import('./charts.js').then((module) => ({ default: module.CandleChart })));
@@ -315,9 +316,10 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const sharedMarginMode = usesSharedCrossExMargin(authenticatedPortfolio);
   const availableBalanceUnit = balanceUnitFor(authenticatedPortfolio, exchangeId);
   const displayedBalance = availableBalance ? Number(availableBalance).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '—';
-  const venueFee = fees.find((fee) => fee.venue === exchangeId.toUpperCase());
-  const takerFeeText = venueFee ? `${(Number(venueFee.futureTakerFee) * 100).toFixed(4)}%` : t('Exchange setting');
-  const makerFeeText = venueFee ? `${(Number(venueFee.futureMakerFee) * 100).toFixed(4)}%` : t('Exchange setting');
+  const takerFeeRate = numericFutureFeeRate(fees, exchangeId, symbol, 'taker');
+  const makerFeeRate = numericFutureFeeRate(fees, exchangeId, symbol, 'maker');
+  const takerFeeText = takerFeeRate !== undefined ? `${(takerFeeRate * 100).toFixed(4)}%` : t('Exchange setting');
+  const makerFeeText = makerFeeRate !== undefined ? `${(makerFeeRate * 100).toFixed(4)}%` : t('Exchange setting');
   const referenceCandle = chartReady ? hoveredCandle ?? candles[candles.length - 1] ?? null : null;
   const isFavorite = favorites.includes(symbol);
   const portfolioPosition = authenticatedPortfolio?.snapshot.futuresPositions?.find((position) => position.symbol === symbol);

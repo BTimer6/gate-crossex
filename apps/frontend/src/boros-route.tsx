@@ -37,6 +37,7 @@ import {
   usesSharedCrossExMargin,
 } from './route-shared.js';
 import { useLanguage } from './i18n.js';
+import { numericFutureFeeRate } from './fee-rates.js';
 import { strategyVenueSymbol } from './strategy-asset-options.js';
 import { RunningStrategiesPanel } from './strategy-route.js';
 
@@ -160,22 +161,23 @@ function resolveStrategyLeverages(
   };
 }
 
-function perpTakerFeeForVenue(fees: VenueFeeRate[], platformName: string): number | undefined {
+function perpTakerFeeForVenue(
+  fees: VenueFeeRate[],
+  catalog: MarketCatalogAsset[] | null,
+  platformName: string,
+  asset: string,
+): number | undefined {
   const venueId = borosVenueId(platformName);
-  const fee = venueId ? fees.find((item) => item.venue === venueId.toUpperCase()) : undefined;
-  const rate = Number(fee?.futureTakerFee);
-  return Number.isFinite(rate) && rate >= 0 ? rate : undefined;
-}
-
-function perpFeeRate(fee: VenueFeeRate | undefined, kind: 'maker' | 'taker'): number | undefined {
-  const rate = Number(kind === 'maker' ? fee?.futureMakerFee : fee?.futureTakerFee);
-  return Number.isFinite(rate) && rate >= 0 ? rate : undefined;
+  const symbol = venueId ? strategyVenueSymbol(catalog, venueId, asset) : '';
+  const rate = venueId ? numericFutureFeeRate(fees, venueId, symbol, 'taker') : undefined;
+  return rate !== undefined && Number.isFinite(rate) && rate >= 0 ? rate : undefined;
 }
 
 function opportunityReturnAt100k(
   strategy: BorosStrategy,
   leverages: StrategyLeverages | null,
   fees: VenueFeeRate[],
+  catalog: MarketCatalogAsset[] | null,
 ) {
   if (!leverages) return null;
   return borosReturnEstimate({
@@ -184,8 +186,8 @@ function opportunityReturnAt100k(
     shortLeverage: leverages.shortLeverage,
     longNotionalUsd: 100_000,
     shortNotionalUsd: 100_000,
-    longPerpTakerFeeRate: perpTakerFeeForVenue(fees, strategy.longMarket.platformName),
-    shortPerpTakerFeeRate: perpTakerFeeForVenue(fees, strategy.shortMarket.platformName),
+    longPerpTakerFeeRate: perpTakerFeeForVenue(fees, catalog, strategy.longMarket.platformName, strategy.longMarket.assetSymbol),
+    shortPerpTakerFeeRate: perpTakerFeeForVenue(fees, catalog, strategy.shortMarket.platformName, strategy.shortMarket.assetSymbol),
     includeEntranceFees: true,
   });
 }
@@ -307,9 +309,9 @@ export function BorosStrategyView({
         const rightLeverages = resolveStrategyLeverages(
           right.strategy, right.ready, catalog, authenticatedPortfolio, crossExLeverageCaps,
         );
-        const leftApr = opportunityReturnAt100k(left.strategy, leftLeverages, fees)?.netApr
+        const leftApr = opportunityReturnAt100k(left.strategy, leftLeverages, fees, catalog)?.netApr
           ?? Number.NEGATIVE_INFINITY;
-        const rightApr = opportunityReturnAt100k(right.strategy, rightLeverages, fees)?.netApr
+        const rightApr = opportunityReturnAt100k(right.strategy, rightLeverages, fees, catalog)?.netApr
           ?? Number.NEGATIVE_INFINITY;
         return Number(right.ready) - Number(left.ready)
           || rightApr - leftApr
@@ -376,7 +378,7 @@ export function BorosStrategyView({
     const leverages = resolveStrategyLeverages(
       strategy, ready, catalog, authenticatedPortfolio, crossExLeverageCaps,
     );
-    return opportunityReturnAt100k(strategy, leverages, fees) !== null;
+    return opportunityReturnAt100k(strategy, leverages, fees, catalog) !== null;
   });
   const opportunityCardCount = Math.max(2, Math.min(response?.strategies.length ?? 5, 8));
 
@@ -518,10 +520,10 @@ export function BorosStrategyView({
   const shortVenueFee = fees.find((fee) => fee.venue === symbols?.shortVenueId.toUpperCase());
   const longPerpFeeKind = executionMethod === 'Maker–Taker' && makerLeg === 'left' ? 'maker' : 'taker';
   const shortPerpFeeKind = executionMethod === 'Maker–Taker' && makerLeg === 'right' ? 'maker' : 'taker';
-  const longPerpTakerFeeRate = perpFeeRate(longVenueFee, longPerpFeeKind);
-  const shortPerpTakerFeeRate = perpFeeRate(shortVenueFee, shortPerpFeeKind);
-  const longPerpCloseFeeRate = perpFeeRate(longVenueFee, 'taker');
-  const shortPerpCloseFeeRate = perpFeeRate(shortVenueFee, 'taker');
+  const longPerpTakerFeeRate = symbols ? numericFutureFeeRate(fees, symbols.longVenueId, symbols.longSymbol, longPerpFeeKind) : undefined;
+  const shortPerpTakerFeeRate = symbols ? numericFutureFeeRate(fees, symbols.shortVenueId, symbols.shortSymbol, shortPerpFeeKind) : undefined;
+  const longPerpCloseFeeRate = symbols ? numericFutureFeeRate(fees, symbols.longVenueId, symbols.longSymbol, 'taker') : undefined;
+  const shortPerpCloseFeeRate = symbols ? numericFutureFeeRate(fees, symbols.shortVenueId, symbols.shortSymbol, 'taker') : undefined;
   const configuredExecutionMethod = executionMethod === 'Maker–Taker'
     ? `${t('Maker–Taker')} · ${makerLeg === 'left' ? selected?.longMarket.platformName : selected?.shortMarket.platformName} ${t('maker')}`
     : t('Taker–Taker');
@@ -816,7 +818,7 @@ export function BorosStrategyView({
           : <div className="boros-opportunity-list" role="radiogroup" aria-label={t('Fixed-rate strategies')}>
             {displayedOpportunities.map(({ strategy, ready }) => {
               const leverages = strategyLeverages(strategy, ready);
-              const ticketReturn = opportunityReturnAt100k(strategy, leverages, fees);
+              const ticketReturn = opportunityReturnAt100k(strategy, leverages, fees, catalog);
               return <button
                 key={strategy.id}
                 role="radio"
@@ -954,43 +956,45 @@ export function BorosStrategyView({
                   <p className="boros-leg-order"><span>{t('CrossEx order size')}</span><strong>{quantity || '—'} {asset}</strong></p>
                 </article>
               </div>
-              <section className="boros-execution-config" aria-label={t('Configure paired execution')}>
-                <div className="boros-execution-size boros-fields">
-                  <label><span>{t('Per-order quantity')}</span><div><input aria-label={t('Per-order quantity')} inputMode="decimal" value={perOrderQuantity} onChange={(event) => setPerOrderQuantity(event.target.value)} placeholder={longInstrument?.minSize ?? '0.10'} /><b>{asset}</b></div><small>{t('The engine repeats this clip until the total position size is reached.')}</small></label>
-                  <label><span>{t('Total amount')}</span><div className="boros-readonly-field"><output aria-label={t('Total amount')}>{quantity || '—'}</output><b>{asset}</b></div><small>{t('From the four-leg position size above.')}</small></label>
-                  {!perOrderQuantityValid && perOrderQuantity !== '' && <p className="boros-field-error" role="alert">{t('Per-order quantity must meet both contracts and not exceed total size.')}</p>}
-                </div>
-                <div className="compact-method boros-execution-method">
-                  <span>{t('Execution method')}</span>
-                  <div className="method-options execution-method-options" role="group" aria-label={t('Execution method')}>
-                    <button type="button" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button>
-                    <button type="button" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button>
+              <section className="boros-execution-card" aria-label={t('Configure paired execution')}>
+                <div className="boros-execution-config">
+                  <div className="boros-execution-size boros-fields">
+                    <label><span>{t('Per-order quantity')}</span><div><input aria-label={t('Per-order quantity')} inputMode="decimal" value={perOrderQuantity} onChange={(event) => setPerOrderQuantity(event.target.value)} placeholder={longInstrument?.minSize ?? '0.10'} /><b>{asset}</b></div><small>{t('The engine repeats this clip until the total position size is reached.')}</small></label>
+                    <label><span>{t('Total amount')}</span><div className="boros-readonly-field"><output aria-label={t('Total amount')}>{quantity || '—'}</output><b>{asset}</b></div><small>{t('From the four-leg position size above.')}</small></label>
+                    {!perOrderQuantityValid && perOrderQuantity !== '' && <p className="boros-field-error" role="alert">{t('Per-order quantity must meet both contracts and not exceed total size.')}</p>}
                   </div>
-                  {executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="group" aria-label={t('Choose maker leg')}>
-                    <button type="button" className={makerLeg === 'left' ? 'active' : ''} aria-pressed={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{selected.longMarket.platformName}</strong></button>
-                    <button type="button" className={makerLeg === 'right' ? 'active' : ''} aria-pressed={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{selected.shortMarket.platformName}</strong></button>
-                  </div>}
+                  <div className="compact-method boros-execution-method">
+                    <span>{t('Execution method')}</span>
+                    <div className="method-options execution-method-options" role="group" aria-label={t('Execution method')}>
+                      <button type="button" className={executionMethod === 'Taker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Taker–Taker'} onClick={() => setExecutionMethod('Taker–Taker')}>⚡ {t('Taker–Taker')}</button>
+                      <button type="button" className={executionMethod === 'Maker–Taker' ? 'active' : ''} aria-pressed={executionMethod === 'Maker–Taker'} onClick={() => setExecutionMethod('Maker–Taker')}>◫ {t('Maker–Taker')}</button>
+                    </div>
+                    {executionMethod === 'Maker–Taker' && <div className="maker-leg-picker execution-maker-leg-options" role="group" aria-label={t('Choose maker leg')}>
+                      <button type="button" className={makerLeg === 'left' ? 'active' : ''} aria-pressed={makerLeg === 'left'} onClick={() => setMakerLeg('left')}><small>{t('Maker')} · A</small><strong>{selected.longMarket.platformName}</strong></button>
+                      <button type="button" className={makerLeg === 'right' ? 'active' : ''} aria-pressed={makerLeg === 'right'} onClick={() => setMakerLeg('right')}><small>{t('Maker')} · B</small><strong>{selected.shortMarket.platformName}</strong></button>
+                    </div>}
+                  </div>
+                </div>
+                {!quotesFresh && <p className="boros-quote-state"><i />{t('Waiting for fresh CrossEx quotes from both venues…')}</p>}
+                <div className="boros-review">
+                  <dl>
+                    <div><dt>{t('Entry threshold')}</dt><dd className="boros-review-input"><input aria-label={t('Entry threshold')} aria-invalid={!entryThresholdValid || undefined} disabled={!selectedEntry?.ready} type="text" inputMode="decimal" value={entryThresholdBps} onMouseDown={(event) => { if (requestMissingPrerequisite() || !borosConfirmed) { event.preventDefault(); if (quantityReady && leverageMarginStatus !== 'higher_leverage_required') requestBorosConfirmation(); } }} onFocus={() => { if (!requestMissingPrerequisite() && !borosConfirmed) requestBorosConfirmation(); }} onChange={(event) => setEntryThresholdBps(event.target.value)} /><b>bps</b></dd></div>
+                    <div><dt>{t('Current slippage')}</dt><dd className="boros-review-output"><output aria-label={t('Current slippage')}>{currentSlippageBps === null ? '—' : currentSlippageBps.toFixed(2)}</output><b>bps</b></dd></div>
+                    <div><dt>{t('CrossEx direction')}</dt><dd>{t('Long')} {selected.longMarket.platformName} / {t('Short')} {selected.shortMarket.platformName}</dd></div>
+                    <div><dt>{t('Total execution')}</dt><dd>{quantity || '—'} {asset}</dd></div>
+                    <div><dt>{t('Per order')}</dt><dd>{perOrderQuantity || '—'} {asset}</dd></div>
+                    <div><dt>{t('Estimated margin')}</dt><dd>{estimatedMargin > 0 ? `${formatAmount(estimatedMargin)} USDT` : '—'}</dd></div>
+                    <div><dt>{t('Available margin')}</dt><dd>{availableMarginDisplay}</dd></div>
+                    <div><dt>{t('Execution')}</dt><dd>{configuredExecutionMethod}</dd></div>
+                  </dl>
+                  {marginInsufficient && <p className="boros-risk-error" role="alert">{t('Insufficient margin for the paired position plus safety reserve.')}</p>}
+                  <button className={tradingEnabled ? 'boros-execute' : 'boros-execute locked'} onClick={handleOpenPositionsClick} disabled={launching || !selectedEntry?.ready || (borosConfirmed && !executionReady)}>
+                    {launching ? t('Submitting paired execution…') : tradingEnabled ? t('Open positions') : t('Enable live trading to execute')}
+                  </button>
+                  {launchNotice && <p className={`boros-launch-notice ${launchNotice.kind}`} role="status">{launchNotice.text}</p>}
+                  <small className="boros-execution-note">{t('Both legs are submitted together. If only one leg fills, the engine repairs the imbalance or pauses for review.')}</small>
                 </div>
               </section>
-              {!quotesFresh && <p className="boros-quote-state"><i />{t('Waiting for fresh CrossEx quotes from both venues…')}</p>}
-              <div className="boros-review">
-                <dl>
-                  <div><dt>{t('Entry threshold')}</dt><dd className="boros-review-input"><input aria-label={t('Entry threshold')} aria-invalid={!entryThresholdValid || undefined} disabled={!selectedEntry?.ready} type="text" inputMode="decimal" value={entryThresholdBps} onMouseDown={(event) => { if (requestMissingPrerequisite() || !borosConfirmed) { event.preventDefault(); if (quantityReady && leverageMarginStatus !== 'higher_leverage_required') requestBorosConfirmation(); } }} onFocus={() => { if (!requestMissingPrerequisite() && !borosConfirmed) requestBorosConfirmation(); }} onChange={(event) => setEntryThresholdBps(event.target.value)} /><b>bps</b></dd></div>
-                  <div><dt>{t('Current slippage')}</dt><dd className="boros-review-output"><output aria-label={t('Current slippage')}>{currentSlippageBps === null ? '—' : currentSlippageBps.toFixed(2)}</output><b>bps</b></dd></div>
-                  <div><dt>{t('CrossEx direction')}</dt><dd>{t('Long')} {selected.longMarket.platformName} / {t('Short')} {selected.shortMarket.platformName}</dd></div>
-                  <div><dt>{t('Total execution')}</dt><dd>{quantity || '—'} {asset}</dd></div>
-                  <div><dt>{t('Per order')}</dt><dd>{perOrderQuantity || '—'} {asset}</dd></div>
-                  <div><dt>{t('Estimated margin')}</dt><dd>{estimatedMargin > 0 ? `${formatAmount(estimatedMargin)} USDT` : '—'}</dd></div>
-                  <div><dt>{t('Available margin')}</dt><dd>{availableMarginDisplay}</dd></div>
-                  <div><dt>{t('Execution')}</dt><dd>{configuredExecutionMethod}</dd></div>
-                </dl>
-                {marginInsufficient && <p className="boros-risk-error" role="alert">{t('Insufficient margin for the paired position plus safety reserve.')}</p>}
-                <button className={tradingEnabled ? 'boros-execute' : 'boros-execute locked'} onClick={handleOpenPositionsClick} disabled={launching || !selectedEntry?.ready || (borosConfirmed && !executionReady)}>
-                  {launching ? t('Submitting paired execution…') : tradingEnabled ? t('Open positions') : t('Enable live trading to execute')}
-                </button>
-                {launchNotice && <p className={`boros-launch-notice ${launchNotice.kind}`} role="status">{launchNotice.text}</p>}
-                <small className="boros-execution-note">{t('Both legs are submitted together. If only one leg fills, the engine repairs the imbalance or pauses for review.')}</small>
-              </div>
             </div>
           </section>
         </div>

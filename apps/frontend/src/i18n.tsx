@@ -4,7 +4,16 @@ export type Language = 'en' | 'zh';
 export type Theme = 'dark' | 'light';
 
 const chinese: Record<string, string> = {
-  Trade: '交易', Strategy: '策略', 'Funding Rates': '资金费率', Portfolio: '资产', Settings: '设置', 'Main navigation': '主导航',
+  Trade: '交易', Strategy: '策略', 'Funding Rates': '资金费率', Portfolio: '资产', Settings: '设置', 'Main navigation': '主导航', More: '更多', 'More tools': '更多工具',
+  'Trading fee comparison': '交易费率对比', 'Compare account fees by ticker': '按代币对比账户费率',
+  'Trading tools': '交易工具', 'Enter a ticker to compare fees and estimated costs across every exchange that supports its perpetual contract.': '输入代币代码，对比所有支持该永续合约的交易所费率和预估成本。',
+  'Current CrossEx account rates': '当前 CrossEx 账户费率', Ticker: '代币代码', 'Trade notional': '名义价值', 'Supported exchanges': '支持的交易所',
+  'Perpetual contract': '永续合约', 'Sorted by lowest taker fee': '按吃单费率从低到高排序', 'Refresh rates': '刷新费率', 'Loading rates…': '加载中…',
+  'Maker rate': '挂单费率', 'Taker rate': '吃单费率', 'Est. maker fee': '挂单预估', 'Est. taker fee': '吃单预估', 'Taker round trip': '吃单往返', 'Lowest taker fee': '最低吃单费率', 'Ticker-specific rate': '代币专属费率',
+  'Loading market and fee data…': '正在加载市场和费率数据…', 'Unable to load account fee rates': '无法读取账户费率', 'Configure Gate API credentials in Settings first.': '请先在设置中配置 Gate API 凭证。', 'Check the backend connection and try again.': '请检查后端连接后重试。',
+  'Ticker not found': '未找到该代币', 'Choose a ticker from the CrossEx market catalog.': '请选择 CrossEx 市场目录中的代币代码。', 'No comparable rates': '暂无可比较费率', 'The exchanges listing this ticker have not returned fee rates.': '该代币的交易所尚未返回费率。',
+  'Invalid notional': '名义价值无效', 'Enter a valid positive notional.': '请输入有效的正数名义价值。',
+  'Rates reflect the current CrossEx account tier; actual exchange fills are authoritative.': '费率来自当前 CrossEx 账户等级，实际费用以交易所成交记录为准。', 'Estimates exclude funding and slippage': '预估不包含资金费率与滑点',
   Language: '语言', English: 'English', Chinese: '中文', 'Dark mode': '深色', 'Light mode': '浅色', 'Switch to light mode': '切换至浅色模式', 'Switch to dark mode': '切换至深色模式', Notifications: '通知',
   'Live account': '实盘账户', 'Credentials not configured': '尚未配置凭证', 'Account settings': '账户设置', Security: '安全', 'Credential status': '凭证状态', 'Open secure credential setup': '打开Gate API 密钥设置', Storage: '存储', Verified: '已验证', 'Never verified': '未验证', 'OS keychain': '系统钥匙串', 'Local .env file': '本地 .env 文件', 'Read-only until enabled': '未启用实盘，仅可读取',
   'Backend stream connected': '后端数据流已连接', 'Reconnecting backend stream': '正在重连后端数据流', environment: '环境', upstream: '上游', Support: '支持',

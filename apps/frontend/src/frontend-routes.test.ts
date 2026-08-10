@@ -11,6 +11,7 @@ describe('frontend routes', () => {
     { workspace: 'Funding Rates', asset: null },
     { workspace: 'Funding Rates', asset: 'BTC' },
     { workspace: 'Portfolio' },
+    { workspace: 'Trading Fees' },
   ];
 
   it.each(routes)('round-trips $workspace pages through the URL', (route) => {

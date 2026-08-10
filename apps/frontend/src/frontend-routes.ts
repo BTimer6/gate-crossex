@@ -4,7 +4,8 @@ export type FrontendRoute =
   | { workspace: 'Trade' }
   | { workspace: 'Strategy'; strategyKind: StrategyRouteKind }
   | { workspace: 'Funding Rates'; asset: string | null }
-  | { workspace: 'Portfolio' };
+  | { workspace: 'Portfolio' }
+  | { workspace: 'Trading Fees' };
 
 export const DEFAULT_FRONTEND_ROUTE: FrontendRoute = { workspace: 'Trade' };
 
@@ -20,6 +21,7 @@ export function frontendPath(route: FrontendRoute): string {
   if (route.workspace === 'Trade') return '/';
   if (route.workspace === 'Strategy') return STRATEGY_PATHS[route.strategyKind];
   if (route.workspace === 'Portfolio') return '/portfolio';
+  if (route.workspace === 'Trading Fees') return '/tools/trading-fees';
   return route.asset ? `/funding-rates/${encodeURIComponent(route.asset)}` : '/funding-rates';
 }
 
@@ -28,6 +30,7 @@ export function frontendRoute(pathname: string): FrontendRoute | null {
   const path = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
   if (path === '/') return DEFAULT_FRONTEND_ROUTE;
   if (path === '/portfolio') return { workspace: 'Portfolio' };
+  if (path === '/tools/trading-fees') return { workspace: 'Trading Fees' };
   if (path === '/funding-rates') return { workspace: 'Funding Rates', asset: null };
 
   const strategyKind = (Object.entries(STRATEGY_PATHS) as Array<[StrategyRouteKind, string]>)

@@ -197,7 +197,7 @@ class FakeCrossExGateway implements TradingCrossExGateway {
     this.receivedCredentials.push({ ...credentials });
     this.feeQueryCount += 1;
     return [
-      { exchange_type: 'BINANCE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00006', future_taker_fee: '0.00022', special_fee_list: [] },
+      { exchange_type: 'BINANCE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00006', future_taker_fee: '0.00022', special_fee_list: [{ symbol: 'BINANCE_FUTURE_BTC_USDT', maker_fee_rate: '0.00001', taker_fee_rate: '0.00002' }] },
       { exchange_type: 'GATE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00005', future_taker_fee: '0.0002' },
     ];
   }
@@ -1094,7 +1094,7 @@ describe('local backend', () => {
     expect(first.statusCode).toBe(200);
     expect(concurrent.json()).toEqual(first.json());
     expect(first.json()).toMatchObject({ cacheStatus: 'fresh', fees: [
-      { venue: 'BINANCE', futureTakerFee: '0.00022' },
+      { venue: 'BINANCE', futureTakerFee: '0.00022', specialFees: [{ symbol: 'BINANCE_FUTURE_BTC_USDT', makerFee: '0.00001', takerFee: '0.00002' }] },
       { venue: 'GATE', futureMakerFee: '0.00005' },
     ] });
     const second = await app.inject({ method: 'GET', url: '/api/crossex/fees', headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'fee-rates' } });

@@ -7,7 +7,7 @@ import { compactPrice } from './number-format.js';
 
 export type Side = 'Buy' | 'Sell';
 export type OrderType = 'Limit' | 'Market';
-export type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio';
+export type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
 export type NavigationLabel = Workspace | 'Boros by Pendle';
 export type StrategyKind = StrategyConfig['kind'];
 export type FundingMetric = 'Per interval' | 'APR' | '24h' | '7d' | '30d';

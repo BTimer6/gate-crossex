@@ -1695,6 +1695,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           const fees = rates.map((rate) => ({
             venue: rate.exchange_type, spotMakerFee: rate.spot_maker_fee, spotTakerFee: rate.spot_taker_fee,
             futureMakerFee: rate.future_maker_fee, futureTakerFee: rate.future_taker_fee,
+            specialFees: (rate.special_fee_list ?? []).map((special) => ({
+              symbol: special.symbol,
+              makerFee: special.maker_fee_rate,
+              takerFee: special.taker_fee_rate,
+            })),
           }));
           feeCache = { fees, fetchedAt };
           return { fees, fetchedAt };

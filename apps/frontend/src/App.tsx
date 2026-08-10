@@ -28,6 +28,7 @@ import { DEFAULT_FRONTEND_ROUTE, frontendPath, frontendRoute, type FrontendRoute
 import { LanguageContext, translate, useLanguage, type Language, type Theme } from './i18n.js';
 import type { FundingMetric, PairedPositionPrefill } from './route-shared.js';
 import brandMark from './assets/brand-mark.svg';
+import borosMark from './assets/boros-mark.svg';
 
 const TradingView = lazy(() => import('./trade-route.js').then((module) => ({ default: module.TradingView })));
 const StrategyView = lazy(() => import('./strategy-route.js').then((module) => ({ default: module.StrategyView })));
@@ -36,10 +37,11 @@ const BorosStrategyView = lazy(() => import('./boros-route.js').then((module) =>
 const FundingDetailView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingDetailView })));
 const FundingRatesView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingRatesView })));
 const PortfolioView = lazy(() => import('./portfolio-route.js').then((module) => ({ default: module.PortfolioView })));
+const FeeComparisonView = lazy(() => import('./fee-comparison-route.js').then((module) => ({ default: module.FeeComparisonView })));
 const SOURCE_CODE_URL = 'https://github.com/your-quantguy/gate-crossex';
 const LICENSE_URL = `${SOURCE_CODE_URL}/blob/main/LICENSE`;
 
-type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio';
+type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
 type NavigationLabel = Workspace | 'Boros by Pendle';
 type StrategyKind = StrategyRouteKind;
 type FundingHistoryDuration = 1 | 7 | 30;
@@ -50,7 +52,6 @@ const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Strategy', glyph: '⇄' },
   { label: 'Funding Rates', glyph: '%' },
   { label: 'Boros by Pendle', glyph: '◐' },
-  { label: 'Portfolio', glyph: '◒' },
 ];
 
 const strategyPages: Array<{ kind: StrategyKind; glyph: string; label: string; detail: string }> = [
@@ -286,9 +287,12 @@ function App() {
   // is the menu's containing block (backdrop-filter) and spans the viewport from (0,0), so trigger
   // viewport coordinates apply as-is; fixed positioning also escapes the nav's overflow clipping.
   const [strategyMenuAt, setStrategyMenuAt] = useState<{ top: number; left: number } | null>(null);
+  const [moreMenuAt, setMoreMenuAt] = useState<{ top: number; left: number } | null>(null);
   const strategyNavRef = useRef<HTMLDivElement | null>(null);
   const strategyTriggerRef = useRef<HTMLButtonElement | null>(null);
   const strategyMenuItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const moreNavRef = useRef<HTMLDivElement | null>(null);
+  const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [selectedAsset, setSelectedAsset] = useState('BTC');
   const [fundingMetric, setFundingMetric] = useState<FundingMetric>('Per interval');
   const [fundingOverview, setFundingOverview] = useState<FundingOverviewResponse | null>(null);
@@ -309,6 +313,7 @@ function App() {
   const [balances, setBalances] = useState<Record<string, LiveBalance>>({});
   const [fees, setFees] = useState<VenueFeeRate[]>([]);
   const [feesReady, setFeesReady] = useState(false);
+  const [feesError, setFeesError] = useState<string | null>(null);
   const [tradingMode, setTradingMode] = useState<TradingMode | null>(null);
   const [modeDialogOpen, setModeDialogOpen] = useState(false);
   const [connection, setConnection] = useState<CredentialConnectionStatus | null>(null);
@@ -436,6 +441,17 @@ function App() {
   const refreshStrategies = useCallback(async () => {
     setStrategies((await api.strategies()).strategies);
   }, []);
+  const refreshFees = useCallback(() => {
+    setFeesReady(false);
+    setFeesError(null);
+    void api.fees()
+      .then((response) => setFees(response.fees))
+      .catch((error: unknown) => {
+        setFeesError(error instanceof ApiError ? error.code : 'fee_rates_unavailable');
+        reportBackendConnectivityError(error);
+      })
+      .finally(() => setFeesReady(true));
+  }, [reportBackendConnectivityError]);
 
   const watchMarket = useCallback((symbol: string, interval: CandleInterval) => {
     // The trade view can request a watch before the stream handle exists; remember it for the
@@ -493,17 +509,14 @@ function App() {
 
   useEffect(() => {
     if (workspace === 'Funding Rates') return;
-    if (workspace === 'Trade' || workspace === 'Strategy') {
+    if (workspace === 'Trade' || workspace === 'Strategy' || workspace === 'Trading Fees') {
       void api.marketCatalog().then((response) => setCatalog(response.assets)).catch(reportBackendConnectivityError);
     }
     void refreshTrading().catch(reportBackendConnectivityError);
     if (workspace === 'Strategy') void refreshStrategies().catch(reportBackendConnectivityError);
-    if (workspace !== 'Trade' && workspace !== 'Strategy') return;
-    void api.fees()
-      .then((response) => setFees(response.fees))
-      .catch(reportBackendConnectivityError)
-      .finally(() => setFeesReady(true));
-  }, [workspace, refreshTrading, refreshStrategies, reportBackendConnectivityError]);
+    if (workspace !== 'Trade' && workspace !== 'Strategy' && workspace !== 'Trading Fees') return;
+    refreshFees();
+  }, [workspace, refreshTrading, refreshStrategies, refreshFees, reportBackendConnectivityError]);
 
   const terminalStreamEnabled = workspace !== 'Funding Rates';
   useEffect(() => {
@@ -677,23 +690,26 @@ function App() {
   }, [settingsOpen, notificationsOpen]);
 
   useEffect(() => {
-    if (!strategyMenuAt) return;
+    if (!strategyMenuAt && !moreMenuAt) return;
     const onPointerDown = (event: MouseEvent) => {
       if (strategyNavRef.current && !strategyNavRef.current.contains(event.target as Node)) setStrategyMenuAt(null);
+      if (moreNavRef.current && !moreNavRef.current.contains(event.target as Node)) setMoreMenuAt(null);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        const moreWasOpen = moreMenuAt !== null;
         setStrategyMenuAt(null);
-        strategyTriggerRef.current?.focus();
+        setMoreMenuAt(null);
+        (moreWasOpen ? moreTriggerRef.current : strategyTriggerRef.current)?.focus();
       }
     };
     // The stored anchor goes stale if the trigger moves, so a resize simply closes the menu.
-    const onResize = () => setStrategyMenuAt(null);
+    const onResize = () => { setStrategyMenuAt(null); setMoreMenuAt(null); };
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
     window.addEventListener('resize', onResize);
     return () => { document.removeEventListener('mousedown', onPointerDown); document.removeEventListener('keydown', onKeyDown); window.removeEventListener('resize', onResize); };
-  }, [strategyMenuAt]);
+  }, [strategyMenuAt, moreMenuAt]);
 
   const openStrategyPage = useCallback((kind: StrategyKind) => {
     navigate({ workspace: 'Strategy', strategyKind: kind });
@@ -703,9 +719,16 @@ function App() {
 
   const openStrategyMenu = (trigger: HTMLButtonElement) => {
     const rect = trigger.getBoundingClientRect();
+    setMoreMenuAt(null);
     setStrategyMenuAt({ top: rect.bottom + 6, left: rect.left });
     const selectedIndex = Math.max(0, strategyPages.findIndex((page) => page.kind === strategyKind));
     requestAnimationFrame(() => strategyMenuItemRefs.current[selectedIndex]?.focus());
+  };
+
+  const openMoreMenu = (trigger: HTMLButtonElement) => {
+    const rect = trigger.getBoundingClientRect();
+    setStrategyMenuAt(null);
+    setMoreMenuAt({ top: rect.bottom + 6, left: rect.left });
   };
 
   const onStrategyMenuKeyDown = (event: React.KeyboardEvent<HTMLUListElement>) => {
@@ -728,6 +751,8 @@ function App() {
 
   function openNotifications() {
     const next = !notificationsOpen;
+    setStrategyMenuAt(null);
+    setMoreMenuAt(null);
     setSettingsOpen(false);
     setNotificationsOpen(next);
     if (next) setNotificationsSeenAt(new Date().toISOString());
@@ -771,9 +796,10 @@ function App() {
       ? <FundingDetailView asset={fundingDetailAsset} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
     if (workspace === 'Portfolio') return <PortfolioView tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
+    if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -785,6 +811,7 @@ function App() {
   useEffect(() => {
     if (tradingMode !== 'unset' && !modeDialogOpen) return;
     setStrategyMenuAt(null);
+    setMoreMenuAt(null);
     setNotificationsOpen(false);
     setSettingsOpen(false);
   }, [modeDialogOpen, tradingMode]);
@@ -839,11 +866,38 @@ function App() {
             : item.label === 'Funding Rates'
               ? { workspace: 'Funding Rates', asset: null }
               : { workspace: 'Portfolio' });
-        }}><span>{item.glyph}</span>{t(item.label)}</button>)}</nav>
+        }}>{item.label === 'Boros by Pendle'
+            ? <span className="nav-boros-mark" aria-hidden="true"><img src={borosMark} alt="" /></span>
+            : <span>{item.glyph}</span>}{t(item.label)}</button>)}
+        <div className="nav-strategy nav-more" ref={moreNavRef}>
+          <button ref={moreTriggerRef} className={`${workspace === 'Trading Fees' ? 'active' : ''}${moreMenuAt ? ' menu-open' : ''}`}
+            aria-label={t('More')} aria-haspopup="menu" aria-expanded={moreMenuAt !== null}
+            onClick={(event) => { if (moreMenuAt) setMoreMenuAt(null); else openMoreMenu(event.currentTarget); }}
+            onKeyDown={(event) => {
+              if (!moreMenuAt && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+                event.preventDefault();
+                openMoreMenu(event.currentTarget);
+                requestAnimationFrame(() => moreNavRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus());
+              }
+            }}>
+            <span aria-hidden="true">⋯</span>更多<svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
+          </button>
+          {moreMenuAt && <ul className="nav-strategy-menu nav-more-menu" role="menu" aria-label={t('More tools')} style={moreMenuAt}>
+            <li role="none"><button role="menuitem" className={workspace === 'Trading Fees' ? 'selected' : ''} onClick={() => {
+              navigate({ workspace: 'Trading Fees' });
+              setMoreMenuAt(null);
+              moreTriggerRef.current?.focus();
+            }}><strong>{t('Trading fee comparison')}</strong><small>{t('Compare account fees by ticker')}</small></button></li>
+          </ul>}
+        </div>
+      </nav>
       <div className="top-actions">
         {tradingMode !== null && tradingMode !== 'unset' && <button className={`mode-badge ${tradingMode}`} onClick={openModeDialog} title={t('Switch trading mode')} aria-label={t('Switch trading mode')}>
           <i />{t(tradingMode === 'live' ? 'Live trading' : 'Read-only')}
         </button>}
+        <button className={`portfolio-shortcut${workspace === 'Portfolio' ? ' active' : ''}`} onClick={() => navigate({ workspace: 'Portfolio' })}>
+          <span aria-hidden="true">◒</span>{t('Portfolio')}
+        </button>
         <div className="profile-wrap" ref={notificationsRef}>
           <button className="utility" aria-label={t('Notifications')} aria-haspopup="dialog" aria-expanded={notificationsOpen} onClick={openNotifications}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg>
@@ -858,6 +912,8 @@ function App() {
         </div>
         <div className="profile-wrap settings-wrap" ref={settingsRef}>
           <button className="settings-button" aria-label={t('Settings')} title={t('Settings')} aria-haspopup="dialog" aria-expanded={settingsOpen} onClick={() => {
+            setStrategyMenuAt(null);
+            setMoreMenuAt(null);
             setNotificationsOpen(false);
             setSettingsOpen((current) => !current);
           }}>
