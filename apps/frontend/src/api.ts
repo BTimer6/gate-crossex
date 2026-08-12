@@ -372,8 +372,14 @@ export const api = {
 export interface TerminalStreamHandle {
   close(): void;
   watchQuotes(symbols: string[]): void;
+  watchKlines(watches: KlineWatch[]): void;
   watchMarket(symbol: string, interval: CandleInterval): void;
   clearWatch(): void;
+}
+
+export interface KlineWatch {
+  symbol: string;
+  interval: CandleInterval;
 }
 
 const STREAM_CONNECT_TIMEOUT_MS = 10_000;
@@ -390,6 +396,7 @@ export function connectTerminalStream(
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let staleTimer: ReturnType<typeof setTimeout> | null = null;
   let quoteSymbols: string[] = [];
+  let klineWatches: KlineWatch[] = [];
   let lastWatch: { symbol: string; interval: CandleInterval } | null = null;
 
   const clearSocketTimers = () => {
@@ -407,6 +414,11 @@ export function connectTerminalStream(
   const sendQuoteWatch = () => {
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'watch.quotes', symbols: quoteSymbols }));
+    }
+  };
+  const sendKlineWatch = () => {
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'watch.klines', watches: klineWatches }));
     }
   };
   const sendMarketWatch = () => {
@@ -440,6 +452,7 @@ export function connectTerminalStream(
       onState('connected');
       armStaleTimer();
       sendQuoteWatch();
+      if (klineWatches.length > 0) sendKlineWatch();
       sendMarketWatch();
     });
     nextSocket.addEventListener('message', (event) => {
@@ -481,6 +494,16 @@ export function connectTerminalStream(
       if (next.length === quoteSymbols.length && next.every((symbol, index) => symbol === quoteSymbols[index])) return;
       quoteSymbols = next;
       sendQuoteWatch();
+    },
+    watchKlines: (watches) => {
+      const unique = new Map(watches.map((watch) => [`${watch.symbol}:${watch.interval}`, watch]));
+      const next = [...unique.values()].sort((left, right) =>
+        left.symbol.localeCompare(right.symbol) || left.interval.localeCompare(right.interval));
+      if (next.length === klineWatches.length
+        && next.every((watch, index) => watch.symbol === klineWatches[index]?.symbol
+          && watch.interval === klineWatches[index]?.interval)) return;
+      klineWatches = next;
+      sendKlineWatch();
     },
     watchMarket: (symbol, interval) => {
       if (lastWatch?.symbol === symbol && lastWatch.interval === interval) return;

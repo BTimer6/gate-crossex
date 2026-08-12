@@ -180,12 +180,21 @@ describe('local API request coordination', () => {
     socket?.emit('message', { data: JSON.stringify({ type: 'market.update', payload: { symbol: 42 } }) });
     socket?.emit('message', { data: JSON.stringify({ type: 'mode.update', payload: { mode: 'readonly' } }) });
     handle.watchQuotes(['OKX_FUTURE_ETH_USDT', 'GATE_FUTURE_ETH_USDT']);
+    handle.watchKlines([
+      { symbol: 'GATE_FUTURE_SKHYNIX_USDT', interval: '5m' },
+      { symbol: 'GATE_FUTURE_SKHY_USDT', interval: '5m' },
+      { symbol: 'GATE_FUTURE_SKHYNIX_USDT', interval: '5m' },
+    ]);
     handle.watchMarket('GATE_FUTURE_BTC_USDT', '1m');
 
     expect(messages).toEqual([{ type: 'mode.update', payload: { mode: 'readonly' } }]);
     expect(socket?.sent.map((message) => JSON.parse(message))).toEqual([
       { type: 'watch.quotes', symbols: [] },
       { type: 'watch.quotes', symbols: ['GATE_FUTURE_ETH_USDT', 'OKX_FUTURE_ETH_USDT'] },
+      { type: 'watch.klines', watches: [
+        { symbol: 'GATE_FUTURE_SKHY_USDT', interval: '5m' },
+        { symbol: 'GATE_FUTURE_SKHYNIX_USDT', interval: '5m' },
+      ] },
       { type: 'watch.market', symbol: 'GATE_FUTURE_BTC_USDT', interval: '1m' },
     ]);
     handle.close();

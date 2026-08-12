@@ -1248,6 +1248,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       symbols: z.array(MarketWatchSymbolSchema).max(20),
     }),
     z.object({
+      type: z.literal('watch.klines'),
+      watches: z.array(z.object({
+        symbol: MarketWatchSymbolSchema,
+        interval: z.enum(CANDLE_INTERVALS),
+      })).max(20),
+    }),
+    z.object({
       type: z.literal('watch.market'),
       symbol: MarketWatchSymbolSchema,
       interval: z.enum(CANDLE_INTERVALS),
@@ -1342,10 +1349,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       tradeBatchSymbol = null;
       klineBatch.clear();
     };
+    const clearKlineBatch = () => {
+      if (klineBatchTimer) clearTimeout(klineBatchTimer);
+      klineBatchTimer = null;
+      klineBatch.clear();
+    };
     // The hub broadcasts book/trade/kline messages for the union of every client's watches, so
     // relay only this connection's watched market: another tab watching a second symbol must not
     // leak into this client's single-slot book state.
     let watched: { symbol: string; interval: CandleInterval } | null = null;
+    let watchedKlines = new Set<string>();
+    const watchesKline = (symbol: string, interval: CandleInterval) =>
+      (watched?.symbol === symbol && watched.interval === interval)
+      || watchedKlines.has(`${symbol}:${interval}`);
     const scopedSend = (message: MarketHubMessage) => {
       if (message.type === 'market.snapshot') {
         safeSend({ type: 'market.status', payload: {
@@ -1369,11 +1385,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         return;
       }
       if (message.type === 'kline.update') {
-        if (message.payload.symbol === watched?.symbol && message.payload.interval === watched?.interval) queueKlineUpdate(message);
+        if (watchesKline(message.payload.symbol, message.payload.interval)) queueKlineUpdate(message);
         return;
       }
       if (message.type === 'kline.snapshot'
-        && (message.payload.symbol !== watched?.symbol || message.payload.interval !== watched?.interval)) return;
+        && !watchesKline(message.payload.symbol, message.payload.interval)) return;
       safeSend(message);
     };
     const unsubscribeMarkets = marketHub.subscribe(scopedSend);
@@ -1389,10 +1405,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     statusHeartbeat.unref?.();
     let watchReleases: Array<() => void> = [];
     let quoteWatchRelease: (() => void) | null = null;
+    const klineWatchReleases: Array<() => void> = [];
     const clearWatch = () => { for (const release of watchReleases.splice(0)) release(); };
     const clearQuoteWatch = () => {
       quoteWatchRelease?.();
       quoteWatchRelease = null;
+    };
+    const clearKlineWatches = () => {
+      for (const release of klineWatchReleases.splice(0)) release();
+      watchedKlines = new Set();
+      clearKlineBatch();
     };
     safeSend({ type: 'mode.update', payload: { mode: tradingSession.current } });
     safeSend({ type: 'strategy.snapshot', payload: { strategies: tradingRuntime.listStrategies() } });
@@ -1414,6 +1436,22 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
             type: 'market.snapshot',
             payload: { ...snapshot, markets: snapshot.markets.filter((market) => marketSymbols.has(market.symbol)) },
           });
+        }
+        return;
+      }
+      if (watch.data.type === 'watch.klines') {
+        clearKlineWatches();
+        const unique = new Map(watch.data.watches.map((entry) => [`${entry.symbol}:${entry.interval}`, entry]));
+        const watches = [...unique.values()].filter((entry) => ensureMarketKnown(entry.symbol));
+        watchedKlines = new Set(watches.map((entry) => `${entry.symbol}:${entry.interval}`));
+        for (const entry of watches) {
+          klineWatchReleases.push(marketHub.watchKlines(entry.symbol, entry.interval));
+          candleStore.hydrate(entry.symbol, entry.interval);
+          safeSend({
+            type: 'kline.snapshot',
+            payload: { symbol: entry.symbol, interval: entry.interval, candles: marketHub.candles(entry.symbol, entry.interval) },
+          });
+          candleStore.prefetch(entry.symbol, entry.interval);
         }
         return;
       }
@@ -1440,6 +1478,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     socket.on('close', () => {
       clearWatch();
       clearQuoteWatch();
+      clearKlineWatches();
       clearMarketBatch();
       clearVolatileBatches();
       clearInterval(statusHeartbeat);

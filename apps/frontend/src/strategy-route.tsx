@@ -5,10 +5,12 @@ import {
   ApiError,
   type AuthenticatedPortfolioSnapshot,
   type Candle,
+  type CandleInterval,
   type CrossExInstrument,
   type FundingHistorySeriesEntry,
   type FundingOverviewResponse,
   type LiveBalance,
+  type KlineWatch,
   type MarketCatalogAsset,
   type MarketSnapshot,
   type StrategyConfig,
@@ -965,7 +967,16 @@ interface PremiumStrategyViewProps {
   onOpenModeDialog: () => void;
   onStrategiesChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
+  candleSeries: Record<string, Candle[]>;
   watchQuotes: (symbols: string[]) => void;
+  watchKlines: (watches: KlineWatch[]) => void;
+}
+
+function loadFreshPairCandles(adrSymbol: string, hedgeSymbol: string, interval: CandleInterval) {
+  return Promise.allSettled([
+    api.candles(adrSymbol, interval, { limit: 300, fresh: true }),
+    api.candles(hedgeSymbol, interval, { limit: 300, fresh: true }),
+  ] as const);
 }
 
 interface StrategyLeverageControlProps {
@@ -1137,7 +1148,7 @@ function StrategyLeverageControl({
   </div>;
 }
 
-export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes }: PremiumStrategyViewProps) {
+export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, candleSeries, watchQuotes, watchKlines }: PremiumStrategyViewProps) {
   const { language, theme, t } = useLanguage();
   const [adrVenueId, setAdrVenueId] = useState('gate');
   const [hedgeVenueId, setHedgeVenueId] = useState('gate');
@@ -1168,6 +1179,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const [freshnessNow, setFreshnessNow] = useState(Date.now());
   const premiumHistoryLoadingRef = useRef<Set<string>>(new Set());
   const premiumHistoryRequestedRef = useRef<Set<string>>(new Set());
+  const premiumHistoryInitialRequestsRef = useRef(new Map<string, ReturnType<typeof loadFreshPairCandles>>());
   const instruments = useInstrumentCatalog();
 
   // Venue pickers offer only venues that actually list each ticker; before the catalog knows
@@ -1192,33 +1204,40 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     return () => window.clearInterval(timer);
   }, []);
 
-  // Register both stock-perp tickers without opening unused book, trade, and kline subscriptions.
+  // Stream both tickers without opening unused order-book or public-trade subscriptions.
   useEffect(() => {
     watchQuotes([adrSymbol, hedgeSymbol]);
   }, [adrSymbol, hedgeSymbol, watchQuotes]);
 
   useEffect(() => {
+    watchKlines([
+      { symbol: adrSymbol, interval: premiumHistoryInterval },
+      { symbol: hedgeSymbol, interval: premiumHistoryInterval },
+    ]);
+    return () => watchKlines([]);
+  }, [adrSymbol, hedgeSymbol, premiumHistoryInterval, watchKlines]);
+
+  useEffect(() => {
     let cancelled = false;
-    let inFlight = false;
     const interval = premiumHistoryInterval;
     const key = premiumHistoryKey;
     setPremiumCandles((current) => current.key === key
       ? current
       : { key, adr: [], hedge: [], adrHasMore: true, hedgeHasMore: true, status: 'loading' });
 
-    const load = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      const [adrResult, hedgeResult] = await Promise.allSettled([
-        api.candles(adrSymbol, interval, { limit: 300, fresh: true }),
-        api.candles(hedgeSymbol, interval, { limit: 300, fresh: true }),
-      ]);
+    let request = premiumHistoryInitialRequestsRef.current.get(key);
+    if (!request) {
+      request = loadFreshPairCandles(adrSymbol, hedgeSymbol, interval);
+      premiumHistoryInitialRequestsRef.current.set(key, request);
+    }
+    void request.then(([adrResult, hedgeResult]) => {
       if (!cancelled) setPremiumCandles((current) => {
         if (current.key !== key) return current;
         const adrResponse = adrResult.status === 'fulfilled' ? adrResult.value : null;
         const hedgeResponse = hedgeResult.status === 'fulfilled' ? hedgeResult.value : null;
-        const adr = adrResponse ? mergeCandleHistory(current.adr, adrResponse.candles) : current.adr;
-        const hedge = hedgeResponse ? mergeCandleHistory(current.hedge, hedgeResponse.candles) : current.hedge;
+        // Any WebSocket candle received while REST was in flight remains authoritative.
+        const adr = adrResponse ? mergeCandleHistory(adrResponse.candles, current.adr) : current.adr;
+        const hedge = hedgeResponse ? mergeCandleHistory(hedgeResponse.candles, current.hedge) : current.hedge;
         const hasPair = adr.length > 0 && hedge.length > 0;
         return {
           key,
@@ -1231,16 +1250,36 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
             : adrResult.status === 'rejected' || hedgeResult.status === 'rejected' ? 'failed' : 'empty',
         };
       });
-      inFlight = false;
-    };
-
-    void load();
-    const timer = window.setInterval(() => void load(), interval === '1m' ? 30_000 : 60_000);
+    }).finally(() => {
+      if (premiumHistoryInitialRequestsRef.current.get(key) === request) {
+        premiumHistoryInitialRequestsRef.current.delete(key);
+      }
+    });
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
   }, [adrSymbol, hedgeSymbol, premiumHistoryInterval, premiumHistoryKey]);
+
+  const streamedAdrCandles = candleSeries[`${adrSymbol}:${premiumHistoryInterval}`];
+  const streamedHedgeCandles = candleSeries[`${hedgeSymbol}:${premiumHistoryInterval}`];
+  useEffect(() => {
+    if ((!streamedAdrCandles || streamedAdrCandles.length === 0)
+      && (!streamedHedgeCandles || streamedHedgeCandles.length === 0)) return;
+    const key = premiumHistoryKey;
+    setPremiumCandles((current) => {
+      if (current.key !== key) return current;
+      const adr = streamedAdrCandles ? mergeCandleHistory(current.adr, streamedAdrCandles) : current.adr;
+      const hedge = streamedHedgeCandles ? mergeCandleHistory(current.hedge, streamedHedgeCandles) : current.hedge;
+      return {
+        ...current,
+        adr,
+        hedge,
+        status: adr.length > 0 && hedge.length > 0
+          ? candleTailIsFresh(adr, premiumHistoryInterval) && candleTailIsFresh(hedge, premiumHistoryInterval) ? 'live' : 'stale'
+          : current.status,
+      };
+    });
+  }, [premiumHistoryInterval, premiumHistoryKey, streamedAdrCandles, streamedHedgeCandles]);
 
   const loadOlderPremiumHistory = useCallback(() => {
     const { interval } = PAIR_HISTORY_RANGES[premiumRange];

@@ -1047,8 +1047,15 @@ describe('local backend', () => {
       clientB.send(JSON.stringify({ type: 'watch.quotes', symbols: ['GATE_FUTURE_ETH_USDT'] }));
       clientA.send(JSON.stringify({ type: 'watch.market', symbol: 'GATE_FUTURE_BTC_USDT', interval: '1m' }));
       clientB.send(JSON.stringify({ type: 'watch.market', symbol: 'GATE_FUTURE_ETH_USDT', interval: '1m' }));
+      clientC.send(JSON.stringify({ type: 'watch.klines', watches: [
+        { symbol: 'GATE_FUTURE_BTC_USDT', interval: '1m' },
+        { symbol: 'GATE_FUTURE_ETH_USDT', interval: '1m' },
+      ] }));
       await waitFor(() => ['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_ETH_USDT'].every((symbol) =>
         upstreamRequests.some((request) => request.event === 'subscribe' && request.channel === 'order_book_update' && request.payload?.includes(symbol))));
+      await waitFor(() => new Set(messagesC
+        .filter((message) => message.type === 'kline.snapshot')
+        .map((message) => message.payload.symbol)).size === 2);
       // Quote-only registration expands client A's market scope without replacing its detailed BTC watch.
       clientA.send(JSON.stringify({ type: 'watch.quotes', symbols: ['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_SOL_USDT'] }));
 
@@ -1088,11 +1095,14 @@ describe('local backend', () => {
         .flatMap((message) => message.payload.markets ?? [])
         .map((market) => market.symbol);
       await waitFor(() => scopedSymbols(messagesA).length >= 3 && scopedSymbols(messagesB).length >= 3
+        && scopedSymbols(messagesC).length >= 2
         && batchSymbols(messagesA).length >= 2 && batchSymbols(messagesB).length >= 1);
       expect(new Set(scopedSymbols(messagesA))).toEqual(new Set(['GATE_FUTURE_BTC_USDT']));
       expect(new Set(scopedSymbols(messagesB))).toEqual(new Set(['GATE_FUTURE_ETH_USDT']));
       expect(new Set(batchSymbols(messagesA))).toEqual(new Set(['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_SOL_USDT']));
       expect(new Set(batchSymbols(messagesB))).toEqual(new Set(['GATE_FUTURE_ETH_USDT']));
+      expect(new Set(scopedSymbols(messagesC))).toEqual(new Set(['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_ETH_USDT']));
+      expect(messagesC.some((message) => message.type === 'orderbook.update' || message.type === 'trade.batch')).toBe(false);
       expect(batchSymbols(messagesC)).toEqual([]);
       expect(messagesA.find((message) => message.type === 'trade.batch')?.payload.trades).toHaveLength(2);
       expect(messagesB.find((message) => message.type === 'trade.batch')?.payload.trades).toHaveLength(2);

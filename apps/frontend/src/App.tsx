@@ -10,6 +10,7 @@ import {
   type CredentialConnectionStatus,
   type FundingHistoryEntry,
   type FundingOverviewResponse,
+  type KlineWatch,
   type LiveBalance,
   type LiveMarket,
   type MarketCatalogAsset,
@@ -328,6 +329,7 @@ function App() {
   const streamRef = useRef<TerminalStreamHandle | null>(null);
   const pendingWatchRef = useRef<{ symbol: string; interval: CandleInterval } | null>(null);
   const pendingQuoteSymbolsRef = useRef<string[]>([]);
+  const pendingKlineWatchesRef = useRef<KlineWatch[]>([]);
   const marketBufferRef = useRef<Map<string, LiveMarket>>(new Map());
   const lastMarketFlushAtRef = useRef(0);
   const tradeBufferRef = useRef<{ symbol: string; trades: PublicTrade[] } | null>(null);
@@ -468,7 +470,16 @@ function App() {
     streamRef.current?.watchQuotes(symbols);
   }, []);
 
+  const watchKlines = useCallback((watches: KlineWatch[]) => {
+    pendingKlineWatchesRef.current = watches;
+    streamRef.current?.watchKlines(watches);
+  }, []);
+
   useEffect(() => {
+    if (workspace !== 'Strategy') {
+      pendingKlineWatchesRef.current = [];
+      streamRef.current?.watchKlines([]);
+    }
     if (workspace === 'Trade') return;
     pendingWatchRef.current = null;
     streamRef.current?.clearWatch();
@@ -597,8 +608,11 @@ function App() {
         tradeBufferRef.current = { symbol: message.payload.symbol, trades };
       }
       const watchedInterval = pendingWatchRef.current?.interval;
+      const isAdditionalKlineWatch = (symbol: string, interval: CandleInterval) =>
+        pendingKlineWatchesRef.current.some((watch) => watch.symbol === symbol && watch.interval === interval);
       if (message.type === 'kline.snapshot'
-        && message.payload.symbol === watchedSymbol && message.payload.interval === watchedInterval) {
+        && ((message.payload.symbol === watchedSymbol && message.payload.interval === watchedInterval)
+          || isAdditionalKlineWatch(message.payload.symbol, message.payload.interval))) {
         const key = `${message.payload.symbol}:${message.payload.interval}`;
         setCandleSeries((current) => ({
           ...current,
@@ -606,7 +620,8 @@ function App() {
         }));
       }
       if (message.type === 'kline.update'
-        && message.payload.symbol === watchedSymbol && message.payload.interval === watchedInterval) {
+        && ((message.payload.symbol === watchedSymbol && message.payload.interval === watchedInterval)
+          || isAdditionalKlineWatch(message.payload.symbol, message.payload.interval))) {
         const key = `${message.payload.symbol}:${message.payload.interval}`;
         const candle = message.payload.candle;
         setCandleSeries((current) => {
@@ -627,6 +642,7 @@ function App() {
     });
     streamRef.current = handle;
     handle.watchQuotes(pendingQuoteSymbolsRef.current);
+    handle.watchKlines(pendingKlineWatchesRef.current);
     if (pendingWatchRef.current) handle.watchMarket(pendingWatchRef.current.symbol, pendingWatchRef.current.interval);
     const flushTimer = window.setInterval(() => {
       const buffered = marketBufferRef.current;
@@ -789,7 +805,7 @@ function App() {
   const content = useMemo(() => {
     if (workspace === 'Trade') return <TradingView asset={selectedAsset} catalog={availableCatalog} onSelectAsset={selectAsset} marketSnapshot={marketSnapshot} tradingSnapshot={tradingSnapshot} authenticatedPortfolio={authenticatedPortfolio} balances={balances} fees={fees} orderBook={orderBook} publicTrades={publicTrades} candleSeries={candleSeries} candleBackfilling={candleBackfilling} watchMarket={watchMarket} seedCandles={seedCandles} onTradingChanged={refreshTrading} onPositionsRefresh={refreshPositions} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} favorites={favorites} onToggleFavorite={toggleFavorite} confirmOrders={confirmOrders} onSetConfirmOrders={setConfirmOrders} />;
     if (workspace === 'Strategy') {
-      if (strategyKind === 'premium') return <PremiumStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
+      if (strategyKind === 'premium') return <PremiumStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} candleSeries={candleSeries} watchQuotes={watchQuotes} watchKlines={watchKlines} />;
       if (strategyKind === 'boros') return <BorosStrategyView marketSnapshot={marketSnapshot} catalog={availableCatalog} balances={balances} fees={fees} feesReady={feesReady} strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
       return <StrategyView mode={strategyKind} prefill={positionPrefill} marketSnapshot={marketSnapshot} catalog={availableCatalog} fees={fees} strategies={strategies} balances={balances} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onStrategiesChanged={refreshStrategies} onPositionsRefresh={refreshPositions} watchQuotes={watchQuotes} />;
     }
@@ -800,7 +816,7 @@ function App() {
     if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, strategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
