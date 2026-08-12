@@ -481,7 +481,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 18, currentMigration: '0018_credential_profiles.sql' },
+      database: { migrationCount: 19, currentMigration: '0019_strategy_accounts.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -770,7 +770,11 @@ describe('local backend', () => {
     } });
     expect(start.statusCode).toBe(200);
     const started = start.json();
-    expect(started).toMatchObject({ kind: 'position', status: 'RUNNING', progress: 0, filledQuantity: '0', config: { entryBps: '-5' } });
+    expect(started).toMatchObject({
+      kind: 'position', status: 'RUNNING', progress: 0, filledQuantity: '0',
+      accountProfileId: DEFAULT_CREDENTIAL_PROFILE, accountLabel: 'Gate CrossEx',
+      config: { entryBps: '-5' },
+    });
     expect(started.id).toMatch(/^PAIR-[A-Z0-9]{8}$/);
 
     const strategies = await app.inject({ method: 'GET', url: '/api/strategies', headers: { host: '127.0.0.1:17840' } });
@@ -1906,6 +1910,108 @@ describe('local backend', () => {
         expect.objectContaining({ label: 'Secondary account', active: false }),
       ],
     });
+
+    const strategyId = 'PAIR-ACCOUNT1';
+    database.prepare(`INSERT INTO execution_strategies
+      (id, kind, environment, status, config_json, progress, filled_quantity, filled_left,
+       filled_right, open_position, credential_profile_id, credential_profile_label,
+       created_at, updated_at, stopped_at)
+      VALUES (?, 'position', 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
+      .run(strategyId, JSON.stringify({
+        kind: 'position', asset: 'BTC', hedgeMode: 'SHARE_RATIO', leftLeverage: '1', rightLeverage: '1',
+        leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY', entryBps: '5',
+        totalAmount: '0.1', perOrderQuantity: '0.1', reduceOnly: false,
+        executionMethod: 'MAKER_TAKER', makerLeg: 'left', grid: false,
+      }), DEFAULT_CREDENTIAL_PROFILE, 'Primary account',
+      '2026-08-12T16:20:00.000Z', '2026-08-12T16:20:00.000Z');
+
+    const switchNeedsConfirmation = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${secondary!.id}/activate`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'switch-account' },
+    });
+    expect(switchNeedsConfirmation.statusCode).toBe(409);
+    expect(switchNeedsConfirmation.json()).toEqual({
+      error: 'running_strategies_require_confirmation', strategyCount: 1, strategyIds: [strategyId],
+    });
+    expect(database.prepare('SELECT status FROM execution_strategies WHERE id = ?').get(strategyId))
+      .toEqual({ status: 'RUNNING' });
+
+    const switchedInWebApp = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${secondary!.id}/activate`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'switch-account' },
+      payload: { confirmPauseRunningStrategies: true },
+    });
+    expect(switchedInWebApp.statusCode).toBe(200);
+    expect(switchedInWebApp.json()).toMatchObject({
+      label: 'Secondary account',
+      activeProfileId: secondary!.id,
+      profiles: [
+        expect.objectContaining({ label: 'Primary account', active: false }),
+        expect.objectContaining({ label: 'Secondary account', active: true }),
+      ],
+    });
+    expect(database.prepare('SELECT status, credential_profile_id FROM execution_strategies WHERE id = ?').get(strategyId))
+      .toEqual({ status: 'PAUSED', credential_profile_id: DEFAULT_CREDENTIAL_PROFILE });
+
+    database.prepare(`
+      UPDATE execution_strategies
+      SET credential_profile_id = ?, credential_profile_label = ?
+      WHERE id = ?
+    `).run(secondary!.id, 'Secondary account', strategyId);
+    const renameWithoutIntent = await app.inject({
+      method: 'PATCH',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: browserHeaders,
+      payload: { label: 'Secondary desk' },
+    });
+    expect(renameWithoutIntent.statusCode).toBe(403);
+    const invalidRename = await app.inject({
+      method: 'PATCH',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'rename-account' },
+      payload: { label: '   ' },
+    });
+    expect(invalidRename.statusCode).toBe(400);
+    const renamed = await app.inject({
+      method: 'PATCH',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'rename-account' },
+      payload: { label: '  Secondary desk  ' },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(renamed.json()).toMatchObject({
+      label: 'Secondary desk',
+      profiles: expect.arrayContaining([
+        expect.objectContaining({ id: secondary!.id, label: 'Secondary desk', active: true }),
+      ]),
+    });
+    expect(database.prepare('SELECT label FROM credential_metadata WHERE id = ?').get(secondary!.id))
+      .toEqual({ label: 'Secondary desk' });
+    expect(database.prepare('SELECT credential_profile_label FROM execution_strategies WHERE id = ?').get(strategyId))
+      .toEqual({ credential_profile_label: 'Secondary desk' });
+
+    const deletedInactive = await app.inject({
+      method: 'DELETE',
+      url: `/api/onboarding/accounts/${DEFAULT_CREDENTIAL_PROFILE}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'delete-account' },
+    });
+    expect(deletedInactive.statusCode).toBe(200);
+    expect(deletedInactive.json()).toMatchObject({
+      label: 'Secondary desk',
+      profiles: [expect.objectContaining({ label: 'Secondary desk', active: true })],
+    });
+    expect(await vault.get(DEFAULT_CREDENTIAL_PROFILE)).toBeNull();
+
+    const deletedActive = await app.inject({
+      method: 'DELETE',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'delete-account' },
+    });
+    expect(deletedActive.statusCode).toBe(200);
+    expect(deletedActive.json()).toMatchObject({ configured: false, activeProfileId: null, profiles: [] });
+    expect(await vault.get(secondary!.id)).toBeNull();
   });
 
   it('discards authenticated cache at boot when the active .env credentials may have changed', async () => {

@@ -121,6 +121,7 @@ export interface ExecutionOrder {
 
 export interface StrategyRecord {
   id: string; kind: 'position' | 'auto' | 'premium'; status: string; config: CreateStrategyInput;
+  accountProfileId: string | null; accountLabel: string | null;
   progress: number; filledQuantity: string; filledLeft: string; filledRight: string; openPosition: string;
   /** Sum of realized PnL reported by strategy-linked trade fills. */
   realizedPnl: string;
@@ -146,6 +147,7 @@ interface OrderRow {
 
 interface StrategyRow {
   id: string; kind: 'position' | 'auto' | 'premium'; environment: 'live'; status: string; config_json: string;
+  credential_profile_id: string | null; credential_profile_label: string | null;
   progress: number; filled_quantity: string; filled_left: string; filled_right: string; open_position: string;
   created_at: string; updated_at: string; stopped_at: string | null;
 }
@@ -162,6 +164,7 @@ function orderFromRow(row: OrderRow): ExecutionOrder {
 
 function strategyFromRow(row: StrategyRow): StrategyRecord {
   return { id: row.id, kind: row.kind, status: row.status,
+    accountProfileId: row.credential_profile_id, accountLabel: row.credential_profile_label,
     config: CreateStrategyInputSchema.parse(JSON.parse(row.config_json)), progress: row.progress,
     filledQuantity: row.filled_quantity, filledLeft: row.filled_left, filledRight: row.filled_right,
     openPosition: row.open_position, realizedPnl: '0',

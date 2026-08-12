@@ -40,6 +40,47 @@ describe('local API request coordination', () => {
     }));
   });
 
+  it('sends explicit intents for in-app account switching, renaming, and deletion', async () => {
+    const connection = {
+      configured: true,
+      storage: 'env_file',
+      label: 'Primary account',
+      lastVerifiedAt: '2026-08-12T16:00:00.000Z',
+      secureEntryPath: '/secure/credentials',
+      readOnly: true,
+      activeProfileId: 'gate-crossex-default',
+      profiles: [{
+        id: 'gate-crossex-default', label: 'Primary account', storage: 'env_file',
+        lastVerifiedAt: '2026-08-12T16:00:00.000Z', active: true,
+      }],
+    };
+    const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) => {
+      void _path;
+      void _init;
+      return new Response(JSON.stringify(connection));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.switchAccount('gate-crossex-default', true)).resolves.toMatchObject({ label: 'Primary account' });
+    await expect(api.renameAccount('gate-crossex-default', 'Main trading')).resolves.toMatchObject({ label: 'Primary account' });
+    await expect(api.deleteAccount('gate-crossex-default')).resolves.toMatchObject({ label: 'Primary account' });
+
+    const switchCall = fetchMock.mock.calls[0];
+    const renameCall = fetchMock.mock.calls[1];
+    const deleteCall = fetchMock.mock.calls[2];
+    expect(switchCall?.[0]).toBe('/api/onboarding/accounts/gate-crossex-default/activate');
+    expect(switchCall?.[1]?.method).toBe('POST');
+    expect(new Headers(switchCall?.[1]?.headers).get('x-gct-credential-intent')).toBe('switch-account');
+    expect(switchCall?.[1]?.body).toBe('{"confirmPauseRunningStrategies":true}');
+    expect(renameCall?.[0]).toBe('/api/onboarding/accounts/gate-crossex-default');
+    expect(renameCall?.[1]?.method).toBe('PATCH');
+    expect(new Headers(renameCall?.[1]?.headers).get('x-gct-credential-intent')).toBe('rename-account');
+    expect(renameCall?.[1]?.body).toBe('{"label":"Main trading"}');
+    expect(deleteCall?.[0]).toBe('/api/onboarding/accounts/gate-crossex-default');
+    expect(deleteCall?.[1]?.method).toBe('DELETE');
+    expect(new Headers(deleteCall?.[1]?.headers).get('x-gct-credential-intent')).toBe('delete-account');
+  });
+
   it('rejects a successful response that violates the shared runtime contract', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       mode: 'live',

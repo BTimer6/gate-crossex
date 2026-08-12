@@ -8,6 +8,11 @@ describe('English and Chinese translations', () => {
     ['zh', 'Best ask', '最优卖价'],
     ['zh', 'ADL indicator', 'ADL 指标'],
     ['zh', 'Manage and switch accounts', '管理和切换账户'],
+    ['zh', 'Current account', '当前账户'],
+    ['zh', 'Edit account name', '编辑账户名称'],
+    ['zh', 'Add a new account', '添加新账户'],
+    ['zh', 'Delete account', '删除账户'],
+    ['zh', 'Pause strategies and switch account?', '暂停策略并切换账户？'],
     ['zh', 'Sign in with Gate API credentials', '使用 Gate API 密钥登录'],
     ['zh', 'Open secure credential setup', '打开 Gate API 密钥设置'],
   ] as const)('translates %s %s', (language, key, expected) => {

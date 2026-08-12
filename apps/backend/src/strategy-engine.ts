@@ -328,10 +328,14 @@ export class StrategyEngine {
     }
   }
 
-  activatePersistedStrategies(): void {
+  activatePersistedStrategies(credentialProfileId?: string | null): void {
     if (!this.session.liveTradingEnabled) return;
     for (const record of this.runtime.listStrategies()) {
       if (record.status !== 'RUNNING') continue;
+      if (credentialProfileId !== undefined
+        && record.accountProfileId !== credentialProfileId
+        // Legacy rows without an owner are considered part of the active account until reviewed.
+        && record.accountProfileId !== null) continue;
       if (this.actors.has(record.id)) continue;
       this.attach(record);
       this.runtime.addStrategyLog(record.id, 'info', 'Strategy resumed', 'Live mode enabled after order reconciliation', '—', 'Monitoring live spreads');
@@ -355,8 +359,16 @@ export class StrategyEngine {
    * successful credential mutation must make persisted RUNNING strategies non-resumable before
    * the new profile can become active.
    */
-  pauseRunningStrategiesForCredentialChange(): number {
-    const running = this.runtime.listStrategies().filter((record) => record.status === 'RUNNING');
+  runningStrategiesForCredentialProfile(credentialProfileId?: string | null): StrategyRecord[] {
+    return this.runtime.listStrategies().filter((record) => record.status === 'RUNNING'
+      && (credentialProfileId === undefined
+        || record.accountProfileId === credentialProfileId
+        // Legacy strategies are treated as belonging to the account active during migration.
+        || record.accountProfileId === null));
+  }
+
+  pauseRunningStrategiesForCredentialChange(credentialProfileId?: string | null): number {
+    const running = this.runningStrategiesForCredentialProfile(credentialProfileId);
     if (running.length === 0) return 0;
     const updatedAt = new Date().toISOString();
     const update = this.database.prepare(`UPDATE execution_strategies
@@ -398,7 +410,10 @@ export class StrategyEngine {
     return [...this.actors.keys()];
   }
 
-  async startStrategy(raw: unknown): Promise<StrategyRecord> {
+  async startStrategy(
+    raw: unknown,
+    account: { profileId: string; label: string } | null = null,
+  ): Promise<StrategyRecord> {
     const input = CreateStrategyInputSchema.parse(raw);
     // Grid strategies remain readable/resumable for historical compatibility, but the product no
     // longer allows creating new premium grids.
@@ -450,8 +465,10 @@ export class StrategyEngine {
     const id = `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
-      filled_quantity, filled_left, filled_right, open_position, created_at, updated_at, stopped_at)
-      VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, NULL)`).run(id, input.kind, JSON.stringify(input), now, now);
+      filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
+      credential_profile_label, created_at, updated_at, stopped_at)
+      VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
+      .run(id, input.kind, JSON.stringify(input), account?.profileId ?? null, account?.label ?? null, now, now);
     const shortPremium = input.leftSide === 'SELL';
     const hedgeModeLabel = input.hedgeMode === 'EQUAL_NOTIONAL' ? 'equal-notional hedge' : 'share-ratio hedge';
     const startCondition = input.closePlan

@@ -67,6 +67,12 @@ function assertCurrentSchema(database: Database.Database): void {
   if (!auditColumns.some((column) => column.name === 'correlation_id')) {
     throw new Error('Database schema is missing audit_events.correlation_id');
   }
+  const strategyColumns = database.prepare('PRAGMA table_info(execution_strategies)').all() as Array<{ name: string }>;
+  for (const required of ['credential_profile_id', 'credential_profile_label']) {
+    if (!strategyColumns.some((column) => column.name === required)) {
+      throw new Error(`Database schema is missing execution_strategies.${required}`);
+    }
+  }
 }
 
 export function openDatabase(databasePath: string, migrationsDir: string): Database.Database {
@@ -123,7 +129,7 @@ export function openDatabase(databasePath: string, migrationsDir: string): Datab
     }
 
     assertDatabaseIntegrity(database);
-    if (migrationFiles.includes('0018_credential_profiles.sql')) assertCurrentSchema(database);
+    if (migrationFiles.includes('0019_strategy_accounts.sql')) assertCurrentSchema(database);
     database.pragma('optimize');
     return database;
   } catch (error) {

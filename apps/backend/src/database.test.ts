@@ -30,13 +30,17 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 18,
-      currentMigration: '0018_credential_profiles.sql',
+      migrationCount: 19,
+      currentMigration: '0019_strategy_accounts.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
     const positionColumns = first.prepare('PRAGMA table_info(live_positions)').all() as Array<{ name: string }>;
     expect(positionColumns.map((column) => column.name)).toContain('funding_fee');
+    const strategyColumns = first.prepare('PRAGMA table_info(execution_strategies)').all() as Array<{ name: string }>;
+    expect(strategyColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
+      'credential_profile_id', 'credential_profile_label',
+    ]));
     if (process.platform !== 'win32') {
       expect(statSync(location.directory).mode & 0o777).toBe(0o700);
       expect(statSync(location.path).mode & 0o777).toBe(0o600);
@@ -44,7 +48,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(18);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(19);
     reopened.close();
   });
 
@@ -87,7 +91,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0018_credential_profiles.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0019_strategy_accounts.sql');
     database.close();
   });
 

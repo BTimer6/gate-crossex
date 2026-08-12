@@ -199,9 +199,17 @@ function credentialPageMessage(language: SecureCredentialLanguage, english: stri
 const DeleteCredentialFormSchema = CredentialContextSchema.extend({
   csrfToken: z.string().min(20).max(200),
 });
+const CredentialProfileIdSchema = z.string().regex(/^gate-crossex-(?:default|account-[0-9a-f-]{36})$/);
 const SwitchCredentialFormSchema = CredentialContextSchema.extend({
   csrfToken: z.string().min(20).max(200),
-  profileId: z.string().regex(/^gate-crossex-(?:default|account-[0-9a-f-]{36})$/),
+  profileId: CredentialProfileIdSchema,
+});
+const CredentialProfileParamsSchema = z.object({ profileId: CredentialProfileIdSchema });
+const WebAccountSwitchSchema = z.object({
+  confirmPauseRunningStrategies: z.boolean().default(false),
+});
+const WebAccountRenameSchema = z.object({
+  label: z.string().trim().min(1).max(80).refine(noControlCharacters),
 });
 
 export interface BuildAppOptions {
@@ -1046,7 +1054,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     };
   });
 
-  app.get('/api/onboarding/connection', async (): Promise<CredentialConnectionStatus> => {
+  const credentialConnectionStatus = async (): Promise<CredentialConnectionStatus> => {
     const metadata = activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId) : null;
     const detectedProvider = metadata || !activeCredentialProfileId
       ? null
@@ -1068,6 +1076,192 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         active: profile.id === activeCredentialProfileId,
       })),
     };
+  };
+
+  app.get('/api/onboarding/connection', credentialConnectionStatus);
+
+  app.patch('/api/onboarding/accounts/:profileId', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-credential-intent'] !== 'rename-account') {
+        return reply.code(403).send({ error: 'missing_credential_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const profileParams = CredentialProfileParamsSchema.safeParse(request.params);
+    const renameRequest = WebAccountRenameSchema.safeParse(request.body);
+    if (!profileParams.success || !renameRequest.success) {
+      return reply.code(400).send({ error: 'invalid_account_name' });
+    }
+    const profile = getCredentialMetadata(database, profileParams.data.profileId);
+    if (!profile) return reply.code(404).send({ error: 'credential_profile_not_found' });
+    if (profile.id !== activeCredentialProfileId) {
+      return reply.code(409).send({ error: 'credential_profile_not_active' });
+    }
+    if (profile.label === renameRequest.data.label) return credentialConnectionStatus();
+
+    try {
+      database.transaction(() => {
+        upsertCredentialMetadata(database, { ...profile, label: renameRequest.data.label });
+        database.prepare(`
+          UPDATE execution_strategies
+          SET credential_profile_label = ?
+          WHERE credential_profile_id = ?
+        `).run(renameRequest.data.label, profile.id);
+        addAuditEvent(database, 'credential_profile_renamed', {
+          profile: profile.id,
+          previousLabel: profile.label,
+          nextLabel: renameRequest.data.label,
+          source: 'web_app',
+        });
+      })();
+      return credentialConnectionStatus();
+    } catch {
+      request.log.error({ profile: profile.id }, 'web account rename failed');
+      return reply.code(500).send({ error: 'credential_profile_rename_failed' });
+    }
+  });
+
+  app.post('/api/onboarding/accounts/:profileId/activate', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-credential-intent'] !== 'switch-account') {
+        return reply.code(403).send({ error: 'missing_credential_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = CredentialProfileParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_credential_profile' });
+    const switchRequest = WebAccountSwitchSchema.safeParse(request.body ?? {});
+    if (!switchRequest.success) return reply.code(400).send({ error: 'invalid_account_switch' });
+    const target = getCredentialMetadata(database, parsed.data.profileId);
+    if (!target) return reply.code(404).send({ error: 'credential_profile_not_found' });
+    if (target.id === activeCredentialProfileId) return credentialConnectionStatus();
+
+    let credentials: GateCredentials | null = null;
+    const previousActiveProfileId = activeCredentialProfileId;
+    const affectedStrategies = strategyEngine.runningStrategiesForCredentialProfile(previousActiveProfileId);
+    if (affectedStrategies.length > 0 && !switchRequest.data.confirmPauseRunningStrategies) {
+      return reply.code(409).send({
+        error: 'running_strategies_require_confirmation',
+        strategyCount: affectedStrategies.length,
+        strategyIds: affectedStrategies.map((strategy) => strategy.id),
+      });
+    }
+    try {
+      await quiesceForCredentialMutation();
+      credentials = await storedCredentialVault.get(target.id);
+      if (!credentials) throw new TradingRuntimeError('credential_missing_from_vault', 409);
+      const account = await crossExGateway.queryAccount(credentials);
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId);
+      const verifiedAt = new Date().toISOString();
+      privateStream.stop();
+      database.transaction(() => {
+        upsertCredentialMetadata(database, { ...target, lastVerifiedAt: verifiedAt });
+        saveActiveCredentialProfile(database, target.id);
+        addAuditEvent(database, 'credential_profile_switched', {
+          fromProfile: previousActiveProfileId,
+          toProfile: target.id,
+          accountMode: account.account_mode,
+          pausedStrategyCount,
+          source: 'web_app',
+        });
+      })();
+      activeCredentialProfileId = target.id;
+      invalidateAuthenticatedState();
+      privateStream.start();
+      if (options.startMarketStream) triggerPortfolioRefresh?.();
+      return credentialConnectionStatus();
+    } catch (error) {
+      activeCredentialProfileId = previousActiveProfileId;
+      try { saveActiveCredentialProfile(database, previousActiveProfileId); } catch { /* preserve original error */ }
+      privateStream.start();
+      request.log.warn({ reason: error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR' }, 'web account switch failed');
+      if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      if (error instanceof GateApiError) {
+        return reply.code(502).send({ error: 'credential_verification_failed', label: error.label });
+      }
+      return reply.code(500).send({ error: 'credential_profile_switch_failed' });
+    } finally {
+      credentials = null;
+    }
+  });
+
+  app.delete('/api/onboarding/accounts/:profileId', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-credential-intent'] !== 'delete-account') {
+        return reply.code(403).send({ error: 'missing_credential_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = CredentialProfileParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_credential_profile' });
+    const profile = getCredentialMetadata(database, parsed.data.profileId);
+    if (!profile) return reply.code(404).send({ error: 'credential_profile_not_found' });
+
+    const deletingActiveProfile = profile.id === activeCredentialProfileId;
+    const previousActiveProfileId = activeCredentialProfileId;
+    let previousCredentials: GateCredentials | null = null;
+    let previousProvider: CredentialStorageProvider | null = null;
+    let vaultDeleted = false;
+    try {
+      if (deletingActiveProfile) await quiesceForCredentialMutation();
+      const pausedStrategyCount = deletingActiveProfile
+        ? strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId)
+        : 0;
+      previousCredentials = await storedCredentialVault.get(profile.id);
+      previousProvider = await storedCredentialVault.getProvider(profile.id);
+      if (deletingActiveProfile) privateStream.stop();
+      vaultDeleted = await storedCredentialVault.delete(profile.id);
+      if (previousCredentials && !vaultDeleted) throw new Error('credential_store_reported_no_deletion');
+      try {
+        database.transaction(() => {
+          deleteCredentialMetadata(database, profile.id);
+          if (deletingActiveProfile) saveActiveCredentialProfile(database, null);
+          addAuditEvent(database, 'credential_deleted', {
+            profile: profile.id,
+            active: deletingActiveProfile,
+            pausedStrategyCount,
+            source: 'web_app',
+          });
+        })();
+      } catch (error) {
+        if (previousCredentials) {
+          await storedCredentialVault.set(profile.id, previousCredentials, previousProvider ?? undefined);
+          vaultDeleted = false;
+        }
+        throw error;
+      }
+      if (deletingActiveProfile) {
+        activeCredentialProfileId = null;
+        invalidateAuthenticatedState();
+        privateStream.start();
+      }
+      return credentialConnectionStatus();
+    } catch (error) {
+      if (vaultDeleted && previousCredentials) {
+        await storedCredentialVault.set(profile.id, previousCredentials, previousProvider ?? undefined)
+          .catch((rollbackError) => request.log.error({ err: rollbackError }, 'web account deletion rollback failed'));
+      }
+      try {
+        database.transaction(() => {
+          upsertCredentialMetadata(database, profile);
+          if (deletingActiveProfile) saveActiveCredentialProfile(database, previousActiveProfileId);
+        })();
+        activeCredentialProfileId = previousActiveProfileId;
+      } catch { /* preserve deletion error */ }
+      if (deletingActiveProfile) privateStream.start();
+      request.log.warn({ profile: profile.id }, 'web account deletion failed');
+      if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      return reply.code(500).send({ error: 'credential_profile_delete_failed' });
+    } finally {
+      previousCredentials = null;
+    }
   });
 
   app.get('/api/trading-mode', async () => ({ mode: tradingSession.current }));
@@ -1128,7 +1322,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       const unresolved = await strategyEngine.suspendForTradingLock();
       unresolvedOrderIds = unresolved.map(({ order }) => order.id);
     } else {
-      strategyEngine.activatePersistedStrategies();
+      strategyEngine.activatePersistedStrategies(activeCredentialProfileId);
     }
     if (mode !== previous) {
       addAuditEvent(database, 'trading_mode_changed', {
@@ -1287,7 +1481,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           return reply.code(503).send({ error: 'strategy_instrument_constraints_unavailable' });
         }
       }
-      return await strategyEngine.startStrategy(request.body);
+      const profileId = activeCredentialProfileId;
+      const profile = profileId ? getCredentialMetadata(database, profileId) : null;
+      if (!profileId) return reply.code(409).send({ error: 'credential_not_configured' });
+      const provider = await storedCredentialVault.getProvider(profileId);
+      return await strategyEngine.startStrategy(request.body, {
+        profileId,
+        label: profile?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
+      });
     }
     catch (error) {
       if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_strategy', issues: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) });
@@ -2341,7 +2542,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     try {
       await quiesceForCredentialMutation();
       const account = await crossExGateway.queryAccount(credentials);
-      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange();
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId);
       const verifiedAt = new Date().toISOString();
       const storageProvider = parsed.data.storageProvider ?? storedCredentialVault.provider;
       previousCredentials = await storedCredentialVault.get(profileId);
@@ -2459,7 +2660,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       credentials = await storedCredentialVault.get(target.id);
       if (!credentials) throw new TradingRuntimeError('credential_missing_from_vault', 409);
       const account = await crossExGateway.queryAccount(credentials);
-      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange();
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId);
       const verifiedAt = new Date().toISOString();
       privateStream.stop();
       database.transaction(() => {
@@ -2528,7 +2729,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     try {
       if (!profileId) throw new TradingRuntimeError('credential_not_configured', 409);
       await quiesceForCredentialMutation();
-      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange();
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(profileId);
       previousCredentials = await storedCredentialVault.get(profileId);
       previousProvider = await storedCredentialVault.getProvider(profileId);
       privateStream.stop();

@@ -351,6 +351,32 @@ export const api = {
     headers: { 'x-gct-read-intent': 'fee-rates' },
   }),
   connection: () => request(CredentialConnectionStatusSchema, '/api/onboarding/connection'),
+  switchAccount: (profileId: string, confirmPauseRunningStrategies = false) => request(
+    CredentialConnectionStatusSchema,
+    `/api/onboarding/accounts/${encodeURIComponent(profileId)}/activate`,
+    {
+      method: 'POST',
+      headers: { 'x-gct-credential-intent': 'switch-account' },
+      body: JSON.stringify({ confirmPauseRunningStrategies }),
+    },
+  ),
+  renameAccount: (profileId: string, label: string) => request(
+    CredentialConnectionStatusSchema,
+    `/api/onboarding/accounts/${encodeURIComponent(profileId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'x-gct-credential-intent': 'rename-account' },
+      body: JSON.stringify({ label }),
+    },
+  ),
+  deleteAccount: (profileId: string) => request(
+    CredentialConnectionStatusSchema,
+    `/api/onboarding/accounts/${encodeURIComponent(profileId)}`,
+    {
+      method: 'DELETE',
+      headers: { 'x-gct-credential-intent': 'delete-account' },
+    },
+  ),
   discovery: () => request(SystemDiscoverySchema, '/api/system/discovery'),
   tradingMode: () => request(TradingModeResponseSchema, '/api/trading-mode'),
   setTradingMode: (mode: 'readonly' | 'live', acceptDisclaimer: boolean) =>

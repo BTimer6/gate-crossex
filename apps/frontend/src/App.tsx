@@ -56,6 +56,13 @@ const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Boros by Pendle', glyph: '◐' },
 ];
 
+function TopbarNavigationContent({ label, glyph, iconSrc }: { label: string; glyph: string; iconSrc?: string }) {
+  const { t } = useLanguage();
+  return <>{iconSrc
+    ? <span className="nav-boros-mark" aria-hidden="true"><img src={iconSrc} alt="" /></span>
+    : <span className="topbar-nav-glyph" aria-hidden="true">{glyph}</span>}{t(label)}</>;
+}
+
 const strategyPages: Array<{ kind: StrategyKind; glyph: string; label: string; detail: string }> = [
   { kind: 'position', glyph: '◎', label: 'Cross-exchange hedge', detail: 'Execute a fixed two-venue position, then stop' },
   { kind: 'premium', glyph: '≒', label: 'SK hynix premium bot', detail: 'Trade the SK hynix ADR premium vs the Korean listing' },
@@ -131,6 +138,182 @@ function useDialogFocus(open: boolean, onClose?: () => void) {
   }, [open]);
 
   return dialogRef;
+}
+
+type AccountAction = { profileId: string; kind: 'switch' | 'delete' } | null;
+type PendingAccountSwitch = { profileId: string; strategies: StrategyRecord[] } | null;
+
+function accountStorageLabel(
+  storage: CredentialConnectionStatus['storage'],
+  t: (key: string) => string,
+): string {
+  if (storage === 'os_keychain') return t('OS keychain');
+  if (storage === 'env_file') return t('Local .env file');
+  return storage;
+}
+
+function AccountManagerDialog({
+  open,
+  connection,
+  language,
+  action,
+  pendingSwitch,
+  deleteConfirmationId,
+  error,
+  editingAccountName,
+  accountNameDraft,
+  accountRenameSaving,
+  accountRenameError,
+  onClose,
+  onSwitch,
+  onCancelSwitch,
+  onConfirmSwitch,
+  onRequestDelete,
+  onCancelDelete,
+  onDelete,
+  onBeginRename,
+  onAccountNameChange,
+  onCancelRename,
+  onRename,
+  onAdd,
+}: {
+  open: boolean;
+  connection: CredentialConnectionStatus | null;
+  language: Language;
+  action: AccountAction;
+  pendingSwitch: PendingAccountSwitch;
+  deleteConfirmationId: string | null;
+  error: string | null;
+  editingAccountName: boolean;
+  accountNameDraft: string;
+  accountRenameSaving: boolean;
+  accountRenameError: string | null;
+  onClose: () => void;
+  onSwitch: (profileId: string) => void;
+  onCancelSwitch: () => void;
+  onConfirmSwitch: (profileId: string) => void;
+  onRequestDelete: (profileId: string) => void;
+  onCancelDelete: () => void;
+  onDelete: (profileId: string) => void;
+  onBeginRename: () => void;
+  onAccountNameChange: (label: string) => void;
+  onCancelRename: () => void;
+  onRename: () => void;
+  onAdd: () => void;
+}) {
+  const { t } = useLanguage();
+  const dialogRef = useDialogFocus(open, onClose);
+  if (!open) return null;
+  const sourceAccount = connection?.profiles.find((profile) => profile.active) ?? null;
+  const targetAccount = pendingSwitch
+    ? connection?.profiles.find((profile) => profile.id === pendingSwitch.profileId) ?? null
+    : null;
+  const switchBusy = pendingSwitch !== null
+    && action?.kind === 'switch'
+    && action.profileId === pendingSwitch.profileId;
+
+  return <div className="modal-backdrop account-manager-backdrop" onMouseDown={(event) => {
+    if (event.target === event.currentTarget) onClose();
+  }}>
+    <section ref={dialogRef} className="account-manager-dialog" role="dialog" aria-modal="true" aria-labelledby="account-manager-title" tabIndex={-1}>
+      <header>
+        <div><p>{t(pendingSwitch ? 'Action required' : 'Account settings')}</p><h2 id="account-manager-title">{t(pendingSwitch ? 'Pause strategies and switch account?' : 'Manage and switch accounts')}</h2></div>
+        <button className="account-manager-close" onClick={pendingSwitch ? onCancelSwitch : onClose} disabled={switchBusy || accountRenameSaving} aria-label={t('Close')}>×</button>
+      </header>
+      {pendingSwitch ? <>
+        <div className="account-switch-warning">
+          <span className="account-switch-warning-icon" aria-hidden="true">!</span>
+          <div>
+            <strong>{t('Running strategies are attached to the current account.')}</strong>
+            <p>{t('To switch accounts safely, the strategies below will be paused and live trading will be locked. You can review them before enabling trading again.')}</p>
+          </div>
+        </div>
+        <div className="account-switch-route" aria-label={t('Account switch')}>
+          <span><small>{t('Current account')}</small><strong>{sourceAccount?.label ?? '—'}</strong></span>
+          <b aria-hidden="true">→</b>
+          <span><small>{t('Switch to')}</small><strong>{targetAccount?.label ?? '—'}</strong></span>
+        </div>
+        <section className="account-switch-strategies" aria-labelledby="affected-strategies-title">
+          <h3 id="affected-strategies-title">{t('Strategies that will be paused')} <span>{pendingSwitch.strategies.length || '—'}</span></h3>
+          {pendingSwitch.strategies.length > 0 ? pendingSwitch.strategies.map((strategy) => <div key={strategy.id}>
+            <span><strong>{strategy.id}</strong><small>{strategy.config.asset} · {t(strategy.kind === 'auto' ? 'Price-difference bot' : strategy.kind === 'premium' ? 'SK hynix premium bot' : 'Cross-exchange hedge')}</small></span>
+            <em>{t('Running')}</em>
+          </div>) : <p>{t('The backend detected a newly running strategy. Confirm to pause all affected strategies before switching.')}</p>}
+        </section>
+        {error && <p className="account-manager-error" role="alert">{t(error)}</p>}
+        <footer className="account-switch-footer">
+          <button onClick={onCancelSwitch} disabled={switchBusy}>{t('Keep current account')}</button>
+          <button className="confirm-account-switch" data-dialog-autofocus onClick={() => onConfirmSwitch(pendingSwitch.profileId)} disabled={switchBusy}>
+            {switchBusy ? t('Pausing and switching…') : t('Pause strategies and switch')}
+          </button>
+        </footer>
+      </> : <>
+      <p className="account-manager-intro">{t('Switching the active account locks live trading until you enable it again.')}</p>
+      {error && <p className="account-manager-error" role="alert">{t(error)}</p>}
+      <div className="account-manager-list" aria-label={t('Available accounts')}>
+        {(connection?.profiles ?? []).map((profile) => {
+          const deleting = deleteConfirmationId === profile.id;
+          const renaming = profile.active && editingAccountName;
+          const busy = action?.profileId === profile.id;
+          const verified = profile.lastVerifiedAt
+            ? `${t('Verified')} ${new Date(profile.lastVerifiedAt).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}`
+            : t('Never verified');
+          return <article className={`account-manager-row${profile.active ? ' active' : ''}${deleting ? ' deleting' : ''}`} key={profile.id}>
+            <div className="account-manager-avatar" aria-hidden="true">{profile.label.trim().charAt(0).toUpperCase() || 'G'}</div>
+            {renaming ? <form className="account-manager-rename-form" onSubmit={(event) => {
+              event.preventDefault();
+              onRename();
+            }}>
+              <input
+                autoFocus
+                value={accountNameDraft}
+                maxLength={80}
+                onChange={(event) => onAccountNameChange(event.target.value)}
+                disabled={accountRenameSaving}
+                aria-label={t('Account name')}
+              />
+              <div>
+                <button type="button" onClick={onCancelRename} disabled={accountRenameSaving}>{t('Cancel edit')}</button>
+                <button type="submit" className="primary" disabled={accountRenameSaving || !accountNameDraft.trim()}>{t(accountRenameSaving ? 'Saving…' : 'Save')}</button>
+              </div>
+              {accountRenameError && <small role="alert">{t(accountRenameError)}</small>}
+            </form> : <><div className="account-manager-identity">
+              <strong>{profile.label}</strong>
+              <small>{accountStorageLabel(profile.storage, t)} · {verified}</small>
+            </div>
+            {deleting ? <div className="account-delete-confirmation">
+              <strong>{t('Delete this account?')}</strong>
+              <small>{t('This removes its saved API credentials from this device.')}</small>
+              <span>
+                <button onClick={onCancelDelete} disabled={busy}>{t('Keep account')}</button>
+                <button className="danger" onClick={() => onDelete(profile.id)} disabled={busy}>
+                  {busy ? t('Deleting…') : t('Delete account')}
+                </button>
+              </span>
+            </div> : <div className="account-manager-actions">
+              {profile.active
+                ? <span className="account-active-pill">● {t('Active')}</span>
+                : <button onClick={() => onSwitch(profile.id)} disabled={action !== null || editingAccountName}>
+                  {busy && action?.kind === 'switch' ? t('Switching…') : t('Switch')}
+                </button>}
+              {profile.active && <button className="account-rename-button" onClick={onBeginRename} disabled={action !== null}>{t('Edit account name')}</button>}
+              <button className="account-delete-button" onClick={() => onRequestDelete(profile.id)} disabled={action !== null || editingAccountName} aria-label={`${t('Delete account')}: ${profile.label}`} title={t('Delete account')}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5" /></svg>
+              </button>
+            </div>}</>}
+          </article>;
+        })}
+        {connection && connection.profiles.length === 0 && <div className="account-manager-empty">
+          <strong>{t('No accounts saved yet.')}</strong>
+          <small>{t('Add an account to connect Gate CrossEx.')}</small>
+        </div>}
+      </div>
+      <footer>
+        <button className="add-account-button" data-dialog-autofocus onClick={onAdd} disabled={editingAccountName || accountRenameSaving}>+ {t('Add a new account')}</button>
+      </footer>
+      </>}
+    </section>
+  </div>;
 }
 
 function symbolParts(symbol: string) {
@@ -247,7 +430,7 @@ function TradingModeGate({ mode, onApplied, credentialEntryPath, onCredentialSta
       <ul className="disclaimer-points">
         <li>{t('This is open-source software provided “as is”, without warranty of any kind. The authors and contributors are not liable for any losses arising from its use.')}</li>
         <li>{t('When live trading is enabled, this terminal places real orders on your live exchange account. Software bugs, network failures, or exchange behavior can cause unexpected orders, positions, or losses.')}</li>
-        <li>{t('Enabling live trading also re-activates any strategies that were left in a running state.')}</li>
+        <li>{t('Enabling live trading re-activates running strategies attached to the current account.')}</li>
         <li>{t('Trading derivatives involves substantial risk of loss. You alone are responsible for all activity on your API keys and for compliance with local regulations. Nothing in this application is investment advice.')}</li>
       </ul>
       <label className="disclaimer-agree">
@@ -327,6 +510,15 @@ function App() {
   const [tradingMode, setTradingMode] = useState<TradingMode | null>(null);
   const [modeDialogOpen, setModeDialogOpen] = useState(false);
   const [connection, setConnection] = useState<CredentialConnectionStatus | null>(null);
+  const [editingAccountName, setEditingAccountName] = useState(false);
+  const [accountNameDraft, setAccountNameDraft] = useState('');
+  const [accountRenameSaving, setAccountRenameSaving] = useState(false);
+  const [accountRenameError, setAccountRenameError] = useState<string | null>(null);
+  const [accountManagerOpen, setAccountManagerOpen] = useState(false);
+  const [accountAction, setAccountAction] = useState<AccountAction>(null);
+  const [pendingAccountSwitch, setPendingAccountSwitch] = useState<PendingAccountSwitch>(null);
+  const [deleteConfirmationId, setDeleteConfirmationId] = useState<string | null>(null);
+  const [accountManagerError, setAccountManagerError] = useState<string | null>(null);
   const [orderBook, setOrderBook] = useState<OrderBookSnapshot | null>(null);
   const [publicTrades, setPublicTrades] = useState<{ symbol: string; trades: PublicTrade[] }>({ symbol: '', trades: [] });
   const [candleSeries, setCandleSeries] = useState<Record<string, Candle[]>>({});
@@ -356,6 +548,11 @@ function App() {
       markBackendUnavailable();
     }
   }, [markBackendUnavailable]);
+  const refreshConnection = useCallback(async () => {
+    const next = await api.connection();
+    setConnection(next);
+    return next;
+  }, []);
 
   useEffect(() => {
     if (backendUnavailableSince === null) {
@@ -690,16 +887,20 @@ function App() {
   }, [workspace, refreshMarketSnapshot, reportBackendConnectivityError]);
 
   useEffect(() => {
-    if (settingsOpen) void api.connection().then(setConnection).catch(() => undefined);
-  }, [settingsOpen]);
+    if (settingsOpen || accountManagerOpen) void refreshConnection().catch(() => undefined);
+  }, [settingsOpen, accountManagerOpen, refreshConnection]);
+
+  useEffect(() => {
+    if (accountManagerOpen) void refreshStrategies().catch(reportBackendConnectivityError);
+  }, [accountManagerOpen, refreshStrategies, reportBackendConnectivityError]);
 
   useEffect(() => {
     const refreshConnectionAfterCredentialWindow = () => {
-      void api.connection().then(setConnection).catch(() => undefined);
+      void refreshConnection().catch(() => undefined);
     };
     window.addEventListener('focus', refreshConnectionAfterCredentialWindow);
     return () => window.removeEventListener('focus', refreshConnectionAfterCredentialWindow);
-  }, []);
+  }, [refreshConnection]);
 
   useEffect(() => {
     if (!settingsOpen && !notificationsOpen) return;
@@ -841,12 +1042,142 @@ function App() {
     : t('Account reconnecting');
   const accountStatusConnected = accountStream?.state === 'live';
 
+  const applyAccountConnection = useCallback((next: CredentialConnectionStatus) => {
+    setConnection(next);
+    if (next.readOnly) {
+      setTradingMode((current) => current === 'unset' ? current : 'readonly');
+    }
+  }, []);
+
+  const beginAccountNameEdit = useCallback(() => {
+    if (!connection?.activeProfileId || !connection.label) return;
+    setDeleteConfirmationId(null);
+    setAccountNameDraft(connection.label);
+    setAccountRenameError(null);
+    setEditingAccountName(true);
+  }, [connection?.activeProfileId, connection?.label]);
+
+  const cancelAccountNameEdit = useCallback(() => {
+    if (accountRenameSaving) return;
+    setEditingAccountName(false);
+    setAccountRenameError(null);
+  }, [accountRenameSaving]);
+
+  const renameCurrentAccount = useCallback(async () => {
+    const profileId = connection?.activeProfileId;
+    const label = accountNameDraft.trim();
+    if (!profileId || !label) {
+      setAccountRenameError('Enter an account name.');
+      return;
+    }
+    if (label === connection.label) {
+      setEditingAccountName(false);
+      setAccountRenameError(null);
+      return;
+    }
+
+    setAccountRenameSaving(true);
+    setAccountRenameError(null);
+    try {
+      const next = await api.renameAccount(profileId, label);
+      applyAccountConnection(next);
+      setStrategies((current) => current.map((strategy) => strategy.accountProfileId === profileId
+        ? { ...strategy, accountLabel: next.label }
+        : strategy));
+      setEditingAccountName(false);
+    } catch (error) {
+      reportBackendConnectivityError(error);
+      setAccountRenameError('Unable to rename this account. Try again.');
+    } finally {
+      setAccountRenameSaving(false);
+    }
+  }, [accountNameDraft, applyAccountConnection, connection?.activeProfileId, connection?.label, reportBackendConnectivityError]);
+
+  useEffect(() => {
+    setEditingAccountName(false);
+    setAccountRenameError(null);
+  }, [connection?.activeProfileId]);
+
+  useEffect(() => {
+    if (settingsOpen) return;
+    setEditingAccountName(false);
+    setAccountRenameError(null);
+  }, [settingsOpen]);
+
+  const openAccountManager = useCallback(() => {
+    setSettingsOpen(false);
+    setEditingAccountName(false);
+    setAccountRenameError(null);
+    setAccountManagerError(null);
+    setDeleteConfirmationId(null);
+    setPendingAccountSwitch(null);
+    setAccountManagerOpen(true);
+  }, []);
+
+  const closeAccountManager = useCallback(() => {
+    if (accountAction || accountRenameSaving) return;
+    setAccountManagerOpen(false);
+    setEditingAccountName(false);
+    setAccountRenameError(null);
+    setDeleteConfirmationId(null);
+    setPendingAccountSwitch(null);
+    setAccountManagerError(null);
+  }, [accountAction, accountRenameSaving]);
+
+  const switchAccount = useCallback(async (profileId: string, confirmPauseRunningStrategies: boolean) => {
+    setAccountAction({ profileId, kind: 'switch' });
+    setAccountManagerError(null);
+    try {
+      applyAccountConnection(await api.switchAccount(profileId, confirmPauseRunningStrategies));
+      await refreshStrategies();
+      setPendingAccountSwitch(null);
+    } catch (error) {
+      reportBackendConnectivityError(error);
+      if (error instanceof ApiError && error.code === 'running_strategies_require_confirmation') {
+        const affected = strategies.filter((strategy) => strategy.status === 'RUNNING'
+          && (strategy.accountProfileId === connection?.activeProfileId || strategy.accountProfileId === null));
+        setPendingAccountSwitch({ profileId, strategies: affected });
+      } else {
+        setAccountManagerError('Unable to switch accounts. Try again.');
+      }
+    } finally {
+      setAccountAction(null);
+    }
+  }, [applyAccountConnection, connection?.activeProfileId, refreshStrategies, reportBackendConnectivityError, strategies]);
+
+  const requestAccountSwitch = useCallback((profileId: string) => {
+    const affected = strategies.filter((strategy) => strategy.status === 'RUNNING'
+      && (strategy.accountProfileId === connection?.activeProfileId || strategy.accountProfileId === null));
+    if (affected.length > 0) {
+      setPendingAccountSwitch({ profileId, strategies: affected });
+      setAccountManagerError(null);
+      return;
+    }
+    void switchAccount(profileId, false);
+  }, [connection?.activeProfileId, strategies, switchAccount]);
+
+  const deleteAccount = useCallback(async (profileId: string) => {
+    setAccountAction({ profileId, kind: 'delete' });
+    setAccountManagerError(null);
+    try {
+      applyAccountConnection(await api.deleteAccount(profileId));
+      setDeleteConfirmationId(null);
+    } catch (error) {
+      reportBackendConnectivityError(error);
+      setAccountManagerError('Unable to delete this account. Try again.');
+    } finally {
+      setAccountAction(null);
+    }
+  }, [applyAccountConnection, reportBackendConnectivityError]);
+
   useEffect(() => {
     if (tradingMode !== 'unset' && !modeDialogOpen) return;
     setStrategyMenuAt(null);
     setMoreMenuAt(null);
     setNotificationsOpen(false);
     setSettingsOpen(false);
+    setAccountManagerOpen(false);
+    setPendingAccountSwitch(null);
   }, [modeDialogOpen, tradingMode]);
 
   return <LanguageContext.Provider value={{ language, theme, t, setLanguage }}><div className={`app-shell${workspace === 'Trade' ? ' trading-page' : ''}`}>
@@ -869,7 +1200,7 @@ function App() {
       </button>
       <nav aria-label={t('Main navigation')}>{navItems.map((item) => item.label === 'Strategy'
         ? <div className="nav-strategy" key={item.label} ref={strategyNavRef}>
-          <button ref={strategyTriggerRef} className={`${workspace === 'Strategy' && strategyKind !== 'boros' ? 'active' : ''}${strategyMenuAt ? ' menu-open' : ''}`}
+          <button ref={strategyTriggerRef} className={`topbar-navigation-button ${workspace === 'Strategy' && strategyKind !== 'boros' ? 'active' : ''}${strategyMenuAt ? ' menu-open' : ''}`}
             aria-haspopup="menu" aria-expanded={strategyMenuAt !== null}
             onClick={(event) => { if (strategyMenuAt) setStrategyMenuAt(null); else openStrategyMenu(event.currentTarget); }}
             onKeyDown={(event) => {
@@ -878,7 +1209,7 @@ function App() {
                 openStrategyMenu(event.currentTarget);
               }
             }}>
-            <span>{item.glyph}</span>{t(item.label)}<svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
+            <TopbarNavigationContent label={item.label} glyph={item.glyph} /><svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
           </button>
           {strategyMenuAt && <ul className="nav-strategy-menu" role="menu" aria-label={t('Strategy mode')}
             style={strategyMenuAt} onKeyDown={onStrategyMenuKeyDown}>
@@ -891,7 +1222,7 @@ function App() {
             </li>)}
           </ul>}
         </div>
-        : <button key={item.label} className={item.label === 'Boros by Pendle' ? workspace === 'Strategy' && strategyKind === 'boros' ? 'active' : '' : workspace === item.label ? 'active' : ''} onClick={() => {
+        : <button key={item.label} className={`topbar-navigation-button ${item.label === 'Boros by Pendle' ? workspace === 'Strategy' && strategyKind === 'boros' ? 'active' : '' : workspace === item.label ? 'active' : ''}`} onClick={() => {
           navigate(item.label === 'Trade'
             ? { workspace: 'Trade' }
             : item.label === 'Boros by Pendle'
@@ -899,11 +1230,9 @@ function App() {
             : item.label === 'Funding Rates'
               ? { workspace: 'Funding Rates', asset: null }
               : { workspace: 'Portfolio' });
-        }}>{item.label === 'Boros by Pendle'
-            ? <span className="nav-boros-mark" aria-hidden="true"><img src={borosMark} alt="" /></span>
-            : <span>{item.glyph}</span>}{t(item.label)}</button>)}
+        }}><TopbarNavigationContent label={item.label} glyph={item.glyph} iconSrc={item.label === 'Boros by Pendle' ? borosMark : undefined} /></button>)}
         <div className="nav-strategy nav-more" ref={moreNavRef}>
-          <button ref={moreTriggerRef} className={`${workspace === 'Trading Fees' ? 'active' : ''}${moreMenuAt ? ' menu-open' : ''}`}
+          <button ref={moreTriggerRef} className={`topbar-navigation-button ${workspace === 'Trading Fees' ? 'active' : ''}${moreMenuAt ? ' menu-open' : ''}`}
             aria-label={t('More')} aria-haspopup="menu" aria-expanded={moreMenuAt !== null}
             onClick={(event) => { if (moreMenuAt) setMoreMenuAt(null); else openMoreMenu(event.currentTarget); }}
             onKeyDown={(event) => {
@@ -913,7 +1242,7 @@ function App() {
                 requestAnimationFrame(() => moreNavRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus());
               }
             }}>
-            <span aria-hidden="true">⋯</span>{t('More')}<svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
+            <TopbarNavigationContent label="More" glyph="⋯" /><svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
           </button>
           {moreMenuAt && <ul className="nav-strategy-menu nav-more-menu" role="menu" aria-label={t('More tools')} style={moreMenuAt}>
             <li role="none"><button role="menuitem" className={workspace === 'Trading Fees' ? 'selected' : ''} onClick={() => {
@@ -925,11 +1254,11 @@ function App() {
         </div>
       </nav>
       <div className="top-actions">
-        {tradingMode !== null && tradingMode !== 'unset' && <button className={`mode-badge ${tradingMode}`} onClick={openModeDialog} title={t('Switch trading mode')} aria-label={t('Switch trading mode')}>
+        {tradingMode !== null && tradingMode !== 'unset' && <button className={`topbar-navigation-button mode-badge ${tradingMode}`} onClick={openModeDialog} title={t('Switch trading mode')} aria-label={t('Switch trading mode')}>
           <i />{t(tradingMode === 'live' ? 'Live trading' : 'Read-only')}
         </button>}
-        <button className={`portfolio-shortcut${workspace === 'Portfolio' ? ' active' : ''}`} onClick={() => navigate({ workspace: 'Portfolio' })}>
-          <span aria-hidden="true">◒</span>{t('Portfolio')}
+        <button className={`topbar-navigation-button portfolio-shortcut${workspace === 'Portfolio' ? ' active' : ''}`} onClick={() => navigate({ workspace: 'Portfolio' })}>
+          <TopbarNavigationContent label="Portfolio" glyph="◒" />
         </button>
         <div className="profile-wrap" ref={notificationsRef}>
           <button className="utility" aria-label={t('Notifications')} aria-haspopup="dialog" aria-expanded={notificationsOpen} onClick={openNotifications}>
@@ -953,7 +1282,17 @@ function App() {
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.38.33.72.6 1 .3.29.68.43 1.1.4h.09v4h-.09a1.7 1.7 0 0 0-1.7.6Z" /></svg>
           </button>
           {settingsOpen && <section className="settings-panel" role="dialog" aria-label={t('Preferences')}>
-            <header><strong>{t('Preferences')}</strong><small>{t('Account settings')}</small></header>
+            <p className="settings-section">{t('Account settings')}</p>
+            <div className="settings-account">
+              <small>{t('Current account')}</small>
+              <strong>{connection?.label ?? (connection?.configured ? t('Live account') : t('Credentials not configured'))}</strong>
+              <small>{connection?.configured
+                ? `${storageLabel} · ${connection.lastVerifiedAt ? `${t('Verified')} ${new Date(connection.lastVerifiedAt).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}` : t('Never verified')}`
+                : t('Credentials not configured')}</small>
+              {connection?.readOnly && <small className="readonly-flag">{t('Read-only until enabled')}</small>}
+              {connection && connection.profiles.length > 1 && <small>{connection.profiles.length} {t('saved accounts')}</small>}
+            </div>
+            <button className="settings-link" onClick={openAccountManager}>{t('Manage and switch accounts')}<span>›</span></button>
             <p className="settings-section">{t('Trading')}</p>
             <div className="settings-row">
               <div><strong>{t('Order confirmation')}</strong><small>{t(confirmOrders ? 'Show a confirmation popup before submitting an order' : 'Orders submit immediately without confirmation')}</small></div>
@@ -977,16 +1316,6 @@ function App() {
                 <button className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')} aria-pressed={theme === 'light'}>{t('Light mode')}</button>
               </div>
             </div>
-            <p className="settings-section">{t('Account settings')}</p>
-            <div className="settings-account">
-              <strong>{connection?.label ?? (connection?.configured ? t('Live account') : t('Credentials not configured'))}</strong>
-              <small>{connection?.configured
-                ? `${storageLabel} · ${connection.lastVerifiedAt ? `${t('Verified')} ${new Date(connection.lastVerifiedAt).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}` : t('Never verified')}`
-                : t('Credentials not configured')}</small>
-              {connection?.readOnly && <small className="readonly-flag">{t('Read-only until enabled')}</small>}
-              {connection && connection.profiles.length > 1 && <small>{connection.profiles.length} {t('saved accounts')}</small>}
-            </div>
-            <button className="settings-link" onClick={() => openCredentialWindow(`/secure/credentials?lang=${language}`)}>{t(connection?.profiles.length ? 'Manage and switch accounts' : 'Sign in with Gate API credentials')}<span>›</span></button>
             <button className="settings-link" onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API<span>›</span></button>
             <p className="settings-section">{t('Open source')}</p>
             <div className="settings-account">
@@ -1009,6 +1338,31 @@ function App() {
       </Suspense>
     </main>
     <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><span>UTC {clock}</span><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span></div></footer>
+    <AccountManagerDialog
+      open={accountManagerOpen}
+      connection={connection}
+      language={language}
+      action={accountAction}
+      pendingSwitch={pendingAccountSwitch}
+      deleteConfirmationId={deleteConfirmationId}
+      error={accountManagerError}
+      editingAccountName={editingAccountName}
+      accountNameDraft={accountNameDraft}
+      accountRenameSaving={accountRenameSaving}
+      accountRenameError={accountRenameError}
+      onClose={closeAccountManager}
+      onSwitch={requestAccountSwitch}
+      onCancelSwitch={() => { if (!accountAction) { setPendingAccountSwitch(null); setAccountManagerError(null); } }}
+      onConfirmSwitch={(profileId) => { void switchAccount(profileId, true); }}
+      onRequestDelete={(profileId) => { setDeleteConfirmationId(profileId); setAccountManagerError(null); }}
+      onCancelDelete={() => setDeleteConfirmationId(null)}
+      onDelete={(profileId) => { void deleteAccount(profileId); }}
+      onBeginRename={beginAccountNameEdit}
+      onAccountNameChange={setAccountNameDraft}
+      onCancelRename={cancelAccountNameEdit}
+      onRename={() => { void renameCurrentAccount(); }}
+      onAdd={() => openCredentialWindow(`/secure/credentials?action=add&lang=${language}`)}
+    />
     {tradingMode !== null && (tradingMode === 'unset' || modeDialogOpen) && <TradingModeGate
       mode={tradingMode}
       credentialEntryPath={connection?.secureEntryPath ?? '/secure/credentials'}

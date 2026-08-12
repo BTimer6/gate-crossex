@@ -343,7 +343,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       const startedAt = strategyStartTime(strategy.createdAt, language);
       return <div className="running-row" key={strategy.id}>
         {showingHistory && <span className="strategy-start-time"><strong>{startedAt.date}</strong><small>{startedAt.time}</small></span>}
-        <span><strong>{strategy.id}</strong><small>{kindLabel(strategy)}</small></span>
+        <span><strong>{strategy.id}</strong><small>{kindLabel(strategy)}{strategy.accountLabel ? ` · ${strategy.accountLabel}` : ''}</small></span>
         <span><strong>{strategyMarketLabel(config)}</strong><small>{t(premium ? 'ADR premium' : 'Perpetual')}</small></span>
         <span>{timedClose ? [...new Set(config.closePlan?.targets.map((target) => symbolParts(target.symbol).venue) ?? [])].join(' ⇄ ') : config.leftVenue === config.rightVenue ? leftVenue?.name ?? config.leftVenue : `${leftVenue?.name ?? config.leftVenue} ⇄ ${rightVenue?.name ?? config.rightVenue}`}</span>
         <span>{timedClose

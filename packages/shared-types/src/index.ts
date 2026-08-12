@@ -938,6 +938,8 @@ export const StrategyRecordSchema = z.object({
   id: z.string(),
   kind: z.enum(['position', 'auto', 'premium']),
   status: z.string(),
+  accountProfileId: z.string().nullable(),
+  accountLabel: z.string().nullable(),
   config: StrategyConfigSchema,
   progress: z.number(),
   filledQuantity: z.string(),
