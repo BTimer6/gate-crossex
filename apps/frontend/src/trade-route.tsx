@@ -65,6 +65,9 @@ import { canonicalPositionAsset, positionGroupKey, positionGroupLabel } from './
 import { PositionCloseDialog } from './position-close-dialog.js';
 import { numericFutureFeeRate } from './fee-rates.js';
 import { useLanguage } from './i18n.js';
+import { formatExecutionDateTime } from './execution-date-time.js';
+import { executionPageWindow } from './execution-pagination.js';
+import { ExecutionPagination } from './execution-pagination-control.js';
 
 const CandleChart = lazy(() => import('./charts.js').then((module) => ({ default: module.CandleChart })));
 
@@ -933,6 +936,7 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   const { t } = useLanguage();
   const [cancellingIds, setCancellingIds] = useState<string[]>([]);
   const [closeTargets, setCloseTargets] = useState<Position[] | null>(null);
+  const [tablePages, setTablePages] = useState({ positions: 1, openOrders: 1, orderHistory: 1, tradeHistory: 1 });
   const positions = snapshot?.positions.filter((position) => Number(position.quantity) !== 0) ?? [];
   const orders = snapshot?.orders ?? [];
   const openOrders = orders.filter((order) => OPEN_ORDER_STATES.includes(order.state));
@@ -942,6 +946,7 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
     (result[positionGroupKey(part.asset, part.venue)] ??= []).push(position);
     return result;
   }, {}));
+  const positionsPage = executionPageWindow(groups.length, tablePages.positions);
   const tabs = [`Positions (${positions.length})`, `Open orders (${openOrders.length})`, 'Order history', 'Trade history'];
   const active = bottomTab.startsWith('Positions') ? tabs[0] : bottomTab.startsWith('Open orders') ? tabs[1] : bottomTab;
   const notionalFor = (position: Position) => Math.abs(Number(position.quantity) * Number(position.mark_price));
@@ -959,6 +964,20 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [active, positions.length, onPositionsRefresh]);
+  useEffect(() => {
+    setTablePages((current) => {
+      const next = {
+        positions: executionPageWindow(groups.length, current.positions).page,
+        openOrders: executionPageWindow(openOrders.length, current.openOrders).page,
+        orderHistory: executionPageWindow(orders.length, current.orderHistory).page,
+        tradeHistory: executionPageWindow(fills.length, current.tradeHistory).page,
+      };
+      return next.positions === current.positions
+        && next.openOrders === current.openOrders
+        && next.orderHistory === current.orderHistory
+        && next.tradeHistory === current.tradeHistory ? current : next;
+    });
+  }, [groups.length, openOrders.length, orders.length, fills.length]);
   const requestClose = (targets: Position[]) => {
     if (tradingMode !== 'live') {
       onOpenModeDialog();
@@ -983,7 +1002,7 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   };
   return <section className="positions-panel terminal-panel">
     <div className="positions-head"><div className="panel-tabs">{tabs.map((tab) => { const match = tab.match(/^(.+?)( \(\d+\))?$/); return <button className={active === tab ? 'active' : ''} onClick={() => setBottomTab(tab)} key={tab}>{t(match?.[1] ?? tab)}{match?.[2] ?? ''}</button>; })}</div></div>
-    {active.startsWith('Positions') && (groups.length ? <div className="positions-table table-wrap"><table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th><th>{t('Close position')}</th></tr></thead><tbody>{groups.map((legs) => {
+    {active.startsWith('Positions') && (groups.length ? <><div className="positions-table table-wrap"><table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th><th>{t('Close position')}</th></tr></thead><tbody>{groups.slice(positionsPage.start, positionsPage.end).map((legs) => {
       const firstPart = symbolParts(legs[0].symbol);
       const assets = [...new Set(legs.map((leg) => {
         const part = symbolParts(leg.symbol);
@@ -1010,10 +1029,10 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
       }
       const aggregateFundingFee = aggregatePositionFundingFee(legs, portfolioPositions);
       return <Fragment key={key}><tr className="aggregate-row"><td><button className={expandedPosition === key ? 'expand-position expanded' : 'expand-position'} onClick={() => setExpandedPosition(expandedPosition === key ? null : key)}>›</button><strong>{groupLabel} PERP</strong><small className={fullyHedged ? 'hedged-tag' : quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(fullyHedged ? 'Hedged' : quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{venueCount} {t(venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{mixedAssets ? '—' : `${quantity.toFixed(4)} ${asset}`}</td><td>${formatAmount(grossNotional)}</td><td>{mixedAssets ? '—' : compactPrice(weightedEntryPrice)}</td><td>{mixedAssets ? '—' : compactPrice(weightedMarkPrice)}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT</td><td>{legs.reduce((sum, leg) => sum + Number(leg.realized_pnl), 0).toFixed(2)} USDT</td>{fundingFeeCell(aggregateFundingFee, 'USDT')}<td><button className="row-action close-position-action" onClick={() => requestClose(legs)}>{t('Close all')}</button></td></tr>{expandedPosition === key && legs.map((leg) => { const part = symbolParts(leg.symbol); const legPnl = (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity); return <tr className="position-leg" key={leg.symbol}><td><span className="leg-branch">↳</span><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{Number(leg.quantity).toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td className={legPnl >= 0 ? 'positive' : 'negative'}>{legPnl >= 0 ? '+' : ''}{legPnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>; })}</Fragment>;
-    })}</tbody></table></div> : <EmptyTable label="positions" />)}
-    {active.startsWith('Open orders') && (openOrders.length ? <OrderTable orders={openOrders} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
-    {active === 'Order history' && (orders.length ? <OrderTable orders={orders} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
-    {active === 'Trade history' && (fills.length ? <FillTable fills={fills} /> : <EmptyTable label="trade history" />)}
+    })}</tbody></table></div><ExecutionPagination itemCount={groups.length} page={positionsPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, positions: page }))} /></> : <EmptyTable label="positions" />)}
+    {active.startsWith('Open orders') && (openOrders.length ? <OrderTable orders={openOrders} page={tablePages.openOrders} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
+    {active === 'Order history' && (orders.length ? <OrderTable orders={orders} page={tablePages.orderHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, orderHistory: page }))} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
+    {active === 'Trade history' && (fills.length ? <FillTable fills={fills} page={tablePages.tradeHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /> : <EmptyTable label="trade history" />)}
     {closeTargets && <PositionCloseDialog
       targets={closeTargets.map((position) => ({
         id: `${position.symbol}:${position.position_id}`,
@@ -1031,14 +1050,16 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   </section>;
 }
 
-function OrderTable({ orders, cancellable = false, onCancel, busyOrderIds }: { orders: ExecutionOrder[]; cancellable?: boolean; onCancel: (order: ExecutionOrder) => Promise<void>; busyOrderIds: string[] }) {
+function OrderTable({ orders, page, onPageChange, cancellable = false, onCancel, busyOrderIds }: { orders: ExecutionOrder[]; page: number; onPageChange: (page: number) => void; cancellable?: boolean; onCancel: (order: ExecutionOrder) => Promise<void>; busyOrderIds: string[] }) {
   const { language, t } = useLanguage();
-  return <div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th>{cancellable && <th />}</tr></thead><tbody>{orders.map((order) => { const part = symbolParts(order.symbol); const busy = busyOrderIds.includes(order.id); return <tr key={order.id}><td>{new Date(order.createdAt).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong>{order.strategyId && <small className="long-tag">{order.strategyId}</small>}</td><td><VenueFromCode code={part.venue} /></td><td><small className={order.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(order.side === 'BUY' ? 'Buy' : 'Sell')} · {t(order.type === 'LIMIT' ? 'Limit' : 'Market')}</small></td><td>{order.executedAveragePrice ?? order.price ?? t('Market')}</td><td>{order.quantity} {part.asset}</td><td>{order.executedQuantity}</td><td><span className={`status-tag ${order.state.toLowerCase()}`}>{order.state}</span></td><td>{order.remoteOrderId ?? order.clientOrderId}</td>{cancellable && <td><button className="row-action" onClick={() => void onCancel(order)} disabled={busy}>{busy ? t('Cancelling…') : t('Cancel')}</button></td>}</tr>; })}</tbody></table></div>;
+  const window = executionPageWindow(orders.length, page);
+  return <><div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th>{cancellable && <th />}</tr></thead><tbody>{orders.slice(window.start, window.end).map((order) => { const part = symbolParts(order.symbol); const busy = busyOrderIds.includes(order.id); return <tr key={order.id}><td>{formatExecutionDateTime(order.createdAt, language)}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong>{order.strategyId && <small className="long-tag">{order.strategyId}</small>}</td><td><VenueFromCode code={part.venue} /></td><td><small className={order.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(order.side === 'BUY' ? 'Buy' : 'Sell')} · {t(order.type === 'LIMIT' ? 'Limit' : 'Market')}</small></td><td>{order.executedAveragePrice ?? order.price ?? t('Market')}</td><td>{order.quantity} {part.asset}</td><td>{order.executedQuantity}</td><td><span className={`status-tag ${order.state.toLowerCase()}`}>{order.state}</span></td><td>{order.remoteOrderId ?? order.clientOrderId}</td>{cancellable && <td><button className="row-action" onClick={() => void onCancel(order)} disabled={busy}>{busy ? t('Cancelling…') : t('Cancel')}</button></td>}</tr>; })}</tbody></table></div><ExecutionPagination itemCount={orders.length} page={window.page} onPageChange={onPageChange} /></>;
 }
 
-function FillTable({ fills }: { fills: ExecutionFill[] }) {
+function FillTable({ fills, page, onPageChange }: { fills: ExecutionFill[]; page: number; onPageChange: (page: number) => void }) {
   const { language, t } = useLanguage();
-  return <div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Execution price')}</th><th>{t('Size')}</th><th>{t('Fee')}</th><th>{t('Realized PnL')}</th><th>{t('Trade ID')}</th></tr></thead><tbody>{fills.map((fill) => { const part = symbolParts(fill.symbol); return <tr key={fill.id}><td>{new Date(fill.created_at).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong></td><td><VenueFromCode code={part.venue} /></td><td><small className={fill.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(fill.side === 'BUY' ? 'Buy' : 'Sell')}</small></td><td>{fill.price}</td><td>{fill.quantity} {part.asset}</td><td>{Number(fill.fee).toFixed(4)}</td><td>{Number(fill.realized_pnl).toFixed(2)}</td><td>{fill.id.slice(0, 12)}</td></tr>; })}</tbody></table></div>;
+  const window = executionPageWindow(fills.length, page);
+  return <><div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Execution price')}</th><th>{t('Size')}</th><th>{t('Fee')}</th><th>{t('Realized PnL')}</th><th>{t('Trade ID')}</th></tr></thead><tbody>{fills.slice(window.start, window.end).map((fill) => { const part = symbolParts(fill.symbol); return <tr key={fill.id}><td>{formatExecutionDateTime(fill.created_at, language)}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong></td><td><VenueFromCode code={part.venue} /></td><td><small className={fill.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(fill.side === 'BUY' ? 'Buy' : 'Sell')}</small></td><td>{fill.price}</td><td>{fill.quantity} {part.asset}</td><td>{Number(fill.fee).toFixed(4)}</td><td>{Number(fill.realized_pnl).toFixed(2)}</td><td>{fill.id.slice(0, 12)}</td></tr>; })}</tbody></table></div><ExecutionPagination itemCount={fills.length} page={window.page} onPageChange={onPageChange} /></>;
 }
 
 /** Formats the max-size column: explicit totals for position/auto, levels × per-order for grids. */

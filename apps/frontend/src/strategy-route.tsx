@@ -64,6 +64,8 @@ import { PositionCloseDialog, type ClosePositionTarget } from './position-close-
 import { groupStrategyPositions, prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
 import { useLanguage, type Language } from './i18n.js';
 import { numericFutureFeeRate } from './fee-rates.js';
+import { executionPageWindow } from './execution-pagination.js';
+import { ExecutionPagination } from './execution-pagination-control.js';
 
 const PremiumHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PremiumHistoryChart })));
 const PriceDifferenceHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PriceDifferenceHistoryChart })));
@@ -173,6 +175,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const [takeProfitDraft, setTakeProfitDraft] = useState('');
   const [updatingTakeProfitId, setUpdatingTakeProfitId] = useState<string | null>(null);
   const [historyPage, setHistoryPage] = useState(1);
+  const [positionPage, setPositionPage] = useState(1);
   const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
   const [closeNotice, setCloseNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
@@ -192,6 +195,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     [authenticatedPortfolio, tradingSnapshot],
   );
   const positionGroups = useMemo(() => groupStrategyPositions(positionsView.rows), [positionsView.rows]);
+  const positionsPage = executionPageWindow(positionGroups.length, positionPage);
   const selectedLogStrategy = strategies.find((strategy) => strategy.id === selectedLogStrategyId) ?? null;
   const logDialogRef = useDialogFocus(Boolean(selectedLogStrategy), () => setSelectedLogStrategyId(null));
 
@@ -206,6 +210,10 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   useEffect(() => {
     setHistoryPage((current) => Math.min(current, historyPages));
   }, [historyPages]);
+
+  useEffect(() => {
+    setPositionPage((current) => executionPageWindow(positionGroups.length, current).page);
+  }, [positionGroups.length]);
 
   useEffect(() => {
     if (!closeNotice) return;
@@ -301,9 +309,9 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <button role="tab" aria-selected={showingHistory} className={showingHistory ? 'active' : ''} onClick={() => { setActiveStrategyTab('historical'); setHistoryPage(1); setEditingTakeProfitId(null); }}>{t('Historical')} <span>({historicalStrategies.length})</span></button>
       </div>
       {showingPositions ? <>
-        {positionsView.status === 'fresh' && positionGroups.length > 0 && <div className="strategy-positions-table positions-table table-wrap">
+        {positionsView.status === 'fresh' && positionGroups.length > 0 && <><div className="strategy-positions-table positions-table table-wrap">
           <table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('Unrealized PnL')}</th><th>{t('Close position')}</th></tr></thead><tbody>
-            {positionGroups.map((group) => {
+            {positionGroups.slice(positionsPage.start, positionsPage.end).map((group) => {
               if (group.legs.length === 1) {
                 const position = group.legs[0];
                 const venue = exchanges.find((item) => item.id === position.venue.toLowerCase());
@@ -319,7 +327,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
               </Fragment>;
             })}
           </tbody></table>
-        </div>}
+        </div><ExecutionPagination itemCount={positionGroups.length} page={positionsPage.page} onPageChange={setPositionPage} /></>}
         {positionsView.status === 'fresh' && positionsView.rows.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t('No open positions')}</strong><small>{t('The live account has no open futures positions.')}</small></div>}
         {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
         {positionsView.status === 'unavailable' && <div className="no-strategies"><span>◎</span><strong>{t('Position data unavailable')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}

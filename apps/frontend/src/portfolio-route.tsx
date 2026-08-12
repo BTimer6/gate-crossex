@@ -27,6 +27,8 @@ import {
 import { useLanguage } from './i18n.js';
 import { maximumTransferAmount } from './transfer-amount.js';
 import { transferAccountsFor, transferFeeForRoute } from './transfer-rules.js';
+import { executionPageWindow } from './execution-pagination.js';
+import { ExecutionPagination } from './execution-pagination-control.js';
 
 function VenueFromCode({ code }: { code: string }) {
   const exchange = exchanges.find((item) => item.id === code.toLowerCase());
@@ -94,12 +96,14 @@ const TRANSFER_ROUTE_MESSAGES: Record<CrossExTransferRouteError, string> = {
 export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStream, tradingMode, onOpenModeDialog, onRefresh }: PortfolioViewProps) {
   const { language, t } = useLanguage();
   const [tab, setTab] = useState<PortfolioTab>('positions');
+  const [tablePages, setTablePages] = useState({ positions: 1, openOrders: 1, tradeHistory: 1, margin: 1 });
   const [refreshing, setRefreshing] = useState(false);
   const [activityTab, setActivityTab] = useState<ActivityTab>('transfers');
   const [activity, setActivity] = useState<CrossExPortfolioActivityResponse | null>(null);
   const [activityLoading, setActivityLoading] = useState(true);
   const [activityError, setActivityError] = useState<string | null>(null);
   const [activityQuery, setActivityQuery] = useState('');
+  const [activityPages, setActivityPages] = useState<Record<ActivityTab, number>>({ transfers: 1, 'funding-fees': 1, 'account-book': 1 });
   const [transferCoins, setTransferCoins] = useState<CrossExTransferCoin[]>([]);
   const [transferBalances, setTransferBalances] = useState<CrossExTransferBalance[]>([]);
   const [transferCoinError, setTransferCoinError] = useState(false);
@@ -273,6 +277,21 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100);
   }, [snapshot, tradingSnapshot]);
 
+  useEffect(() => {
+    setTablePages((current) => {
+      const next = {
+        positions: executionPageWindow(positionRows.length, current.positions).page,
+        openOrders: executionPageWindow(orderRows.length, current.openOrders).page,
+        tradeHistory: executionPageWindow(fillRows.length, current.tradeHistory).page,
+        margin: executionPageWindow(marginRows.length, current.margin).page,
+      };
+      return next.positions === current.positions
+        && next.openOrders === current.openOrders
+        && next.tradeHistory === current.tradeHistory
+        && next.margin === current.margin ? current : next;
+    });
+  }, [positionRows.length, orderRows.length, fillRows.length, marginRows.length]);
+
   // Snapshot balances first for coverage, live stream rows on top: the asset channel pushes
   // between slower REST reconciliation checks.
   const balanceRows = useMemo(() => {
@@ -409,6 +428,21 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
       .some((value) => value.toLowerCase().includes(normalizedActivityQuery));
   }), [activity, normalizedActivityQuery]);
   const visibleAccountEntries = activityTab === 'funding-fees' ? visibleFundingFees : visibleAccountBook;
+  const activityItemCount = activityTab === 'transfers' ? visibleTransfers.length : visibleAccountEntries.length;
+  const activityPage = executionPageWindow(activityItemCount, activityPages[activityTab]);
+
+  useEffect(() => {
+    setActivityPages((current) => {
+      const next = {
+        transfers: executionPageWindow(visibleTransfers.length, current.transfers).page,
+        'funding-fees': executionPageWindow(visibleFundingFees.length, current['funding-fees']).page,
+        'account-book': executionPageWindow(visibleAccountBook.length, current['account-book']).page,
+      };
+      return next.transfers === current.transfers
+        && next['funding-fees'] === current['funding-fees']
+        && next['account-book'] === current['account-book'] ? current : next;
+    });
+  }, [visibleTransfers.length, visibleFundingFees.length, visibleAccountBook.length]);
 
   const futuresUnrealized = positionRows.reduce((sum, row) => sum + row.upnl, 0);
   const unrealized = futuresUnrealized + marginRows.reduce((sum, row) => sum + row.upnl, 0);
@@ -598,6 +632,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     ...(marginRows.length > 0 ? [{ id: 'margin' as const, label: 'Margin positions', count: marginRows.length }] : []),
   ];
   const activeTab: PortfolioTab = tab === 'margin' && marginRows.length === 0 ? 'positions' : tab;
+  const positionsPage = executionPageWindow(positionRows.length, tablePages.positions);
+  const openOrdersPage = executionPageWindow(orderRows.length, tablePages.openOrders);
+  const tradeHistoryPage = executionPageWindow(fillRows.length, tablePages.tradeHistory);
+  const marginPage = executionPageWindow(marginRows.length, tablePages.margin);
 
   return <div className="alternate-view portfolio-view">
     <section className="view-heading">
@@ -737,14 +775,17 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
             <button className={activityTab === 'funding-fees' ? 'active' : ''} onClick={() => setActivityTab('funding-fees')}>{t('Funding fees')} ({activity?.fundingFees.length ?? 0})</button>
             <button className={activityTab === 'account-book' ? 'active' : ''} onClick={() => setActivityTab('account-book')}>{t('Account ledger')} ({activity?.accountBook.length ?? 0})</button>
           </div>
-          <input value={activityQuery} onChange={(event) => setActivityQuery(event.target.value)} placeholder={t('Filter activity')} aria-label={t('Filter activity')} />
+          <input value={activityQuery} onChange={(event) => {
+            setActivityQuery(event.target.value);
+            setActivityPages({ transfers: 1, 'funding-fees': 1, 'account-book': 1 });
+          }} placeholder={t('Filter activity')} aria-label={t('Filter activity')} />
         </div>
         <div className="activity-table-wrap">
           {activityLoading ? <div className="activity-message"><span>◌</span><strong>{t('Loading funding activity…')}</strong></div>
             : activityError ? <div className="activity-message error"><span>!</span><strong>{t(activityError)}</strong><button onClick={() => void loadActivity()}>{t('Try again')}</button></div>
               : activityTab === 'transfers' ? (visibleTransfers.length ? <table className="activity-table">
                 <thead><tr><th>{t('Time')}</th><th>{t('Asset')}</th><th>{t('Route')}</th><th>{t('Requested')}</th><th>{t('Received')}</th><th>{t('Status')}</th><th>{t('Reference')}</th></tr></thead>
-                <tbody>{visibleTransfers.map((record) => <tr key={record.id}>
+                <tbody>{visibleTransfers.slice(activityPage.start, activityPage.end).map((record) => <tr key={record.id}>
                   <td>{formatWhen(record.createdAt)}</td>
                   <td><strong>{record.coin}</strong></td>
                   <td><span className="activity-route">{transferAccountLabel(record.from)}<b>→</b>{transferAccountLabel(record.to)}</span></td>
@@ -756,7 +797,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
               </table> : <div className="activity-message"><span>◎</span><strong>{t('No transfer history')}</strong><small>{t('Submitted transfers will appear here.')}</small></div>)
                 : (visibleAccountEntries.length ? <table className="activity-table account-book-table">
                   <thead><tr><th>{t('Time')}</th><th>{t('Type')}</th><th>{t('Asset')}</th><th>{t('Exchange')}</th><th>{t('Change')}</th><th>{t('Balance')}</th><th>{t('Reference')}</th></tr></thead>
-                  <tbody>{visibleAccountEntries.map((record) => {
+                  <tbody>{visibleAccountEntries.slice(activityPage.start, activityPage.end).map((record) => {
                     const change = parseNumber(record.change) ?? 0;
                     return <tr key={record.id}>
                       <td>{formatWhen(record.createdAt)}</td>
@@ -770,6 +811,11 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
                   })}</tbody>
                 </table> : <div className="activity-message"><span>◎</span><strong>{t(activityTab === 'funding-fees' ? 'No funding fee history' : 'No account activity')}</strong><small>{t(activityTab === 'funding-fees' ? 'Funding fee entries will appear here.' : 'Balance changes, fees, and funding entries will appear here.')}</small></div>)}
         </div>
+        {!activityLoading && !activityError && activityItemCount > 0 && <ExecutionPagination
+          itemCount={activityItemCount}
+          page={activityPage.page}
+          onPageChange={(page) => setActivityPages((current) => ({ ...current, [activityTab]: page }))}
+        />}
         <footer className="activity-footer">
           <span>{activity ? `${t('Last updated')} ${formatWhen(activity.fetchedAt)}` : t('Authenticated CrossEx REST')}</span>
           <span>{t('Up to 100 recent entries')}</span>
@@ -783,9 +829,9 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <span className="spacer" />
         <span className="table-source">{tableSource}</span>
       </div>
-      {activeTab === 'positions' && (positionRows.length ? <div className="positions-table table-wrap"><table>
+      {activeTab === 'positions' && (positionRows.length ? <><div className="positions-table table-wrap"><table>
         <thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Value')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th></tr></thead>
-        <tbody>{positionRows.map((row) => <tr key={row.id}>
+        <tbody>{positionRows.slice(positionsPage.start, positionsPage.end).map((row) => <tr key={row.id}>
           <td><strong>{marketSymbol(row.asset, row.quote, 'perpetual')}</strong><small className={row.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(row.side)}</small></td>
           <td><VenueFromCode code={row.venue} /></td>
           <td>{formatAmount(Math.abs(row.quantity), 4)} {row.asset}</td>
@@ -797,10 +843,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td>{row.realized !== null ? signedAmount(row.realized) : '—'}</td>
           <td className={row.fundingFee !== null && row.fundingFee > 0 ? 'positive' : row.fundingFee !== null && row.fundingFee < 0 ? 'negative' : ''}>{row.fundingFee !== null ? signedAmount(row.fundingFee) : '—'}</td>
         </tr>)}</tbody>
-      </table></div> : <EmptyTable label="positions" />)}
-      {activeTab === 'orders' && (orderRows.length ? <div className="positions-table table-wrap"><table>
+      </table></div><ExecutionPagination itemCount={positionRows.length} page={positionsPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, positions: page }))} /></> : <EmptyTable label="positions" />)}
+      {activeTab === 'orders' && (orderRows.length ? <><div className="positions-table table-wrap"><table>
         <thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th></tr></thead>
-        <tbody>{orderRows.map((row) => <tr key={row.id}>
+        <tbody>{orderRows.slice(openOrdersPage.start, openOrdersPage.end).map((row) => <tr key={row.id}>
           <td>{formatWhen(row.createdAt)}</td>
           <td><strong>{marketSymbol(row.asset, row.quote, 'perpetual')}</strong>{row.reduceOnly && <small className="reduce-tag">{t('Reduce only')}</small>}</td>
           <td><VenueFromCode code={row.venue} /></td>
@@ -811,10 +857,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td><span className={`status-tag ${row.state.toLowerCase()}`}>{row.state}</span></td>
           <td>{row.reference}</td>
         </tr>)}</tbody>
-      </table></div> : <EmptyTable label="open orders" />)}
-      {activeTab === 'fills' && (fillRows.length ? <div className="positions-table table-wrap"><table>
+      </table></div><ExecutionPagination itemCount={orderRows.length} page={openOrdersPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} /></> : <EmptyTable label="open orders" />)}
+      {activeTab === 'fills' && (fillRows.length ? <><div className="positions-table table-wrap"><table>
         <thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Execution price')}</th><th>{t('Size')}</th><th>{t('Fee')}</th><th>{t('Role')}</th><th>{t('Realized PnL')}</th></tr></thead>
-        <tbody>{fillRows.map((row) => <tr key={row.id}>
+        <tbody>{fillRows.slice(tradeHistoryPage.start, tradeHistoryPage.end).map((row) => <tr key={row.id}>
           <td>{formatWhen(row.createdAt)}</td>
           <td><strong>{marketSymbol(row.asset, row.quote, 'perpetual')}</strong></td>
           <td><VenueFromCode code={row.venue} /></td>
@@ -825,10 +871,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td>{row.matchRole ?? '—'}</td>
           <td className={row.realizedPnl > 0 ? 'positive' : row.realizedPnl < 0 ? 'negative' : ''}>{row.realizedPnl === 0 ? '0.00' : signedAmount(row.realizedPnl)}</td>
         </tr>)}</tbody>
-      </table></div> : <EmptyTable label="trade history" />)}
-      {activeTab === 'margin' && marginRows.length > 0 && <div className="positions-table table-wrap"><table>
+      </table></div><ExecutionPagination itemCount={fillRows.length} page={tradeHistoryPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /></> : <EmptyTable label="trade history" />)}
+      {activeTab === 'margin' && marginRows.length > 0 && <><div className="positions-table table-wrap"><table>
         <thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Value')}</th><th>{t('Entry price')}</th><th>{t('Index price')}</th><th>{t('Leverage')}</th><th>{t('Liability')}</th><th>{t('Interest')}</th><th>{t('Unrealized PnL')}</th></tr></thead>
-        <tbody>{marginRows.map((row) => <tr key={row.id}>
+        <tbody>{marginRows.slice(marginPage.start, marginPage.end).map((row) => <tr key={row.id}>
           <td><strong>{marketSymbol(row.asset, row.quote, 'spot')}</strong><small className={row.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(row.side)}</small></td>
           <td><VenueFromCode code={row.venue} /></td>
           <td>{formatAmount(row.assetQuantity, 6)} {row.asset}</td>
@@ -840,7 +886,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td>{row.interest !== null ? formatAmount(row.interest, 6) : '—'}</td>
           <td className={row.upnl >= 0 ? 'positive' : 'negative'}>{signedAmount(row.upnl)}</td>
         </tr>)}</tbody>
-      </table></div>}
+      </table></div><ExecutionPagination itemCount={marginRows.length} page={marginPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, margin: page }))} /></>}
     </section>
     {pendingTransfer && <div className="modal-backdrop transfer-confirm-backdrop" onMouseDown={(event) => {
       if (event.target === event.currentTarget && !transferring) setPendingTransfer(null);
