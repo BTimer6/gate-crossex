@@ -381,6 +381,7 @@ export const PortfolioFuturesPositionSchema = z.object({
   unrealizedPnlRate: z.string(), entryPrice: z.string(), markPrice: z.string(), leverage: z.string(),
   maxLeverage: z.string(), riskLimit: z.string(), fee: z.string(), fundingFee: z.string(),
   fundingTime: z.string(), createdAt: z.string(), updatedAt: z.string(), realizedPnl: z.string(),
+  crossExAdlRank: z.string().nullable().optional(), exchangeAdlRank: z.string().nullable().optional(),
 });
 export type PortfolioFuturesPosition = z.infer<typeof PortfolioFuturesPositionSchema>;
 

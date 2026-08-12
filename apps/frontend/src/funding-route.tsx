@@ -779,7 +779,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
               : <>{t('No pairs clear the average OI filter.')} {t('Lower the minimum to see more pairs.')}</>
         }</div>}
       </div>
-      <div className="funding-pagination">
+      {filteredMarkets.length >= 10 && <div className="funding-pagination">
         <span className="page-range">{filteredMarkets.length === 0 ? `0 ${t('pairs')}` : `${pageStart + 1}–${Math.min(pageStart + pageSize, filteredMarkets.length)} / ${filteredMarkets.length} ${t('pairs')}`}</span>
         <div className="page-controls">
           <button onClick={() => setPage(1)} disabled={currentPage <= 1} aria-label={t('First page')}>«</button>
@@ -789,7 +789,7 @@ export function FundingRatesView({ marketSnapshot, onMarketFallback, onOpenAsset
           <button onClick={() => setPage(totalPages)} disabled={currentPage >= totalPages} aria-label={t('Last page')}>»</button>
         </div>
         <label className="page-size"><select value={pageSize} onChange={(event) => { setPage(1); setPageSize(Number(event.target.value)); }}>{FUNDING_PAGE_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}</select><span>{t('per page')}</span></label>
-      </div>
+      </div>}
       <footer className="funding-footer">
         <span>
           {overview ? t('Aggregated from venue public REST · refreshed 5m, 30s near settlement') : t(marketSnapshot?.markets.some((market) => market.source === 'gate_crossex_websocket') ? 'Live Gate CrossEx WebSocket' : 'Seed data while awaiting market updates')}

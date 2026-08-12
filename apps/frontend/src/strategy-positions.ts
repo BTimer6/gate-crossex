@@ -14,6 +14,8 @@ export interface StrategyPositionRow {
   markPrice: number;
   leverage: string | null;
   unrealizedPnl: number;
+  crossExAdlRank?: string | null;
+  exchangeAdlRank?: string | null;
 }
 
 export interface StrategyPositionsView {
@@ -58,6 +60,8 @@ function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPosit
         markPrice,
         leverage: position.leverage || null,
         unrealizedPnl: parseNumber(position.unrealizedPnl) ?? 0,
+        crossExAdlRank: position.crossExAdlRank ?? null,
+        exchangeAdlRank: position.exchangeAdlRank ?? null,
       };
     })
     .filter((row): row is StrategyPositionRow => row !== null);
@@ -93,6 +97,8 @@ function executionRows(
         markPrice,
         leverage: portfolioPosition?.leverage || null,
         unrealizedPnl: reportedPnl ?? ((markPrice - entryPrice) * quantity),
+        crossExAdlRank: portfolioPosition?.crossExAdlRank ?? null,
+        exchangeAdlRank: portfolioPosition?.exchangeAdlRank ?? null,
       };
     })
     .filter((row): row is StrategyPositionRow => row !== null);

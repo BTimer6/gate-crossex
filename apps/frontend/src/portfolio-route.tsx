@@ -29,6 +29,8 @@ import { maximumTransferAmount } from './transfer-amount.js';
 import { transferAccountsFor, transferFeeForRoute } from './transfer-rules.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
+import { AdlIndicators } from './adl-indicator.js';
+import { marginRatePercent } from './portfolio-metrics.js';
 
 function VenueFromCode({ code }: { code: string }) {
   const exchange = exchanges.find((item) => item.id === code.toLowerCase());
@@ -38,6 +40,16 @@ function VenueFromCode({ code }: { code: string }) {
 function EmptyTable({ label }: { label: string }) {
   const { t } = useLanguage();
   return <div className="empty-state"><span>◎</span><strong>{t(`No ${label.toLowerCase()}`)}</strong><p>{t('The backend will add rows here as executions occur.')}</p></div>;
+}
+
+function MetricLabel({ label, explanation }: { label: string; explanation: string }) {
+  return <span className="metric-label">
+    {label}
+    <button type="button" className="metric-info" aria-label={`${label}: ${explanation}`}>
+      <span aria-hidden="true">i</span>
+      <span className="metric-tooltip" role="tooltip">{explanation}</span>
+    </button>
+  </span>;
 }
 
 interface PortfolioViewProps {
@@ -69,6 +81,8 @@ interface PortfolioPositionRow {
   leverage: string | null;
   realized: number | null;
   fundingFee: number | null;
+  crossExAdlRank: string | null;
+  exchangeAdlRank: string | null;
 }
 
 function venueDisplayName(code: string): string {
@@ -148,6 +162,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
             leverage: position.leverage || null,
             realized: parseNumber(position.realizedPnl),
             fundingFee: parseNumber(position.fundingFee),
+            crossExAdlRank: position.crossExAdlRank ?? null,
+            exchangeAdlRank: position.exchangeAdlRank ?? null,
           };
         })
         .sort((a, b) => b.value - a.value);
@@ -174,6 +190,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           leverage: null,
           realized: parseNumber(position.realized_pnl),
           fundingFee: null,
+          crossExAdlRank: null,
+          exchangeAdlRank: null,
         };
       })
       .sort((a, b) => b.value - a.value);
@@ -475,6 +493,8 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   const availableMargin = parseNumber(account?.availableMargin);
   const initialMargin = parseNumber(account?.initialMargin);
   const maintenanceMargin = parseNumber(account?.maintenanceMargin);
+  const initialMarginRate = marginRatePercent(account?.initialMarginRate);
+  const maintenanceMarginRate = marginRatePercent(account?.maintenanceMarginRate);
   const marginUsage = marginBalance !== null && marginBalance > 0 && maintenanceMargin !== null
     ? (maintenanceMargin / marginBalance) * 100
     : null;
@@ -658,6 +678,16 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <em>{initialMargin !== null ? `${t('Initial margin')} $${formatAmount(initialMargin)}` : '—'}</em>
       </article>
       <article>
+        <MetricLabel label={t('Current total initial margin rate')} explanation={t('Initial margin rate explanation')} />
+        <strong className={initialMarginRate !== null && initialMarginRate < 100 ? 'negative' : initialMarginRate !== null && initialMarginRate < 110 ? 'margin-rate-warning' : ''}>{initialMarginRate !== null ? `${formatAmount(initialMarginRate, 2)}%` : '—'}</strong>
+        <em>{t('Margin balance divided by total initial margin')}</em>
+      </article>
+      <article>
+        <MetricLabel label={t('Current total maintenance margin rate')} explanation={t('Maintenance margin rate explanation')} />
+        <strong className={maintenanceMarginRate !== null && maintenanceMarginRate <= 100 ? 'negative' : ''}>{maintenanceMarginRate !== null ? `${formatAmount(maintenanceMarginRate, 2)}%` : '—'}</strong>
+        <em>{t('Margin balance divided by total maintenance margin')}</em>
+      </article>
+      <article>
         <span>{t('Unrealized PnL')}</span>
         <strong className={unrealized >= 0 ? 'positive' : 'negative'}>{unrealized >= 0 ? '+' : '-'}${formatAmount(Math.abs(unrealized))}</strong>
         <em>{t('Marked from CrossEx prices')}</em>
@@ -830,7 +860,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <span className="table-source">{tableSource}</span>
       </div>
       {activeTab === 'positions' && (positionRows.length ? <><div className="positions-table table-wrap"><table>
-        <thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Value')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th></tr></thead>
+        <thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Value')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('ADL indicator')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th></tr></thead>
         <tbody>{positionRows.slice(positionsPage.start, positionsPage.end).map((row) => <tr key={row.id}>
           <td><strong>{marketSymbol(row.asset, row.quote, 'perpetual')}</strong><small className={row.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(row.side)}</small></td>
           <td><VenueFromCode code={row.venue} /></td>
@@ -839,6 +869,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           <td>{priceText(row.entryPrice)}</td>
           <td>{priceText(row.markPrice)}</td>
           <td>{row.leverage ? `${row.leverage}×` : '—'}</td>
+          <td><AdlIndicators ranks={[{ key: row.id, venue: row.venue, crossExRank: row.crossExAdlRank, exchangeRank: row.exchangeAdlRank }]} /></td>
           <td className={row.upnl >= 0 ? 'positive' : 'negative'}>{signedAmount(row.upnl)}{row.upnlRate !== null && <span className="pnl-rate">{signedAmount(row.upnlRate)}%</span>}</td>
           <td>{row.realized !== null ? signedAmount(row.realized) : '—'}</td>
           <td className={row.fundingFee !== null && row.fundingFee > 0 ? 'positive' : row.fundingFee !== null && row.fundingFee < 0 ? 'negative' : ''}>{row.fundingFee !== null ? signedAmount(row.fundingFee) : '—'}</td>

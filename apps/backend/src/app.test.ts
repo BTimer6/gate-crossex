@@ -43,6 +43,10 @@ const portfolioFixture: GateCrossExPortfolio = {
     max_leverage: '20', risk_limit: '1', fee: '0.5', funding_fee: '1.2', funding_time: '1783728000000',
     create_time: '1783600000000', update_time: '1783689000000', closed_pnl: '4',
   }],
+  adlRanks: [{
+    user_id: 'account-user', symbol: 'BINANCE_FUTURE_BTC_USDT',
+    crossex_adl_rank: '4', exchange_adl_rank: '3',
+  }],
   marginPositions: [{
     position_id: 'margin-1', symbol: 'GATE_MARGIN_ETH_USDT', position_side: 'LONG', initial_margin: '100',
     maintenance_margin: '20', asset_qty: '1', asset_coin: 'ETH', position_value: '3200', liability: '1000',
@@ -1810,7 +1814,10 @@ describe('local backend', () => {
       snapshot: {
         account: { marginBalance: '1500', accountMode: 'CROSS_EXCHANGE' },
         balances: expect.arrayContaining([expect.objectContaining({ venue: 'BINANCE', coin: 'USDT', equity: '1020' })]),
-        futuresPositions: [{ positionId: 'position-1', symbol: 'BINANCE_FUTURE_BTC_USDT' }],
+        futuresPositions: [{
+          positionId: 'position-1', symbol: 'BINANCE_FUTURE_BTC_USDT',
+          crossExAdlRank: '4', exchangeAdlRank: '3',
+        }],
         marginPositions: [{ positionId: 'margin-1', symbol: 'GATE_MARGIN_ETH_USDT' }],
         openOrders: [{ orderId: 'order-1', clientOrderId: 'client-1' }],
         recentFills: [{ transactionId: 'fill-1', orderId: 'order-0' }],

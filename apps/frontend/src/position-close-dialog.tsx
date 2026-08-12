@@ -11,6 +11,8 @@ import { marketSymbol } from './market-symbol.js';
 import { closeQuantityForPercentage } from './position-close.js';
 import { canonicalPositionAsset, positionGroupLabel } from './position-grouping.js';
 import { formatAmount, symbolParts, useDialogFocus } from './route-shared.js';
+import { AdlIndicators } from './adl-indicator.js';
+import { adlRanksForPositions } from './adl-ranking.js';
 
 export interface ClosePositionTarget {
   id: string;
@@ -47,6 +49,11 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
   }))];
   const closeAssetLabel = positionGroupLabel(closeAssets);
   const venueCount = new Set(targets.map((target) => symbolParts(target.symbol).venue)).size;
+  const targetAdlRanks = adlRanksForPositions(targets.map((target) => ({
+    positionId: target.positionId,
+    symbol: target.symbol,
+    venue: symbolParts(target.symbol).venue,
+  })), portfolio?.snapshot.futuresPositions ?? []);
   const selectedAssets = [...new Set(selectedTargets.map((target) => {
     const part = symbolParts(target.symbol);
     return canonicalPositionAsset(part.asset, part.venue);
@@ -163,6 +170,7 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
         <div><dt>{t('Positions to close')}</dt><dd>{selectedTargets.length}</dd></div>
         <div><dt>{t('Size')}</dt><dd>{closeSize}</dd></div>
         <div><dt>{t('Position notional')}</dt><dd>${formatAmount(selectedTargets.reduce((sum, target) => sum + Number(quantityByTarget.get(target.id) ?? 0) * Number(target.markPrice), 0))}</dd></div>
+        <div><dt>{t('ADL indicator')}</dt><dd><AdlIndicators ranks={targetAdlRanks.filter((_, index) => selectedTargets.some((target) => target.id === targets[index]?.id))} /></dd></div>
         <div><dt>{t('Execution')}</dt><dd>{t('Market reduce-only')}</dd></div>
       </dl>
       {selectable && <div className="close-position-selector">

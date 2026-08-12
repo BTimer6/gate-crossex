@@ -109,7 +109,7 @@ describe('Gate APIv4 signing', () => {
     ]);
   });
 
-  it('uses only the five documented authenticated GETs for a portfolio snapshot', async () => {
+  it('enriches the five portfolio reads with the documented per-symbol ADL ranks', async () => {
     const account = {
       available_margin: '100', margin_balance: '100', initial_margin: '0', maintenance_margin: '0',
       initial_margin_rate: '0', maintenance_margin_rate: '0', position_mode: 'SINGLE',
@@ -145,6 +145,10 @@ describe('Gate APIv4 signing', () => {
       const value = String(url);
       if (value.endsWith('/crossex/accounts')) return new Response(JSON.stringify(account));
       if (value.endsWith('/crossex/positions')) return new Response(JSON.stringify([position]));
+      if (value.endsWith('/crossex/adl_rank?symbol=BINANCE_FUTURE_BTC_USDT')) return new Response(JSON.stringify([{
+        user_id: 'user-1', symbol: 'BINANCE_FUTURE_BTC_USDT',
+        crossex_adl_rank: '4', exchange_adl_rank: '3',
+      }]));
       if (value.endsWith('/crossex/margin_positions')) return new Response('[]');
       if (value.endsWith('/crossex/open_orders')) return new Response(JSON.stringify([order]));
       if (value.endsWith('/crossex/history_trades?page=1&limit=100')) return new Response(JSON.stringify([trade]));
@@ -154,10 +158,39 @@ describe('Gate APIv4 signing', () => {
 
     const portfolio = await client.queryPortfolio({ apiKey: 'test-api-key', apiSecret: 'test-secret' });
 
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
     expect(portfolio.positions[0]?.position_id).toBe('p1');
+    expect(portfolio.adlRanks).toEqual([expect.objectContaining({
+      symbol: 'BINANCE_FUTURE_BTC_USDT', crossex_adl_rank: '4', exchange_adl_rank: '3',
+    })]);
     expect(portfolio.openOrders[0]?.client_order_id).toBe('c1');
     expect(portfolio.recentTrades[0]?.transaction_id).toBe('t1');
+  });
+
+  it('keeps the portfolio usable when supplemental ADL data is unavailable', async () => {
+    const account = {
+      available_margin: '100', margin_balance: '100', initial_margin: '0', maintenance_margin: '0',
+      initial_margin_rate: '0', maintenance_margin_rate: '0', position_mode: 'SINGLE',
+      account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', update_time: '1783689000000', assets: [],
+    };
+    const position = {
+      position_id: 'p1', symbol: 'OKX_FUTURE_BTC_USDT', position_side: 'LONG', initial_margin: '10',
+      maintenance_margin: '2', position_qty: '0.01', position_value: '640', upnl: '2', upnl_rate: '0.01',
+      entry_price: '63000', mark_price: '64000', leverage: '3', max_leverage: '20', risk_limit: '1',
+      fee: '0.1', funding_fee: '0', funding_time: '0', create_time: '1783600000000',
+      update_time: '1783689000000', closed_pnl: '0',
+    };
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const value = String(url);
+      if (value.endsWith('/crossex/accounts')) return new Response(JSON.stringify(account));
+      if (value.endsWith('/crossex/positions')) return new Response(JSON.stringify([position]));
+      if (value.includes('/crossex/adl_rank?')) return new Response(JSON.stringify({ label: 'ADL_UNAVAILABLE' }), { status: 503 });
+      return new Response('[]');
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000, undefined, 0);
+
+    await expect(client.queryPortfolio({ apiKey: 'test-api-key', apiSecret: 'test-secret' }))
+      .resolves.toMatchObject({ positions: [position], adlRanks: [] });
   });
 
   it('validates nullable fields from the public CrossEx symbol catalog', async () => {

@@ -358,7 +358,11 @@ function millisecondTimestamp(value: string | number): string {
   return Number.isFinite(milliseconds) && milliseconds > 0 ? new Date(milliseconds).toISOString() : String(value);
 }
 
-function normalizeFuturesPositions(positions: GateCrossExPosition[]): PortfolioFuturesPosition[] {
+function normalizeFuturesPositions(
+  positions: GateCrossExPosition[],
+  adlRanks: NonNullable<GateCrossExPortfolio['adlRanks']> = [],
+): PortfolioFuturesPosition[] {
+  const adlBySymbol = new Map(adlRanks.map((rank) => [rank.symbol, rank]));
   return positions.map((position) => ({
     positionId: position.position_id, symbol: position.symbol, positionSide: position.position_side,
     initialMargin: position.initial_margin, maintenanceMargin: position.maintenance_margin,
@@ -368,6 +372,8 @@ function normalizeFuturesPositions(positions: GateCrossExPosition[]): PortfolioF
     fee: position.fee, fundingFee: position.funding_fee, fundingTime: position.funding_time,
     createdAt: millisecondTimestamp(position.create_time), updatedAt: millisecondTimestamp(position.update_time),
     realizedPnl: position.closed_pnl,
+    crossExAdlRank: adlBySymbol.get(position.symbol)?.crossex_adl_rank ?? null,
+    exchangeAdlRank: adlBySymbol.get(position.symbol)?.exchange_adl_rank ?? null,
   }));
 }
 
@@ -389,7 +395,7 @@ function normalizePortfolio(portfolio: GateCrossExPortfolio, fetchedAt: string):
       borrowingMaintenanceMargin: asset.borrowing_maintenance_margin,
       availableBalance: asset.available_balance, liability: asset.liability,
     })),
-    futuresPositions: normalizeFuturesPositions(portfolio.positions),
+    futuresPositions: normalizeFuturesPositions(portfolio.positions, portfolio.adlRanks),
     marginPositions: portfolio.marginPositions.map((position) => ({
       positionId: position.position_id, symbol: position.symbol, positionSide: position.position_side,
       initialMargin: position.initial_margin, maintenanceMargin: position.maintenance_margin,
