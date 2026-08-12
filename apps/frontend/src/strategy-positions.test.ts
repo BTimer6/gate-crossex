@@ -127,4 +127,28 @@ describe('strategy positions', () => {
       legs: rows, grossNotional: 400, unrealizedPnl: 2, fullyHedged: true,
     })]);
   });
+
+  it('groups a Hyperliquid SKHX alias with SKHYNIX positions', () => {
+    const rows: StrategyPositionRow[] = [
+      { id: 'gate', venue: 'GATE', asset: 'SKHYNIX', quote: 'USDT', side: 'Long', quantity: 0.1, value: 170, entryPrice: 1700, markPrice: 1710, leverage: '5', unrealizedPnl: 1 },
+      { id: 'hyperliquid', venue: 'HYPERLIQUID', asset: 'SKHX', quote: 'USDC', side: 'Short', quantity: -0.1, value: 171, entryPrice: 1710, markPrice: 1700, leverage: '5', unrealizedPnl: 1 },
+    ];
+
+    expect(groupStrategyPositions(rows)).toEqual([expect.objectContaining({
+      key: 'SKHY-SKHYNIX-PERP', asset: 'SKHYNIX', label: 'SKHYNIX', mixedAssets: false,
+      legs: rows, venueCount: 2, fullyHedged: true,
+    })]);
+  });
+
+  it('keeps SKHX on other venues separate because aliases are venue-scoped', () => {
+    const rows: StrategyPositionRow[] = [
+      { id: 'gate-skhx', venue: 'GATE', asset: 'SKHX', quote: 'USDT', side: 'Long', quantity: 1, value: 10, entryPrice: 10, markPrice: 10, leverage: '5', unrealizedPnl: 0 },
+      { id: 'gate-skhynix', venue: 'GATE', asset: 'SKHYNIX', quote: 'USDT', side: 'Short', quantity: -1, value: 10, entryPrice: 10, markPrice: 10, leverage: '5', unrealizedPnl: 0 },
+    ];
+
+    expect(groupStrategyPositions(rows).map((group) => group.key)).toEqual([
+      'SKHX-PERP',
+      'SKHY-SKHYNIX-PERP',
+    ]);
+  });
 });

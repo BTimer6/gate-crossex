@@ -61,7 +61,7 @@ import {
   type Side,
 } from './route-shared.js';
 import { aggregatePositionFundingFee, positionFundingFee } from './position-funding-fees.js';
-import { positionGroupKey, positionGroupLabel } from './position-grouping.js';
+import { canonicalPositionAsset, positionGroupKey, positionGroupLabel } from './position-grouping.js';
 import { PositionCloseDialog } from './position-close-dialog.js';
 import { numericFutureFeeRate } from './fee-rates.js';
 import { useLanguage } from './i18n.js';
@@ -938,8 +938,8 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   const openOrders = orders.filter((order) => OPEN_ORDER_STATES.includes(order.state));
   const fills = snapshot?.fills ?? [];
   const groups = Object.values(positions.reduce<Record<string, Position[]>>((result, position) => {
-    const asset = symbolParts(position.symbol).asset;
-    (result[positionGroupKey(asset)] ??= []).push(position);
+    const part = symbolParts(position.symbol);
+    (result[positionGroupKey(part.asset, part.venue)] ??= []).push(position);
     return result;
   }, {}));
   const tabs = [`Positions (${positions.length})`, `Open orders (${openOrders.length})`, 'Order history', 'Trade history'];
@@ -984,8 +984,12 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   return <section className="positions-panel terminal-panel">
     <div className="positions-head"><div className="panel-tabs">{tabs.map((tab) => { const match = tab.match(/^(.+?)( \(\d+\))?$/); return <button className={active === tab ? 'active' : ''} onClick={() => setBottomTab(tab)} key={tab}>{t(match?.[1] ?? tab)}{match?.[2] ?? ''}</button>; })}</div></div>
     {active.startsWith('Positions') && (groups.length ? <div className="positions-table table-wrap"><table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th><th>{t('Close position')}</th></tr></thead><tbody>{groups.map((legs) => {
-      const asset = symbolParts(legs[0].symbol).asset;
-      const assets = [...new Set(legs.map((leg) => symbolParts(leg.symbol).asset))];
+      const firstPart = symbolParts(legs[0].symbol);
+      const assets = [...new Set(legs.map((leg) => {
+        const part = symbolParts(leg.symbol);
+        return canonicalPositionAsset(part.asset, part.venue);
+      }))];
+      const asset = assets[0];
       const mixedAssets = assets.length > 1;
       const groupLabel = positionGroupLabel(assets);
       const quantity = legs.reduce((sum, leg) => sum + Number(leg.quantity), 0);
@@ -998,7 +1002,7 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
       const fullyHedged = mixedAssets
         ? legs.some((leg) => Number(leg.quantity) > 0) && legs.some((leg) => Number(leg.quantity) < 0)
         : grossQuantity > 0 && Math.abs(quantity) <= Math.max(1e-12, grossQuantity * 1e-9);
-      const key = `${positionGroupKey(asset)}-PERP`;
+      const key = `${positionGroupKey(firstPart.asset, firstPart.venue)}-PERP`;
       if (legs.length === 1) {
         const leg = legs[0];
         const part = symbolParts(leg.symbol);

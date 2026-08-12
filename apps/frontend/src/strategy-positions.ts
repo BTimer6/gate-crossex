@@ -1,5 +1,5 @@
 import type { AuthenticatedPortfolioSnapshot, TradingSnapshot } from './api.js';
-import { positionGroupKey, positionGroupLabel } from './position-grouping.js';
+import { canonicalPositionAsset, positionGroupKey, positionGroupLabel } from './position-grouping.js';
 import { parseNumber, symbolParts } from './route-shared.js';
 
 export interface StrategyPositionRow {
@@ -130,14 +130,14 @@ export function prepareStrategyPositions(
 export function groupStrategyPositions(rows: readonly StrategyPositionRow[]): StrategyPositionGroup[] {
   const groups = new Map<string, StrategyPositionRow[]>();
   for (const row of rows) {
-    const key = positionGroupKey(row.asset);
+    const key = positionGroupKey(row.asset, row.venue);
     const legs = groups.get(key) ?? [];
     legs.push(row);
     groups.set(key, legs);
   }
 
   return [...groups.entries()].map(([groupKey, legs]) => {
-    const assets = [...new Set(legs.map((leg) => leg.asset))];
+    const assets = [...new Set(legs.map((leg) => canonicalPositionAsset(leg.asset, leg.venue)))];
     const asset = assets[0];
     const mixedAssets = assets.length > 1;
     const quantity = legs.reduce((sum, leg) => sum + leg.quantity, 0);

@@ -9,7 +9,7 @@ import {
 import { useLanguage } from './i18n.js';
 import { marketSymbol } from './market-symbol.js';
 import { closeQuantityForPercentage } from './position-close.js';
-import { positionGroupLabel } from './position-grouping.js';
+import { canonicalPositionAsset, positionGroupLabel } from './position-grouping.js';
 import { formatAmount, symbolParts, useDialogFocus } from './route-shared.js';
 
 export interface ClosePositionTarget {
@@ -41,10 +41,16 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
 
   const selectable = targets.length > 2;
   const selectedTargets = selectable ? targets.filter((target) => selectedIds.includes(target.id)) : targets;
-  const closeAssets = [...new Set(targets.map((target) => symbolParts(target.symbol).asset))];
+  const closeAssets = [...new Set(targets.map((target) => {
+    const part = symbolParts(target.symbol);
+    return canonicalPositionAsset(part.asset, part.venue);
+  }))];
   const closeAssetLabel = positionGroupLabel(closeAssets);
   const venueCount = new Set(targets.map((target) => symbolParts(target.symbol).venue)).size;
-  const selectedAssets = [...new Set(selectedTargets.map((target) => symbolParts(target.symbol).asset))];
+  const selectedAssets = [...new Set(selectedTargets.map((target) => {
+    const part = symbolParts(target.symbol);
+    return canonicalPositionAsset(part.asset, part.venue);
+  }))];
   const quantityByTarget = useMemo(() => new Map(selectedTargets.map((target) => {
     const lotSize = instruments?.find((instrument) => instrument.symbol === target.symbol)?.lotSize ?? null;
     return [target.id, closeQuantityForPercentage(target.quantity, closePercentage, lotSize)] as const;
