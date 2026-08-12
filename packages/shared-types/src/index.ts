@@ -47,6 +47,14 @@ export const CredentialConnectionStatusSchema = z.object({
   lastVerifiedAt: z.string().nullable(),
   secureEntryPath: z.literal('/secure/credentials'),
   readOnly: z.boolean(),
+  activeProfileId: z.string().nullable(),
+  profiles: z.array(z.object({
+    id: z.string(),
+    label: z.string(),
+    storage: z.enum(['os_keychain', 'env_file', 'memory_test_only', 'unavailable']),
+    lastVerifiedAt: z.string().nullable(),
+    active: z.boolean(),
+  })),
 });
 export type CredentialConnectionStatus = z.infer<typeof CredentialConnectionStatusSchema>;
 

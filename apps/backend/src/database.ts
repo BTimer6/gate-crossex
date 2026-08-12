@@ -18,6 +18,7 @@ const CURRENT_SCHEMA_TABLES = [
   'audit_events',
   'candle_cache',
   'crossex_instruments',
+  'credential_session',
   'execution_fills',
   'execution_orders',
   'execution_strategies',
@@ -122,7 +123,7 @@ export function openDatabase(databasePath: string, migrationsDir: string): Datab
     }
 
     assertDatabaseIntegrity(database);
-    if (migrationFiles.includes('0014_database_maintenance.sql')) assertCurrentSchema(database);
+    if (migrationFiles.includes('0018_credential_profiles.sql')) assertCurrentSchema(database);
     database.pragma('optimize');
     return database;
   } catch (error) {

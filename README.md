@@ -107,8 +107,8 @@ The bootstrap verifies the private Node.js runtime against Node.js's published S
 
 1. 打开 Gate CrossEx 并确认风险提示，选择**只读模式**或**实盘交易**。每次重启都会恢复为锁定状态。<br>
    Open Gate CrossEx and accept the risk notice. Choose **read-only** or **live trading**. Every restart returns to the locked state.
-2. 使用 **Open secure credential setup** 添加专用 Gate APIv4 密钥，建议保存到系统钥匙串或凭据管理器。<br>
-   Use **Open secure credential setup** to add a dedicated Gate APIv4 key. The OS keychain is recommended.
+2. 使用设置中的账户登录窗口添加专用 Gate APIv4 密钥；可保存多个账户并安全切换，建议保存到系统钥匙串或凭据管理器。<br>
+   Use the account login window in Settings to add a dedicated Gate APIv4 key. You can save and safely switch multiple accounts; the OS keychain is recommended.
 3. 仅授予所需的 CrossEx 权限。资金划转需要钱包读写权限；请勿授予提现权限。<br>
    Grant only the CrossEx permissions you need. Transfers require wallet read-write permission; never grant withdrawal permission.
 

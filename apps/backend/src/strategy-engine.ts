@@ -349,6 +349,33 @@ export class StrategyEngine {
     return result.unresolved;
   }
 
+  /**
+   * A saved strategy belongs to the account on which it was created. Credential replacement can
+   * point at a different Gate account even when the user reuses the same connection label, so a
+   * successful credential mutation must make persisted RUNNING strategies non-resumable before
+   * the new profile can become active.
+   */
+  pauseRunningStrategiesForCredentialChange(): number {
+    const running = this.runtime.listStrategies().filter((record) => record.status === 'RUNNING');
+    if (running.length === 0) return 0;
+    const updatedAt = new Date().toISOString();
+    const update = this.database.prepare(`UPDATE execution_strategies
+      SET status = 'PAUSED', updated_at = ?
+      WHERE id = ? AND status = 'RUNNING'`);
+    this.database.transaction(() => {
+      for (const record of running) update.run(updatedAt, record.id);
+    })();
+    for (const actor of this.actors.values()) actor.suspended = true;
+    this.actors.clear();
+    this.ledgerCache.clear();
+    for (const record of running) {
+      this.runtime.addStrategyLog(record.id, 'warning', 'Strategy paused',
+        'Account credentials changed', '—', 'Manual review required before trading this strategy again');
+      this.runtime.emitStrategyUpdate(this.runtime.getStrategy(record.id));
+    }
+    return running.length;
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.tickTimer) clearInterval(this.tickTimer);

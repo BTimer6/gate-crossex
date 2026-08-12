@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const SERVICE_NAME = 'dev.gate-crossex.terminal';
 export const DEFAULT_CREDENTIAL_PROFILE = 'gate-crossex-default';
@@ -115,6 +115,22 @@ const ENV_KEYS = {
   apiSecret: 'GCT_GATE_API_SECRET',
 } as const;
 const LEGACY_ENV_CREDENTIAL_NAMES = ['GCT_GATE_UID'] as const;
+type EnvCredentialKeys = Record<keyof typeof ENV_KEYS, string>;
+
+function envKeysForProfile(profile: string): EnvCredentialKeys {
+  if (profile === DEFAULT_CREDENTIAL_PROFILE) return ENV_KEYS;
+  const suffix = createHash('sha256').update(profile).digest('hex').slice(0, 16).toUpperCase();
+  return {
+    apiKey: `GCT_GATE_API_KEY_${suffix}`,
+    apiSecret: `GCT_GATE_API_SECRET_${suffix}`,
+  };
+}
+
+function envProfileMarker(profile: string): string {
+  return profile === DEFAULT_CREDENTIAL_PROFILE
+    ? '# Gate CrossEx credentials — managed by the local app'
+    : `# Gate CrossEx credential profile ${createHash('sha256').update(profile).digest('hex').slice(0, 16)} — managed by the local app`;
+}
 
 function decodeEnvValue(value: string): string {
   const trimmed = value.trim();
@@ -130,9 +146,9 @@ function decodeEnvValue(value: string): string {
   return trimmed;
 }
 
-function readCredentialFields(contents: string): Partial<Record<keyof typeof ENV_KEYS, string>> {
+function readCredentialFields(contents: string, keys: EnvCredentialKeys): Partial<Record<keyof typeof ENV_KEYS, string>> {
   const values: Partial<Record<keyof typeof ENV_KEYS, string>> = {};
-  const names = new Map<string, keyof typeof ENV_KEYS>(Object.entries(ENV_KEYS).map(([field, name]) => [name, field as keyof typeof ENV_KEYS]));
+  const names = new Map<string, keyof typeof ENV_KEYS>(Object.entries(keys).map(([field, name]) => [name, field as keyof typeof ENV_KEYS]));
   for (const line of contents.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)$/);
     const field = match?.[1] ? names.get(match[1]) : undefined;
@@ -156,20 +172,25 @@ export class EnvFileCredentialVault implements CredentialVault {
     }
   }
 
-  async set(_profile: string, credentials: GateCredentials): Promise<void> {
+  async set(profile: string, credentials: GateCredentials): Promise<void> {
     const parsed = StoredCredentialsSchema.parse(credentials);
     const existing = await this.contents();
-    const credentialNames = new Set<string>([...Object.values(ENV_KEYS), ...LEGACY_ENV_CREDENTIAL_NAMES]);
+    const keys = envKeysForProfile(profile);
+    const credentialNames = new Set<string>([
+      ...Object.values(keys),
+      ...(profile === DEFAULT_CREDENTIAL_PROFILE ? LEGACY_ENV_CREDENTIAL_NAMES : []),
+    ]);
+    const marker = envProfileMarker(profile);
     const retained = existing.split(/\r?\n/).filter((line) => {
       const name = line.match(/^\s*([A-Z0-9_]+)\s*=/)?.[1];
-      return !name || !credentialNames.has(name);
+      return line !== marker && (!name || !credentialNames.has(name));
     });
     while (retained.at(-1) === '') retained.pop();
     const credentialLines = [
-      `${ENV_KEYS.apiKey}=${JSON.stringify(parsed.apiKey)}`,
-      `${ENV_KEYS.apiSecret}=${JSON.stringify(parsed.apiSecret)}`,
+      `${keys.apiKey}=${JSON.stringify(parsed.apiKey)}`,
+      `${keys.apiSecret}=${JSON.stringify(parsed.apiSecret)}`,
     ];
-    const output = [...retained, ...(retained.length ? [''] : []), '# Gate CrossEx credentials — managed by the local app', ...credentialLines, ''].join('\n');
+    const output = [...retained, ...(retained.length ? [''] : []), marker, ...credentialLines, ''].join('\n');
     const temporaryPath = `${this.path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporaryPath, output, { encoding: 'utf8', mode: 0o600 });
@@ -182,8 +203,8 @@ export class EnvFileCredentialVault implements CredentialVault {
     }
   }
 
-  async get(): Promise<GateCredentials | null> {
-    const values = readCredentialFields(await this.contents());
+  async get(profile: string = DEFAULT_CREDENTIAL_PROFILE): Promise<GateCredentials | null> {
+    const values = readCredentialFields(await this.contents(), envKeysForProfile(profile));
     if (!values.apiKey && !values.apiSecret) return null;
     return StoredCredentialsSchema.parse({
       apiKey: values.apiKey,
@@ -191,19 +212,23 @@ export class EnvFileCredentialVault implements CredentialVault {
     });
   }
 
-  async getProvider(): Promise<CredentialStorageProvider | null> {
-    return await this.get() ? this.provider : null;
+  async getProvider(profile: string = DEFAULT_CREDENTIAL_PROFILE): Promise<CredentialStorageProvider | null> {
+    return await this.get(profile) ? this.provider : null;
   }
 
-  async delete(): Promise<boolean> {
+  async delete(profile: string = DEFAULT_CREDENTIAL_PROFILE): Promise<boolean> {
     const existing = await this.contents();
     if (!existing) return false;
-    const credentialNames = new Set<string>([...Object.values(ENV_KEYS), ...LEGACY_ENV_CREDENTIAL_NAMES]);
+    const credentialNames = new Set<string>([
+      ...Object.values(envKeysForProfile(profile)),
+      ...(profile === DEFAULT_CREDENTIAL_PROFILE ? LEGACY_ENV_CREDENTIAL_NAMES : []),
+    ]);
+    const marker = envProfileMarker(profile);
     let removed = false;
     const retained = existing.split(/\r?\n/).filter((line) => {
       const name = line.match(/^\s*([A-Z0-9_]+)\s*=/)?.[1];
       if (name && credentialNames.has(name)) { removed = true; return false; }
-      if (line === '# Gate CrossEx credentials — managed by the local app') return false;
+      if (line === marker) return false;
       return true;
     });
     if (!removed) return false;
@@ -247,7 +272,7 @@ export class RoutedCredentialVault implements CredentialVault {
   }
 
   async set(profile: string, credentials: GateCredentials, provider: CredentialStorageProvider = this.provider): Promise<void> {
-    const previousEnv = await this.envFile.get();
+    const previousEnv = await this.envFile.get(profile);
     const previousKeychain = await this.keychain?.get(profile) ?? null;
     const previousPreferred = this.preferredProviders.get(profile) ?? null;
     const effectivePrevious = previousPreferred
@@ -256,7 +281,7 @@ export class RoutedCredentialVault implements CredentialVault {
       const failures: unknown[] = [];
       try {
         if (previousEnv) await this.envFile.set(profile, previousEnv);
-        else await this.envFile.delete();
+        else await this.envFile.delete(profile);
       } catch (error) {
         failures.push(error);
       }
@@ -295,7 +320,7 @@ export class RoutedCredentialVault implements CredentialVault {
     if (provider === 'os_keychain' && this.keychain) {
       try {
         await this.keychain.set(profile, credentials);
-        await this.envFile.delete();
+        await this.envFile.delete(profile);
         this.setPreferredProvider(profile, 'os_keychain');
       } catch (error) {
         try {
@@ -321,29 +346,29 @@ export class RoutedCredentialVault implements CredentialVault {
    */
   async get(profile: string): Promise<GateCredentials | null> {
     if (this.preferredProviders.get(profile) === 'env_file') {
-      return await this.envFile.get() ?? await this.keychain?.get(profile) ?? null;
+      return await this.envFile.get(profile) ?? await this.keychain?.get(profile) ?? null;
     }
-    return await this.keychain?.get(profile) ?? await this.envFile.get();
+    return await this.keychain?.get(profile) ?? await this.envFile.get(profile);
   }
 
   async getProvider(profile: string): Promise<CredentialStorageProvider | null> {
     if (this.preferredProviders.get(profile) === 'env_file') {
-      if (await this.envFile.get()) return 'env_file';
+      if (await this.envFile.get(profile)) return 'env_file';
       return await this.keychain?.getProvider(profile) ?? null;
     }
     const keychainProvider = await this.keychain?.getProvider(profile) ?? null;
     if (keychainProvider) return keychainProvider;
-    return await this.envFile.get() ? 'env_file' : null;
+    return await this.envFile.get(profile) ? 'env_file' : null;
   }
 
   async delete(profile: string): Promise<boolean> {
-    const previousEnv = await this.envFile.get();
+    const previousEnv = await this.envFile.get(profile);
     const previousKeychain = await this.keychain?.get(profile) ?? null;
     const previousPreferred = this.preferredProviders.get(profile) ?? null;
     const effectivePrevious = previousPreferred
       ?? (previousKeychain ? 'os_keychain' : previousEnv ? 'env_file' : null);
     try {
-      const envDeleted = await this.envFile.delete();
+      const envDeleted = await this.envFile.delete(profile);
       const keychainDeleted = await this.keychain?.delete(profile) ?? false;
       this.setPreferredProvider(profile, null);
       return envDeleted || keychainDeleted;

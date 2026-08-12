@@ -524,6 +524,10 @@ export class TradingRuntime {
 
   reconcileLiveBalances(balances: Array<{ venue: string; coin: string; balance: string; availableBalance: string; equity: string; unrealizedPnl: string }>, updatedAt: string): void {
     this.database.transaction(() => {
+      // A REST account snapshot is authoritative. Rows absent from it belong to a venue/coin the
+      // current account no longer has (most importantly after credentials are changed), so an
+      // upsert-only reconciliation would leak balances from the previous account indefinitely.
+      this.database.prepare('DELETE FROM live_balances').run();
       const upsert = this.database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(venue, coin) DO UPDATE SET balance = excluded.balance,
         available_balance = excluded.available_balance, equity = excluded.equity,

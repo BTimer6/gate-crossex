@@ -11,7 +11,7 @@ import type { CrossExTransferRequest, FundingOverviewResponse, PublicMarketSnaps
 import type { Candle, CandleInterval } from '@gate-crossex/shared-types';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
-import { DEFAULT_CREDENTIAL_PROFILE, MemoryCredentialVault, type GateCredentials } from './credential-vault.js';
+import { DEFAULT_CREDENTIAL_PROFILE, EnvFileCredentialVault, MemoryCredentialVault, type CredentialVault, type GateCredentials } from './credential-vault.js';
 import { GateApiError, type CrossExOrderRequest, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExPortfolio, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateFeeRate, type GateOrderActionResponse, type GateSpotAccount, type GateTransferCoin, type GateTransferRecord, type GateAccountBookRecord, type GateTransferResponse, type TradingCrossExGateway } from './crossex-client.js';
 import { openDatabase } from './database.js';
 import { CrossExMarketHub } from './market-hub.js';
@@ -332,7 +332,7 @@ class FakePublicMarketGateway implements PublicMarketDataGateway {
 interface TestContext {
   app: FastifyInstance;
   database: Database.Database;
-  vault: MemoryCredentialVault;
+  vault: CredentialVault;
   gateway: FakeCrossExGateway;
   publicMarketGateway: FakePublicMarketGateway;
   tradingSession: TradingSession;
@@ -481,7 +481,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 17, currentMigration: '0017_hyperliquid_perp_metadata.sql' },
+      database: { migrationCount: 18, currentMigration: '0018_credential_profiles.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -1843,6 +1843,103 @@ describe('local backend', () => {
     expect(reports.statusCode).toBe(200);
     expect(reports.json().reports).toHaveLength(2);
     expect(reports.json().reports[0]).toMatchObject({ status: 'stale' });
+  });
+
+  it('adds and switches saved accounts while clearing the previous account state', async () => {
+    const { app, database, vault } = await createTestApp();
+    const browserHeaders = { host: '127.0.0.1:5173' };
+    const postHeaders = {
+      ...browserHeaders,
+      origin: 'http://127.0.0.1:5173',
+      'content-type': 'application/x-www-form-urlencoded',
+    };
+    const firstForm = await app.inject({ method: 'GET', url: '/secure/credentials', headers: browserHeaders });
+    await app.inject({
+      method: 'POST', url: '/secure/credentials', headers: postHeaders,
+      payload: new URLSearchParams({
+        csrfToken: csrfTokenFrom(firstForm.body), label: 'Primary account',
+        apiKey: 'primary-api-key', apiSecret: 'primary-api-secret',
+      }).toString(),
+    });
+
+    const addForm = await app.inject({ method: 'GET', url: '/secure/credentials?action=add', headers: browserHeaders });
+    expect(addForm.body).toContain('Sign in to another Gate account');
+    const added = await app.inject({
+      method: 'POST', url: '/secure/credentials', headers: postHeaders,
+      payload: new URLSearchParams({
+        csrfToken: csrfTokenFrom(addForm.body), action: 'add', label: 'Secondary account',
+        apiKey: 'secondary-api-key', apiSecret: 'secondary-api-secret',
+      }).toString(),
+    });
+    expect(added.statusCode).toBe(200);
+
+    const profiles = database.prepare('SELECT id, label FROM credential_metadata ORDER BY created_at').all() as Array<{ id: string; label: string }>;
+    expect(profiles.map((profile) => profile.label)).toEqual(['Primary account', 'Secondary account']);
+    const secondary = profiles.find((profile) => profile.label === 'Secondary account');
+    expect(secondary).toBeDefined();
+    expect(await vault.get(secondary!.id)).toMatchObject({ apiKey: 'secondary-api-key' });
+
+    database.prepare(`INSERT INTO live_balances
+      (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES ('KRAKEN', 'USD', '6.59', '6.59', '7.35', '0.76', '2026-08-12T15:00:00.000Z')`).run();
+    const manager = await app.inject({ method: 'GET', url: '/secure/credentials', headers: browserHeaders });
+    expect(manager.body).toContain('Primary account');
+    expect(manager.body).toContain('Secondary account');
+    expect(manager.body).toContain('Saved accounts');
+
+    const switched = await app.inject({
+      method: 'POST', url: '/secure/credentials/switch', headers: postHeaders,
+      payload: new URLSearchParams({
+        csrfToken: csrfTokenFrom(manager.body), profileId: DEFAULT_CREDENTIAL_PROFILE,
+      }).toString(),
+    });
+    expect(switched.statusCode).toBe(200);
+    expect(switched.body).toContain('Account switched');
+    expect(database.prepare('SELECT COUNT(*) AS count FROM live_balances').get()).toEqual({ count: 0 });
+
+    const connection = await app.inject({ method: 'GET', url: '/api/onboarding/connection', headers: browserHeaders });
+    expect(connection.json()).toMatchObject({
+      label: 'Primary account',
+      activeProfileId: DEFAULT_CREDENTIAL_PROFILE,
+      profiles: [
+        expect.objectContaining({ label: 'Primary account', active: true }),
+        expect.objectContaining({ label: 'Secondary account', active: false }),
+      ],
+    });
+  });
+
+  it('discards authenticated cache at boot when the active .env credentials may have changed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gate-crossex-env-restart-'));
+    const config = loadConfig({
+      GCT_DATA_DIR: directory,
+      GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
+      GCT_CREDENTIAL_ENV_PATH: join(directory, '.env'),
+    });
+    const database = openDatabase(config.databasePath, config.migrationsDir);
+    const vault = new EnvFileCredentialVault(config.credentialEnvPath);
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, {
+      apiKey: 'new-account-api-key', apiSecret: 'new-account-api-secret',
+    });
+    database.prepare(`INSERT INTO credential_metadata
+      (id, label, provider, created_at, last_verified_at)
+      VALUES (?, 'Previous account', 'env_file', '2026-08-11T10:00:00.000Z', '2026-08-11T10:00:00.000Z')`)
+      .run(DEFAULT_CREDENTIAL_PROFILE);
+    database.prepare(`INSERT INTO live_balances
+      (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES ('KRAKEN', 'USD', '6.59', '6.59', '7.35', '0.76', '2026-08-11T10:00:00.000Z')`).run();
+    const gateway = new FakeCrossExGateway();
+    const publicMarketGateway = new FakePublicMarketGateway();
+    const tradingSession = new TradingSession();
+    const app = await buildApp({
+      config, database, credentialVault: vault, crossExGateway: gateway,
+      publicMarketGateway, tradingSession, startMarketStream: false, logger: false,
+    });
+    resources.push({ app, database, vault, gateway, publicMarketGateway, tradingSession, directory });
+
+    expect(database.prepare('SELECT COUNT(*) AS count FROM live_balances').get()).toEqual({ count: 0 });
+    expect((await app.inject({
+      method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' },
+    })).json().balances).toEqual([]);
   });
 
   it('preserves Chinese through credential setup, verification, and deletion', async () => {

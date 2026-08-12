@@ -1721,4 +1721,20 @@ describe('strategy engine', () => {
     await resumeTick;
     await resumed.stop();
   });
+
+  it('prevents persisted strategies from resuming after an account credential change', async () => {
+    const { engine, runtime, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig);
+
+    expect(engine.pauseRunningStrategiesForCredentialChange()).toBe(1);
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+    expect(engine.listActiveStrategyIds()).toEqual([]);
+    engine.activatePersistedStrategies();
+    expect(engine.listActiveStrategyIds()).toEqual([]);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy paused', condition: 'Account credentials changed' }),
+    ]));
+  });
 });

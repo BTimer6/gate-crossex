@@ -15,6 +15,8 @@ test.describe.serial('local trading terminal', () => {
 
     await expect(dialog).toBeHidden();
     await expect(page.getByRole('button', { name: 'Switch trading mode', exact: true })).toHaveText('Read-only');
+    await expect(page.locator('.nav-more > button')).toContainText('More');
+    await expect(page.locator('.nav-more > button')).not.toContainText('更多');
     await expect(page.getByText('Reference data', { exact: true })).toHaveCount(0);
     await expect(page.locator('.headline-price span')).toHaveCount(0);
 
@@ -46,8 +48,9 @@ test.describe.serial('local trading terminal', () => {
 
     await dialog.getByRole('button', { name: '中文', exact: true }).click();
     await expect(dialog.getByRole('heading', { name: '添加 Gate API 密钥' })).toBeVisible();
+    await expect(page.locator('.nav-more > button')).toContainText('更多');
     const popupPromise = page.waitForEvent('popup');
-    await dialog.getByRole('button', { name: /打开Gate API 密钥设置/ }).click();
+    await dialog.getByRole('button', { name: /打开 Gate API 密钥设置/ }).click();
     const credentialPage = await popupPromise;
     await expect(credentialPage).toHaveURL(/\/secure\/credentials\?intent=live-trading&lang=zh$/);
     await expect(credentialPage.locator('html')).toHaveAttribute('lang', 'zh-CN');
@@ -55,6 +58,7 @@ test.describe.serial('local trading terminal', () => {
     await expect(credentialPage.getByText(/您正在设置实盘交易/)).toBeVisible();
     await credentialPage.close();
     await dialog.getByRole('button', { name: 'EN', exact: true }).click();
+    await expect(page.locator('.nav-more > button')).toContainText('More');
 
     await page.route('**/api/onboarding/connection', async (route) => route.fulfill({ json: {
       configured: true,
@@ -63,6 +67,14 @@ test.describe.serial('local trading terminal', () => {
       lastVerifiedAt: '2030-01-01T00:00:00.000Z',
       secureEntryPath: '/secure/credentials',
       readOnly: true,
+      activeProfileId: 'gate-crossex-default',
+      profiles: [{
+        id: 'gate-crossex-default',
+        label: 'Gate CrossEx (.env)',
+        storage: 'env_file',
+        lastVerifiedAt: '2030-01-01T00:00:00.000Z',
+        active: true,
+      }],
     } }));
     await page.route('**/api/trading-mode', async (route) => {
       if (route.request().method() === 'POST') await route.fulfill({ json: { mode: 'live' } });

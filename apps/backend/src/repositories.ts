@@ -39,6 +39,41 @@ export function getCredentialMetadata(database: Database.Database, id: string): 
   };
 }
 
+export function listCredentialMetadata(database: Database.Database): CredentialMetadata[] {
+  const rows = database.prepare(`
+    SELECT id, label, provider, created_at, last_verified_at
+    FROM credential_metadata
+    ORDER BY created_at, label
+  `).all() as CredentialMetadataRow[];
+  return rows.map((row) => ({
+    id: row.id,
+    label: row.label,
+    provider: row.provider,
+    createdAt: row.created_at,
+    lastVerifiedAt: row.last_verified_at,
+  }));
+}
+
+/** Undefined means a pre-profile database with no selection; null means an explicit sign-out. */
+export function readActiveCredentialProfile(database: Database.Database): string | null | undefined {
+  const row = database.prepare(`
+    SELECT active_profile_id
+    FROM credential_session
+    WHERE singleton = 1
+  `).get() as { active_profile_id: string | null } | undefined;
+  return row ? row.active_profile_id : undefined;
+}
+
+export function saveActiveCredentialProfile(database: Database.Database, profileId: string | null): void {
+  database.prepare(`
+    INSERT INTO credential_session (singleton, active_profile_id, updated_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(singleton) DO UPDATE SET
+      active_profile_id = excluded.active_profile_id,
+      updated_at = excluded.updated_at
+  `).run(profileId, new Date().toISOString());
+}
+
 export function upsertCredentialMetadata(
   database: Database.Database,
   metadata: CredentialMetadata,

@@ -70,6 +70,14 @@ const DIALOG_FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
+function openCredentialWindow(path: string): void {
+  window.open(
+    path,
+    '_blank',
+    'popup=yes,noopener,noreferrer,width=720,height=820,resizable=yes,scrollbars=yes',
+  );
+}
+
 function useDialogFocus(open: boolean, onClose?: () => void) {
   const dialogRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -200,7 +208,7 @@ function TradingModeGate({ mode, onApplied, credentialEntryPath, onCredentialSta
 
   function openCredentialSetup() {
     const separator = credentialEntryPath.includes('?') ? '&' : '?';
-    window.open(`${credentialEntryPath}${separator}intent=live-trading&lang=${language}`, '_blank', 'noopener');
+    openCredentialWindow(`${credentialEntryPath}${separator}intent=live-trading&lang=${language}`);
   }
 
   async function finishCredentialSetup() {
@@ -686,6 +694,14 @@ function App() {
   }, [settingsOpen]);
 
   useEffect(() => {
+    const refreshConnectionAfterCredentialWindow = () => {
+      void api.connection().then(setConnection).catch(() => undefined);
+    };
+    window.addEventListener('focus', refreshConnectionAfterCredentialWindow);
+    return () => window.removeEventListener('focus', refreshConnectionAfterCredentialWindow);
+  }, []);
+
+  useEffect(() => {
     if (!settingsOpen && !notificationsOpen) return;
     const onPointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
@@ -897,7 +913,7 @@ function App() {
                 requestAnimationFrame(() => moreNavRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus());
               }
             }}>
-            <span aria-hidden="true">⋯</span>更多<svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
+            <span aria-hidden="true">⋯</span>{t('More')}<svg className="nav-caret" viewBox="0 0 8 5" aria-hidden="true"><path d="M1 1l3 3 3-3" /></svg>
           </button>
           {moreMenuAt && <ul className="nav-strategy-menu nav-more-menu" role="menu" aria-label={t('More tools')} style={moreMenuAt}>
             <li role="none"><button role="menuitem" className={workspace === 'Trading Fees' ? 'selected' : ''} onClick={() => {
@@ -968,8 +984,9 @@ function App() {
                 ? `${storageLabel} · ${connection.lastVerifiedAt ? `${t('Verified')} ${new Date(connection.lastVerifiedAt).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}` : t('Never verified')}`
                 : t('Credentials not configured')}</small>
               {connection?.readOnly && <small className="readonly-flag">{t('Read-only until enabled')}</small>}
+              {connection && connection.profiles.length > 1 && <small>{connection.profiles.length} {t('saved accounts')}</small>}
             </div>
-            <button className="settings-link" onClick={() => window.open(`/secure/credentials?lang=${language}`, '_blank', 'noopener')}>{t('Open secure credential setup')}<span>›</span></button>
+            <button className="settings-link" onClick={() => openCredentialWindow(`/secure/credentials?lang=${language}`)}>{t(connection?.profiles.length ? 'Manage and switch accounts' : 'Sign in with Gate API credentials')}<span>›</span></button>
             <button className="settings-link" onClick={() => window.open('/api/system/discovery', '_blank', 'noopener')}>API<span>›</span></button>
             <p className="settings-section">{t('Open source')}</p>
             <div className="settings-account">
