@@ -30,8 +30,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 19,
-      currentMigration: '0019_strategy_accounts.sql',
+      migrationCount: 20,
+      currentMigration: '0020_strategy_account_backfill.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -48,7 +48,59 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(19);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(20);
+    reopened.close();
+  });
+
+  it('attributes unowned pre-account strategies to the original default profile', () => {
+    const location = temporaryDatabasePath();
+    const migrationsDir = resolve(process.cwd(), '../../migrations');
+    const database = openDatabase(location.path, migrationsDir);
+    const now = '2026-01-01T00:00:00.000Z';
+    database.prepare(`
+      INSERT INTO credential_metadata (id, label, provider, created_at)
+      VALUES ('gate-crossex-default', 'Main', 'os_keychain', ?)
+    `).run(now);
+    const insertStrategy = database.prepare(`
+      INSERT INTO execution_strategies (
+        id, kind, environment, status, config_json, progress, filled_quantity,
+        credential_profile_id, credential_profile_label, created_at, updated_at, stopped_at
+      ) VALUES (?, 'position', 'live', 'STOPPED', '{}', 0, '0', ?, ?, ?, ?, ?)
+    `);
+    insertStrategy.run('strategy-legacy', null, null, now, now, now);
+    insertStrategy.run('strategy-owned', 'other-profile', 'Sub', now, now, now);
+    database.prepare("DELETE FROM schema_migrations WHERE id = '0020_strategy_account_backfill.sql'").run();
+    database.close();
+
+    const reopened = openDatabase(location.path, migrationsDir);
+    const rows = reopened.prepare(
+      'SELECT id, credential_profile_id, credential_profile_label FROM execution_strategies ORDER BY id',
+    ).all();
+    expect(rows).toEqual([
+      { id: 'strategy-legacy', credential_profile_id: 'gate-crossex-default', credential_profile_label: 'Main' },
+      { id: 'strategy-owned', credential_profile_id: 'other-profile', credential_profile_label: 'Sub' },
+    ]);
+    reopened.close();
+  });
+
+  it('leaves unowned strategies untouched when the default profile no longer exists', () => {
+    const location = temporaryDatabasePath();
+    const migrationsDir = resolve(process.cwd(), '../../migrations');
+    const database = openDatabase(location.path, migrationsDir);
+    const now = '2026-01-01T00:00:00.000Z';
+    database.prepare(`
+      INSERT INTO execution_strategies (
+        id, kind, environment, status, config_json, progress, filled_quantity, created_at, updated_at, stopped_at
+      ) VALUES ('strategy-orphan', 'position', 'live', 'STOPPED', '{}', 0, '0', ?, ?, ?)
+    `).run(now, now, now);
+    database.prepare("DELETE FROM schema_migrations WHERE id = '0020_strategy_account_backfill.sql'").run();
+    database.close();
+
+    const reopened = openDatabase(location.path, migrationsDir);
+    const row = reopened.prepare(
+      "SELECT credential_profile_id FROM execution_strategies WHERE id = 'strategy-orphan'",
+    ).get() as { credential_profile_id: string | null };
+    expect(row.credential_profile_id).toBeNull();
     reopened.close();
   });
 
@@ -91,7 +143,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0019_strategy_accounts.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0020_strategy_account_backfill.sql');
     database.close();
   });
 
