@@ -662,8 +662,8 @@ test.describe.serial('local trading terminal', () => {
 
     await expect(page).toHaveURL(/\/strategies\/paired-position$/);
     await expect(page.getByRole('combobox', { name: 'Search asset' })).toHaveAttribute('placeholder', 'HYPEUSDC ↔ HYPEUSDT');
-    await expect(page.getByRole('combobox', { name: 'Exchange A' })).toHaveValue('hyperliquid');
-    await expect(page.getByRole('combobox', { name: 'Exchange B' })).toHaveValue('bybit');
+    await expect(page.getByRole('button', { name: 'Exchange A: Hyperliquid' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Exchange B: Bybit' })).toBeVisible();
     await expect(page.getByLabel('Per-order quantity')).toHaveValue('');
     await expect(page.getByLabel('Per-order quantity')).toHaveAttribute('placeholder', 'e.g. 0.10');
     await expect(page.getByLabel('Total amount')).toHaveValue('');

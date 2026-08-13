@@ -21,6 +21,7 @@ import {
 } from './api.js';
 import type { FundingChartSeries } from './charts.js';
 import { cumulativeFundingHistory, cumulativeFundingPnl, realizedFundingEdgeWindows } from './cumulative-funding-history.js';
+import { VenueSelect } from './venue-select.js';
 import { fundingPercentScaledTo8h } from './funding-rates.js';
 import { marketSymbol } from './market-symbol.js';
 import { usePairCandleHistory } from './pair-candle-history.js';
@@ -34,7 +35,6 @@ import {
   FUNDING_VENUE_COLORS,
   PAIR_HISTORY_RANGES,
   VenueCell,
-  VenueIcon,
   assessMarginCapacity,
   balanceFor,
   balanceUnitFor,
@@ -842,8 +842,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           <div className="strategy-legs">
             <div className="strategy-leg sell-leg">
               <div className="leg-top">
-                <VenueIcon id={leftExchange.id} short={leftExchange.short} />
-                <label><small>{t('Exchange A')}</small><select value={leftExchangeId} onChange={(event) => setLeftExchangeId(event.target.value)}>{exchanges.map((venue) => <option key={venue.id} value={venue.id} disabled={venue.id === rightExchangeId}>{venue.name}</option>)}</select></label>
+                <VenueSelect
+                  label={t('Exchange A')}
+                  menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
+                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === rightExchangeId, detail: marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
+                  value={leftExchangeId}
+                  onSelect={setLeftExchangeId}
+                />
                 <em>{t(leftSide)} <span>{leftTicker}</span></em>
               </div>
               <dl>
@@ -860,8 +865,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             </div>
             <div className="strategy-leg buy-leg">
               <div className="leg-top">
-                <VenueIcon id={rightExchange.id} short={rightExchange.short} />
-                <label><small>{t('Exchange B')}</small><select value={rightExchangeId} onChange={(event) => setRightExchangeId(event.target.value)}>{exchanges.map((venue) => <option key={venue.id} value={venue.id} disabled={venue.id === leftExchangeId}>{venue.name}</option>)}</select></label>
+                <VenueSelect
+                  label={t('Exchange B')}
+                  menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
+                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === leftExchangeId, detail: marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
+                  value={rightExchangeId}
+                  onSelect={setRightExchangeId}
+                />
                 <em>{t(rightSide)} <span>{rightTicker}</span></em>
               </div>
               <dl>
@@ -1576,7 +1586,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         <article className="strategy-panel terminal-panel">
           <header className="strategy-panel-head"><div><p className="eyebrow">{t('Market & venues')}</p></div><div className="premium-pair-badge"><strong>{ADR_ASSET} / {ADR_HEDGE_ASSET}</strong><small>1 {ADR_HEDGE_ASSET} = {adrRatio || '—'} {ADR_ASSET}</small></div></header>
           <div className="strategy-legs">
-            <div className="strategy-leg sell-leg"><div className="leg-top"><VenueIcon id={adrExchange.id} short={adrExchange.short} /><label><select aria-label={`${ADR_ASSET} ${t('Exchange')}`} value={adrVenueId} onChange={(event) => setAdrVenueId(event.target.value)}>{adrVenues.map((venueEntry) => <option key={venueEntry.id} value={venueEntry.id}>{venueEntry.name}</option>)}</select></label><em>{t(adrSide)} {ADR_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(adrPrice)}</dd></div><div><dt>{t('Fair ADR value')}</dt><dd>{priceText(fairValue)}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{adrBalance ? `${Number(adrBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${adrBalanceUnit}` : '—'}</dd></div></dl></div>
+            <div className="strategy-leg sell-leg"><div className="leg-top"><VenueSelect label={t('ADR leg')} menuSubtitle={`${ADR_ASSET} ${t('Perpetual').toLowerCase()}`} options={adrVenues.map((venueEntry) => ({ ...venueEntry, detail: marketSymbol(ADR_ASSET, quoteFor(venueEntry.id), 'perpetual') }))} value={adrVenueId} onSelect={setAdrVenueId} /><em>{t(adrSide)} {ADR_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(adrPrice)}</dd></div><div><dt>{t('Fair ADR value')}</dt><dd>{priceText(fairValue)}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{adrBalance ? `${Number(adrBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${adrBalanceUnit}` : '—'}</dd></div></dl></div>
             <div className="leg-spread">
               <span>{t('ADR premium')}</span>
               <strong className={premiumNow !== null && premiumNow >= 0 ? 'positive' : 'negative'}>{premiumNow !== null ? `${premiumNow >= 0 ? '+' : ''}${premiumNow.toFixed(2)}%` : '—'}</strong>
@@ -1588,7 +1598,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
               <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
               <small>{t('Switch direction')}</small>
             </div>
-            <div className="strategy-leg buy-leg"><div className="leg-top"><VenueIcon id={hedgeExchange.id} short={hedgeExchange.short} /><label><select aria-label={`${ADR_HEDGE_ASSET} ${t('Exchange')}`} value={hedgeVenueId} onChange={(event) => setHedgeVenueId(event.target.value)}>{hedgeVenues.map((venueEntry) => <option key={venueEntry.id} value={venueEntry.id}>{venueEntry.name}</option>)}</select></label><em>{t(hedgeSide)} {ADR_HEDGE_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(hedgePrice)}</dd></div><div><dt>{t('Hedge per order')}</dt><dd>{hedgePerOrderText ?? '—'}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{hedgeBalance ? `${Number(hedgeBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${hedgeBalanceUnit}` : '—'}</dd></div></dl></div>
+            <div className="strategy-leg buy-leg"><div className="leg-top"><VenueSelect label={t('Hedge leg')} menuSubtitle={`${ADR_HEDGE_ASSET} ${t('Perpetual').toLowerCase()}`} options={hedgeVenues.map((venueEntry) => ({ ...venueEntry, detail: marketSymbol(ADR_HEDGE_ASSET, quoteFor(venueEntry.id), 'perpetual') }))} value={hedgeVenueId} onSelect={setHedgeVenueId} /><em>{t(hedgeSide)} {ADR_HEDGE_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(hedgePrice)}</dd></div><div><dt>{t('Hedge per order')}</dt><dd>{hedgePerOrderText ?? '—'}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{hedgeBalance ? `${Number(hedgeBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${hedgeBalanceUnit}` : '—'}</dd></div></dl></div>
           </div>
           {!livePair && <div className="premium-data-hint"><span>ⓘ</span><p>{livePairWaitMessage}</p></div>}
         </article>

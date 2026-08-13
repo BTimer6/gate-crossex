@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { contiguousCandleTail, type CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
@@ -22,6 +22,7 @@ import {
   type VenueFeeRate,
 } from './api.js';
 import { MarketSelect } from './market-select.js';
+import { VenueSelect } from './venue-select.js';
 import { marketSymbol } from './market-symbol.js';
 import { compactPrice, decimalPlaces, formatBookAmount, formatGroupStep, fullBookAmount } from './number-format.js';
 import {
@@ -31,7 +32,6 @@ import {
   OPEN_ORDER_STATES,
   TIMEFRAMES,
   VenueCell,
-  VenueIcon,
   assetIcon,
   assetName,
   balanceFor,
@@ -267,8 +267,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [skipFutureConfirmations, setSkipFutureConfirmations] = useState(false);
   const [exchangeId, setExchangeId] = useState('gate');
   const [pendingExchangeId, setPendingExchangeId] = useState<string | null>(null);
-  const [venueMenuOpen, setVenueMenuOpen] = useState(false);
-  const [venueHighlight, setVenueHighlight] = useState(0);
   const [reduceOnly, setReduceOnly] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [chartTab, setChartTab] = useState<'chart' | 'overview'>('chart');
@@ -286,10 +284,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [leverageUpdating, setLeverageUpdating] = useState(false);
   const [leverageError, setLeverageError] = useState<string | null>(null);
   const leverageRef = useRef<HTMLDivElement | null>(null);
-  const venueRootRef = useRef<HTMLDivElement | null>(null);
-  const venueTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const venueItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const venueMenuId = useId();
   const exchangeLoadRef = useRef(0);
   const historyLoadingRef = useRef<Set<string>>(new Set());
   const historyExhaustedRef = useRef<Set<string>>(new Set());
@@ -412,71 +406,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const venueIsAvailable = (venueId: string) =>
     catalogAsset === null || catalogAsset.venues.some((entry) => entry.venue === venueId.toUpperCase());
 
-  const enabledVenueIndexes = () => exchanges
-    .map((item, index) => venueIsAvailable(item.id) ? index : -1)
-    .filter((index) => index >= 0);
-
-  const focusVenue = (index: number) => {
-    setVenueHighlight(index);
-    requestAnimationFrame(() => venueItemRefs.current[index]?.focus());
-  };
-
-  const openVenueMenuFromKeyboard = (direction: 1 | -1) => {
-    const enabled = enabledVenueIndexes();
-    if (enabled.length === 0) return;
-    const selectedIndex = exchanges.findIndex((item) => item.id === exchangeId);
-    const selectedPosition = enabled.indexOf(selectedIndex);
-    const targetPosition = selectedPosition >= 0
-      ? (selectedPosition + (direction > 0 ? 0 : enabled.length - 1)) % enabled.length
-      : direction > 0 ? 0 : enabled.length - 1;
-    setVenueMenuOpen(true);
-    focusVenue(enabled[targetPosition]);
-  };
-
-  const chooseVenue = (nextExchangeId: string) => {
-    setVenueMenuOpen(false);
-    if (nextExchangeId !== exchangeId) selectExchange(nextExchangeId);
-    requestAnimationFrame(() => venueTriggerRef.current?.focus());
-  };
-
-  const onVenueTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-    event.preventDefault();
-    openVenueMenuFromKeyboard(event.key === 'ArrowDown' ? 1 : -1);
-  };
-
-  const onVenueMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    const enabled = enabledVenueIndexes();
-    if (enabled.length === 0) return;
-    const currentPosition = Math.max(0, enabled.indexOf(venueHighlight));
-    let targetPosition: number | null = null;
-    if (event.key === 'ArrowDown') targetPosition = (currentPosition + 1) % enabled.length;
-    else if (event.key === 'ArrowUp') targetPosition = (currentPosition - 1 + enabled.length) % enabled.length;
-    else if (event.key === 'Home') targetPosition = 0;
-    else if (event.key === 'End') targetPosition = enabled.length - 1;
-    if (targetPosition === null) return;
-    event.preventDefault();
-    focusVenue(enabled[targetPosition]);
-  };
-
-  useEffect(() => {
-    if (!venueMenuOpen) return;
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      if (venueRootRef.current && !venueRootRef.current.contains(event.target as Node)) setVenueMenuOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      setVenueMenuOpen(false);
-      venueTriggerRef.current?.focus();
-    };
-    document.addEventListener('mousedown', closeOnOutsideClick);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('mousedown', closeOnOutsideClick);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [venueMenuOpen]);
 
   useEffect(() => {
     // A pending venue page belongs to the asset and timeframe it was requested for. Invalidate it
@@ -727,46 +656,18 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   return <>
     <section className="market-header">
       <div className="pair-title"><MarketSelect asset={asset} label={marketSymbol(asset, quote, 'perpetual')} venue={exchangeId.toUpperCase()} subtitle={`${assetName(asset)} ${t('Perpetual').toLowerCase()}`} icon={assetIcon(asset)} catalog={catalog} marketSnapshot={marketSnapshot} favorites={favorites} assetName={assetName} assetIcon={assetIcon} onSelect={onSelectAsset} t={t} /></div>
-      <div className="exchange-control" ref={venueRootRef}
-        onBlur={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setVenueMenuOpen(false);
-        }}>
-        <button ref={venueTriggerRef} className={`exchange-selector${venueMenuOpen ? ' open' : ''}`}
-          onClick={() => {
-            setVenueHighlight(Math.max(0, exchanges.findIndex((item) => item.id === exchangeId)));
-            setVenueMenuOpen((current) => !current);
-          }} onKeyDown={onVenueTriggerKeyDown}
-          aria-label={`${t('Execution venue')}: ${exchange.name}`} aria-haspopup="menu" aria-expanded={venueMenuOpen}
-          aria-controls={venueMenuOpen ? venueMenuId : undefined}>
-          <VenueIcon id={exchange.id} short={exchange.short} />
-          <span className="exchange-details">
-            <small>{t('Execution venue')}</small>
-            <span className="exchange-summary">
-              <strong>{exchange.name}</strong>
-              <span className="venue-health"><i />{pendingExchangeId ? t('Loading chart…') : liveMarket?.source === 'gate_crossex_websocket' ? t('Connected') : 'SEED'}</span>
-            </span>
-          </span>
-          <span className="exchange-chevron" aria-hidden="true">⌄</span>
-        </button>
-        {venueMenuOpen && <div id={venueMenuId} className="exchange-menu" role="menu" aria-label={t('Execution venue')}
-          onKeyDown={onVenueMenuKeyDown}>
-          <header><span>{t('Execution venue')}</span><small>{asset} {t('Perpetual').toLowerCase()}</small></header>
-          <div className="exchange-menu-list">
-            {exchanges.map((item, index) => {
-              const available = venueIsAvailable(item.id);
-              const selected = item.id === exchangeId;
-              return <button key={item.id} ref={(node) => { venueItemRefs.current[index] = node; }}
-                className={`${selected ? 'selected' : ''}${index === venueHighlight ? ' highlighted' : ''}`}
-                role="menuitemradio" aria-checked={selected} disabled={!available} tabIndex={index === venueHighlight ? 0 : -1}
-                onMouseEnter={() => { if (available) setVenueHighlight(index); }} onClick={() => chooseVenue(item.id)}>
-                <VenueIcon id={item.id} short={item.short} />
-                <span><strong>{item.name}</strong><small>{marketSymbol(asset, catalogAsset?.venues.find((venue) => venue.venue === item.id.toUpperCase())?.quote ?? quoteFor(item.id), 'perpetual')}</small></span>
-                {selected && <i className="exchange-check" aria-hidden="true">✓</i>}
-              </button>;
-            })}
-          </div>
-        </div>}
-      </div>
+      <VenueSelect
+        label={t('Execution venue')}
+        menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
+        status={<span className="venue-health"><i />{pendingExchangeId ? t('Loading chart…') : liveMarket?.source === 'gate_crossex_websocket' ? t('Connected') : 'SEED'}</span>}
+        options={exchanges.map((item) => ({
+          ...item,
+          disabled: !venueIsAvailable(item.id),
+          detail: marketSymbol(asset, catalogAsset?.venues.find((venue) => venue.venue === item.id.toUpperCase())?.quote ?? quoteFor(item.id), 'perpetual'),
+        }))}
+        value={exchangeId}
+        onSelect={selectExchange}
+      />
       <div className="headline-price"><strong>{priceText(displayedPrice)}</strong></div>
       <dl className="market-stats">
         <div><dt>{t('Best bid')}</dt><dd>{priceText(Number(liveMarket?.bidPrice ?? displayedPrice))}</dd></div><div><dt>{t('24h high')}</dt><dd>{priceText(Number(liveMarket?.high24h ?? displayedPrice))}</dd></div><div><dt>{t('24h low')}</dt><dd>{priceText(Number(liveMarket?.low24h ?? displayedPrice))}</dd></div><div><dt>{t('24h volume')}</dt><dd>{liveMarket?.quoteVolume24h ? `$${(Number(liveMarket.quoteVolume24h) / 1_000_000).toFixed(1)}M` : '—'}</dd></div><div><dt>{t('Funding / Interval')}</dt><dd><span className={Number(liveMarket?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</span> · <FundingCountdown target={nextFundingAt} /></dd></div>
