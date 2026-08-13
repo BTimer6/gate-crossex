@@ -248,6 +248,11 @@ export class CrossExMarketHub {
     return this.state;
   }
 
+  /** Registered market count without building the sorted snapshot. */
+  marketCount(): number {
+    return this.markets.size;
+  }
+
   market(symbol: string): LiveMarket | null {
     if (this.dynamicMarkets.has(symbol)) this.dynamicMarkets.set(symbol, Date.now());
     return this.markets.get(symbol) ?? null;
@@ -535,12 +540,19 @@ export class CrossExMarketHub {
       .some((key) => key.endsWith(`:${symbol}`));
   }
 
-  /** Handle one upstream frame and report whether it was a recognized market-data update. */
+  /**
+   * Handle one upstream frame and report whether it was a recognized market-data update.
+   * Frames arrive continuously for every subscribed symbol, so the channel/event fields are
+   * inspected first and exactly one schema runs per frame instead of trying each in sequence.
+   */
   private handleMessage(raw: string, receivedAt: number): boolean {
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { return false; }
-    const subscriptionFailure = SubscriptionFailureSchema.safeParse(payload);
-    if (subscriptionFailure.success) {
+    if (typeof payload !== 'object' || payload === null) return false;
+    const frame = payload as { channel?: unknown; event?: unknown };
+    if (frame.event === 'subscribe') {
+      const subscriptionFailure = SubscriptionFailureSchema.safeParse(payload);
+      if (!subscriptionFailure.success) return false;
       const channel = subscriptionFailure.data.channel;
       const symbols = this.subscriptions.get(channel);
       const invalidFound = invalidSymbolsFromMessage(subscriptionFailure.data.error.message);
@@ -557,8 +569,10 @@ export class CrossExMarketHub {
       }
       return false;
     }
-    const ticker = TickerPushSchema.safeParse(payload);
-    if (ticker.success) {
+    if (frame.event !== 'update' || typeof frame.channel !== 'string') return false;
+    if (frame.channel === 'ticker') {
+      const ticker = TickerPushSchema.safeParse(payload);
+      if (!ticker.success) return false;
       const current = this.markets.get(ticker.data.result.s);
       if (!current) return true;
       const value = ticker.data.result;
@@ -578,30 +592,35 @@ export class CrossExMarketHub {
     // The ticker's `updatedAt`, `receivedAt`, and `source` are the strategy engine's evidence that
     // bid/ask came from the exchange recently and arrived promptly. Funding and open-interest
     // pushes must never refresh them, or seed, stale, or delayed prices could pass that gate.
-    const funding = FundingPushSchema.safeParse(payload);
-    if (funding.success) {
+    if (frame.channel === 'funding_rate') {
+      const funding = FundingPushSchema.safeParse(payload);
+      if (!funding.success) return false;
       const current = this.markets.get(funding.data.result.s);
       if (current) this.publish({ ...current, fundingRate: funding.data.result.r, nextFundingAt: new Date(funding.data.result.T).toISOString() });
       return true;
     }
-    const interest = OpenInterestPushSchema.safeParse(payload);
-    if (interest.success) {
+    if (frame.channel === 'open_interest') {
+      const interest = OpenInterestPushSchema.safeParse(payload);
+      if (!interest.success) return false;
       const current = this.markets.get(interest.data.result.s);
       if (current) this.publish({ ...current, openInterest: interest.data.result.oi, openInterestValue: interest.data.result.oiV ?? current.openInterestValue });
       return true;
     }
-    const bookUpdate = OrderBookUpdatePushSchema.safeParse(payload);
-    if (bookUpdate.success) {
+    if (frame.channel === 'order_book_update') {
+      const bookUpdate = OrderBookUpdatePushSchema.safeParse(payload);
+      if (!bookUpdate.success) return false;
       this.applyBookUpdate(bookUpdate.data.result);
       return true;
     }
-    const trade = TradePushSchema.safeParse(payload);
-    if (trade.success) {
+    if (frame.channel === 'trade') {
+      const trade = TradePushSchema.safeParse(payload);
+      if (!trade.success) return false;
       this.applyTrade(trade.data.result);
       return true;
     }
-    const kline = KlinePushSchema.safeParse(payload);
-    if (kline.success) {
+    if (frame.channel.startsWith('kline_')) {
+      const kline = KlinePushSchema.safeParse(payload);
+      if (!kline.success) return false;
       const interval = kline.data.channel.slice('kline_'.length) as CandleInterval;
       this.applyKline(interval, kline.data.result);
       return true;

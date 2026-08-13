@@ -246,6 +246,22 @@ async function request<T>(schema: RuntimeSchema<T>, path: string, init?: Request
   return pending;
 }
 
+/**
+ * Reuse a successful read for `ttlMs` so route mounts stop re-downloading and re-validating
+ * large, slow-moving payloads. Failures are never cached, and concurrent callers share the
+ * in-flight request via the read coalescing above.
+ */
+function cachedRead<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> {
+  let cached: { value: T; at: number } | null = null;
+  return () => {
+    if (cached && Date.now() - cached.at < ttlMs) return Promise.resolve(cached.value);
+    return load().then((value) => {
+      cached = { value, at: Date.now() };
+      return value;
+    });
+  };
+}
+
 export const api = {
   markets: () => request(MarketSnapshotSchema, '/api/markets'),
   borosStrategies: () => request(BorosStrategiesResponseSchema, '/api/boros/strategies'),
@@ -385,7 +401,9 @@ export const api = {
       headers: { 'x-gct-trading-intent': 'set-trading-mode' },
       body: JSON.stringify({ mode, acceptDisclaimer }),
     }),
-  instruments: () => request(InstrumentsResponseSchema, '/api/crossex/instruments'),
+  // The instrument catalog is thousands of rows and changes on the backend's 5-minute cadence;
+  // reusing it across route mounts avoids a large download + schema validation per tab switch.
+  instruments: cachedRead(5 * 60_000, () => request(InstrumentsResponseSchema, '/api/crossex/instruments')),
   riskLimits: (symbol: string) =>
     request(CrossExRiskLimitResponseSchema, `/api/crossex/instruments/${encodeURIComponent(symbol)}/risk-limits`),
   preferences: () => request(UserPreferencesResponseSchema, '/api/preferences'),

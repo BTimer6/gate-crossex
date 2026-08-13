@@ -46,6 +46,8 @@ const RELEASE_VERSION = `v${import.meta.env.VITE_APP_VERSION}`;
 type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
 type NavigationLabel = Workspace | 'Boros by Pendle';
 type StrategyKind = StrategyRouteKind;
+/** Matches the backend's market-catalog freshness window; switches inside it reuse client state. */
+const CATALOG_CLIENT_REFRESH_MS = 5 * 60_000;
 type FundingHistoryDuration = 1 | 7 | 30;
 type FundingHistoryCache = Record<FundingHistoryDuration, Record<string, FundingHistoryEntry>>;
 
@@ -321,6 +323,18 @@ function symbolParts(symbol: string) {
   return { venue: parts[0] ?? '', asset: parts[2] ?? symbol, quote: parts[3] ?? 'USDT' };
 }
 
+/** Isolated so the once-per-second tick re-renders only this span, never the whole app shell. */
+function UtcClock() {
+  const [clock, setClock] = useState('');
+  useEffect(() => {
+    const update = () => setClock(new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }));
+    update();
+    const timer = window.setInterval(update, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <span>UTC {clock}</span>;
+}
+
 function fallbackCatalogFromSnapshot(snapshot: MarketSnapshot | null): MarketCatalogAsset[] | null {
   if (!snapshot) return null;
   const byAsset = new Map<string, MarketCatalogAsset>();
@@ -497,7 +511,6 @@ function App() {
   const [notificationsSeenAt, setNotificationsSeenAt] = useState(() => window.localStorage.getItem('crossex-notifications-seen') ?? new Date(0).toISOString());
   const [favorites, setFavorites] = useState<string[]>(() => parseStoredFavorites(window.localStorage.getItem('crossex-favorites')));
   const [confirmOrders, setConfirmOrders] = useState(() => window.localStorage.getItem('crossex-confirm-orders') !== 'off');
-  const [clock, setClock] = useState('');
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
   const [tradingSnapshot, setTradingSnapshot] = useState<TradingSnapshot | null>(null);
   const [authenticatedPortfolio, setAuthenticatedPortfolio] = useState<AuthenticatedPortfolioSnapshot | null>(null);
@@ -539,6 +552,10 @@ function App() {
   // Until the boot fetch lands, the persistence effects must not push this browser's cached
   // values back over the server's, so writes stay disabled until then.
   const preferencesReadyRef = useRef(false);
+  const catalogFetchedAtRef = useRef(0);
+  const feesLoadedRef = useRef(false);
+  const tradingSnapshotRef = useRef<TradingSnapshot | null>(null);
+  tradingSnapshotRef.current = tradingSnapshot;
   const t = useMemo(() => (key: string) => translate(language, key), [language]);
   const markBackendUnavailable = useCallback(() => {
     setBackendUnavailableSince((current) => current ?? Date.now());
@@ -653,7 +670,10 @@ function App() {
     setFeesReady(false);
     setFeesError(null);
     void api.fees()
-      .then((response) => setFees(response.fees))
+      .then((response) => {
+        feesLoadedRef.current = true;
+        setFees(response.fees);
+      })
       .catch((error: unknown) => {
         setFeesError(error instanceof ApiError ? error.code : 'fee_rates_unavailable');
         reportBackendConnectivityError(error);
@@ -714,26 +734,25 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const update = () => setClock(new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }));
-    update();
-    const timer = window.setInterval(update, 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
     void api.tradingMode().then((response) => setTradingMode(response.mode)).catch(reportBackendConnectivityError);
   }, [reportBackendConnectivityError]);
 
   useEffect(() => {
     if (workspace === 'Funding Rates') return;
+    // The terminal stream keeps the trading snapshot and strategy list current while connected,
+    // and the catalog/fee payloads move on multi-minute backend cadences, so workspace switches
+    // refetch only what is missing or stale instead of re-requesting everything per navigation.
     if (workspace === 'Trade' || workspace === 'Strategy' || workspace === 'Trading Fees') {
-      void api.marketCatalog().then((response) => setCatalog(response.assets)).catch(reportBackendConnectivityError);
+      if (Date.now() - catalogFetchedAtRef.current > CATALOG_CLIENT_REFRESH_MS) {
+        void api.marketCatalog().then((response) => {
+          catalogFetchedAtRef.current = Date.now();
+          setCatalog(response.assets);
+        }).catch(reportBackendConnectivityError);
+      }
+      if (!feesLoadedRef.current) refreshFees();
     }
-    void refreshTrading().catch(reportBackendConnectivityError);
-    if (workspace === 'Strategy') void refreshStrategies().catch(reportBackendConnectivityError);
-    if (workspace !== 'Trade' && workspace !== 'Strategy' && workspace !== 'Trading Fees') return;
-    refreshFees();
-  }, [workspace, refreshTrading, refreshStrategies, refreshFees, reportBackendConnectivityError]);
+    if (tradingSnapshotRef.current === null) void refreshTrading().catch(reportBackendConnectivityError);
+  }, [workspace, refreshTrading, refreshFees, reportBackendConnectivityError]);
 
   const terminalStreamEnabled = workspace !== 'Funding Rates';
   useEffect(() => {
@@ -1094,6 +1113,8 @@ function App() {
   }, [accountNameDraft, applyAccountConnection, connection?.activeProfileId, connection?.label, reportBackendConnectivityError]);
 
   useEffect(() => {
+    // Fee schedules are account-scoped; the next fee-consuming workspace visit refetches them.
+    feesLoadedRef.current = false;
     setEditingAccountName(false);
     setAccountRenameError(null);
   }, [connection?.activeProfileId]);
@@ -1337,7 +1358,7 @@ function App() {
         {content}
       </Suspense>
     </main>
-    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><span>UTC {clock}</span><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span></div></footer>
+    <footer className="statusbar"><div>{terminalStreamEnabled ? <><span className={streamState === 'connected' ? 'connected' : ''}><i /> {t(streamState === 'connected' ? 'Backend stream connected' : 'Reconnecting backend stream')}</span><span>LIVE {t('environment')}</span><span className={marketSnapshot?.connectionState === 'healthy' ? 'connected' : ''}><i /> {t('Market data')} {marketSnapshot?.connectionState ?? 'connecting'}</span><span className={accountStatusConnected ? 'connected' : ''}><i /> {accountStatusLabel}</span></> : <span className={fundingOverview ? 'connected' : ''}><i /> {t('Funding Rates')}</span>}</div><div><UtcClock /><button onClick={() => window.open(`${SOURCE_CODE_URL}/issues`, '_blank', 'noopener')}>{t('Support')}</button><button onClick={() => window.open(SOURCE_CODE_URL, '_blank', 'noopener')}>{t('Source code')}</button><button onClick={() => window.open(LICENSE_URL, '_blank', 'noopener')}>AGPL-3.0</button><span title={`Release ${RELEASE_VERSION}`}>{RELEASE_VERSION}</span></div></footer>
     <AccountManagerDialog
       open={accountManagerOpen}
       connection={connection}

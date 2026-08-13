@@ -78,17 +78,24 @@ export function MarketSelect({ asset, label, venue, subtitle, icon, catalog, mar
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
   const listId = useId();
+  const overviewRequestedRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   useEffect(() => {
-    if (!showMarketStats) return undefined;
     // The live CrossEx socket is intentionally bounded and cannot cover the full catalog. Its
     // all-venue REST sweep supplies prices for catalog-only rows and is cached by the backend.
-    let cancelled = false;
+    // The sweep is only worth requesting once the dropdown is actually opened — fetching it on
+    // mount made every trading-page visit pay for a payload most sessions never look at.
+    if (!open || !showMarketStats || overviewRequestedRef.current) return;
+    overviewRequestedRef.current = true;
     void api.fundingOverview().then((response) => {
-      if (!cancelled) setBulkOverview(response);
-    }).catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [showMarketStats]);
+      if (mountedRef.current) setBulkOverview(response);
+    }).catch(() => {
+      // Allow the next open to retry after a failed sweep.
+      if (mountedRef.current) overviewRequestedRef.current = false;
+    });
+  }, [open, showMarketStats]);
 
   useEffect(() => {
     if (!open) return;

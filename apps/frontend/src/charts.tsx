@@ -40,6 +40,7 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
   const onLoadMoreRef = useRef(onLoadMore);
   const shownKeyRef = useRef<string | null>(null);
   const precisionRef = useRef<number | null>(null);
+  const renderedRef = useRef<{ key: string; theme: ChartTheme; candles: Candle[] } | null>(null);
   onHoverRef.current = onHover;
   onLoadMoreRef.current = onLoadMore;
 
@@ -100,16 +101,52 @@ export function CandleChart({ candles, interval, seriesKey, theme, locale, place
     const volumeSeries = volumeSeriesRef.current;
     if (!chart || !priceSeries || !volumeSeries) return;
     const palette = PALETTES[theme];
-    candleByTimeRef.current = new Map(candles.map((candle) => [Math.floor(candle.startTime / 1000), candle]));
-    priceSeries.setData(candles.map((candle) => ({
-      time: Math.floor(candle.startTime / 1000) as UTCTimestamp,
-      open: Number(candle.open), high: Number(candle.high), low: Number(candle.low), close: Number(candle.close),
-    })));
-    volumeSeries.setData(candles.map((candle) => ({
-      time: Math.floor(candle.startTime / 1000) as UTCTimestamp,
-      value: Number(candle.volume) || 0,
-      color: Number(candle.close) >= Number(candle.open) ? palette.volumeUp : palette.volumeDown,
-    })));
+    // Live ticks arrive several times a second and only ever revise or append the final candle
+    // (state updates preserve the identity of untouched candle objects). Feed those through the
+    // chart's incremental update path; rebuilding the full series is reserved for a new
+    // symbol/timeframe, history prepends, snapshot replacements, or a theme change (per-bar
+    // volume colors bake in the palette).
+    const previous = renderedRef.current;
+    let incremental = previous !== null
+      && previous.key === seriesKey
+      && previous.theme === theme
+      && previous.candles.length > 0
+      && candles.length >= previous.candles.length
+      && candles.length - previous.candles.length <= 1;
+    if (incremental && previous) {
+      for (let index = 0; index < candles.length - 1; index += 1) {
+        if (candles[index] !== previous.candles[index]) {
+          incremental = false;
+          break;
+        }
+      }
+    }
+    if (incremental) {
+      const candle = candles[candles.length - 1];
+      const time = Math.floor(candle.startTime / 1000) as UTCTimestamp;
+      candleByTimeRef.current.set(time, candle);
+      priceSeries.update({
+        time,
+        open: Number(candle.open), high: Number(candle.high), low: Number(candle.low), close: Number(candle.close),
+      });
+      volumeSeries.update({
+        time,
+        value: Number(candle.volume) || 0,
+        color: Number(candle.close) >= Number(candle.open) ? palette.volumeUp : palette.volumeDown,
+      });
+    } else {
+      candleByTimeRef.current = new Map(candles.map((candle) => [Math.floor(candle.startTime / 1000), candle]));
+      priceSeries.setData(candles.map((candle) => ({
+        time: Math.floor(candle.startTime / 1000) as UTCTimestamp,
+        open: Number(candle.open), high: Number(candle.high), low: Number(candle.low), close: Number(candle.close),
+      })));
+      volumeSeries.setData(candles.map((candle) => ({
+        time: Math.floor(candle.startTime / 1000) as UTCTimestamp,
+        value: Number(candle.volume) || 0,
+        color: Number(candle.close) >= Number(candle.open) ? palette.volumeUp : palette.volumeDown,
+      })));
+    }
+    renderedRef.current = { key: seriesKey, theme, candles };
     const lastClose = candles.length ? Number(candles[candles.length - 1].close) : 0;
     const precision = lastClose >= 1000 ? 1 : lastClose >= 1 ? 2 : 6;
     if (precisionRef.current !== precision && lastClose > 0) {

@@ -1021,13 +1021,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   app.get('/health', async (): Promise<HealthResponse> => {
     const databaseStatus = readDatabaseStatus(database);
+    const marketConnectionState = marketHub.connectionState();
     return {
       ok: databaseStatus.state === 'ok',
       version: process.env.npm_package_version ?? '0.1.0',
       environment: 'live',
       database: databaseStatus.state,
       apiDocsRetrievedAt: API_DOCS_RETRIEVED_AT,
-      connectionState: databaseStatus.state === 'ok' ? marketHub.snapshot().connectionState === 'disconnected' ? 'healthy' : marketHub.snapshot().connectionState : 'degraded',
+      connectionState: databaseStatus.state === 'ok' ? marketConnectionState === 'disconnected' ? 'healthy' : marketConnectionState : 'degraded',
     };
   });
 
@@ -1984,7 +1985,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/markets/size-units', async (request) => {
     const cached = sizeUnitCache;
     // A dynamically registered market invalidates the cache (count changes) so its symbols get mapped.
-    if (cached && cached.complete && cached.marketCount === marketHub.snapshot().markets.length
+    if (cached && cached.complete && cached.marketCount === marketHub.marketCount()
       && Date.now() - Date.parse(cached.fetchedAt) < MARKET_REFERENCE_CACHE_MS) {
       return { units: cached.units, fetchedAt: cached.fetchedAt };
     }

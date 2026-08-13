@@ -274,7 +274,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [chartTab, setChartTab] = useState<'chart' | 'overview'>('chart');
   const [hoveredCandle, setHoveredCandle] = useState<Candle | null>(null);
   const [readyCandleKey, setReadyCandleKey] = useState<string | null>(null);
-  const [clock, setClock] = useState(() => Date.now());
   const [instrumentCatalog, setInstrumentCatalog] = useState<CrossExInstrument[] | null>(null);
   const [officialFundingSnapshot, setOfficialFundingSnapshot] = useState<PublicMarketSnapshot | null>(null);
   const [sizeUnits, setSizeUnits] = useState<Record<string, string> | null>(null);
@@ -622,11 +621,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   }, [candles, candleKey, symbol, interval, seedCandles]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
     setMaxLeverage(null);
     setRiskTiers(null);
@@ -775,7 +769,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
       </div>
       <div className="headline-price"><strong>{priceText(displayedPrice)}</strong></div>
       <dl className="market-stats">
-        <div><dt>{t('Best bid')}</dt><dd>{priceText(Number(liveMarket?.bidPrice ?? displayedPrice))}</dd></div><div><dt>{t('24h high')}</dt><dd>{priceText(Number(liveMarket?.high24h ?? displayedPrice))}</dd></div><div><dt>{t('24h low')}</dt><dd>{priceText(Number(liveMarket?.low24h ?? displayedPrice))}</dd></div><div><dt>{t('24h volume')}</dt><dd>{liveMarket?.quoteVolume24h ? `$${(Number(liveMarket.quoteVolume24h) / 1_000_000).toFixed(1)}M` : '—'}</dd></div><div><dt>{t('Funding / Interval')}</dt><dd><span className={Number(liveMarket?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</span> · {formatCountdown(nextFundingAt, clock)}</dd></div>
+        <div><dt>{t('Best bid')}</dt><dd>{priceText(Number(liveMarket?.bidPrice ?? displayedPrice))}</dd></div><div><dt>{t('24h high')}</dt><dd>{priceText(Number(liveMarket?.high24h ?? displayedPrice))}</dd></div><div><dt>{t('24h low')}</dt><dd>{priceText(Number(liveMarket?.low24h ?? displayedPrice))}</dd></div><div><dt>{t('24h volume')}</dt><dd>{liveMarket?.quoteVolume24h ? `$${(Number(liveMarket.quoteVolume24h) / 1_000_000).toFixed(1)}M` : '—'}</dd></div><div><dt>{t('Funding / Interval')}</dt><dd><span className={Number(liveMarket?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</span> · <FundingCountdown target={nextFundingAt} /></dd></div>
       </dl>
       <button className="star-button" onClick={() => onToggleFavorite(symbol)} aria-label={`${isFavorite ? 'Remove' : 'Add'} ${asset} favorite`} aria-pressed={isFavorite}>{isFavorite ? '★' : '☆'}</button>
     </section>
@@ -810,7 +804,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
             <div><dt>{t('Maker fee')}</dt><dd>{makerFeeText}</dd></div>
             <div><dt>{t('Taker fee')}</dt><dd>{takerFeeText}</dd></div>
             <div><dt>{t('Funding / Interval')}</dt><dd>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</dd></div>
-            <div><dt>{t('Next funding')}</dt><dd>{formatCountdown(nextFundingAt, clock)}</dd></div>
+            <div><dt>{t('Next funding')}</dt><dd><FundingCountdown target={nextFundingAt} /></dd></div>
             <div><dt>{t('Status')}</dt><dd>{instrument.state}</dd></div>
           </dl>}
         </div>}
@@ -914,6 +908,16 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
 function VenueFromCode({ code }: { code: string }) {
   const exchange = exchanges.find((item) => item.id === code.toLowerCase());
   return <VenueCell id={code.toLowerCase()} name={exchange?.name ?? code} short={exchange?.short ?? code.slice(0, 2)} />;
+}
+
+/** Self-ticking countdown so the per-second refresh re-renders this label, not the whole terminal. */
+function FundingCountdown({ target }: { target: string | undefined }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <>{formatCountdown(target, now)}</>;
 }
 
 function EmptyTable({ label }: { label: string }) {
