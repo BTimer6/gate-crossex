@@ -1583,7 +1583,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
 
     <section className={`strategy-layout revised ${directionFlipped ? 'direction-flipped' : ''}`}>
       <div className="strategy-main">
-        <article className="strategy-panel terminal-panel">
+        <article className="strategy-panel strategy-market-panel terminal-panel">
           <header className="strategy-panel-head"><div><p className="eyebrow">{t('Market & venues')}</p></div><div className="premium-pair-badge"><strong>{ADR_ASSET} / {ADR_HEDGE_ASSET}</strong><small>1 {ADR_HEDGE_ASSET} = {adrRatio || '—'} {ADR_ASSET}</small></div></header>
           <div className="strategy-legs">
             <div className="strategy-leg sell-leg"><div className="leg-top"><VenueSelect label={t('ADR leg')} menuSubtitle={`${ADR_ASSET} ${t('Perpetual').toLowerCase()}`} options={adrVenues.map((venueEntry) => ({ ...venueEntry, detail: marketSymbol(ADR_ASSET, quoteFor(venueEntry.id), 'perpetual') }))} value={adrVenueId} onSelect={setAdrVenueId} /><em>{t(adrSide)} {ADR_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(adrPrice)}</dd></div><div><dt>{t('Fair ADR value')}</dt><dd>{priceText(fairValue)}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{adrBalance ? `${Number(adrBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${adrBalanceUnit}` : '—'}</dd></div></dl></div>
