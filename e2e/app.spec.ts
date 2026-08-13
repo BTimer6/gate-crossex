@@ -104,7 +104,8 @@ test.describe.serial('local trading terminal', () => {
     await search.press('Escape');
     await expect(marketTrigger).toBeFocused();
 
-    const strategyTrigger = page.getByRole('button', { name: '⇄ Strategy', exact: true });
+    // Topbar glyphs are aria-hidden decoration, so accessible names carry the label only.
+    const strategyTrigger = page.getByRole('button', { name: 'Strategy', exact: true });
     await strategyTrigger.press('ArrowDown');
     const firstStrategy = page.getByRole('menuitem', { name: /Cross-exchange hedge/ });
     await expect(firstStrategy).toBeFocused();
@@ -437,7 +438,7 @@ test.describe.serial('local trading terminal', () => {
     expect(chartBands!.ohlcBottom).toBeLessThanOrEqual(chartBands!.chartTop);
     await expect(page.locator('.ohlc')).toHaveCSS('border-bottom-width', '0px');
 
-    await page.getByRole('button', { name: '% Funding Rates', exact: true }).click();
+    await page.getByRole('button', { name: 'Funding Rates', exact: true }).click();
     await expect(page).toHaveURL(/\/funding-rates$/);
     await expect(page.getByRole('heading', { name: 'Funding rate matrix.' })).toBeVisible();
     await expect.poll(loadedScripts).toEqual(expect.arrayContaining([expect.stringContaining('funding-route-')]));
