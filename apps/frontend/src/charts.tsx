@@ -411,7 +411,7 @@ export function FundingHistoryChart({
     if (!host) return;
     const chart = createChart(host, {
       autoSize: true,
-      layout: { background: { type: ColorType.Solid, color: 'transparent' }, fontFamily: "'Manrope', ui-sans-serif, system-ui, sans-serif", fontSize: 11 },
+      layout: { background: { type: ColorType.Solid, color: 'transparent' }, fontFamily: "'Manrope', ui-sans-serif, system-ui, sans-serif", fontSize: 12 },
       grid: { vertLines: { visible: false }, horzLines: { visible: true } },
       rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.12, bottom: 0.12 } },
       timeScale: { borderVisible: false, secondsVisible: false, timeVisible: true, rightOffset: 1 },
