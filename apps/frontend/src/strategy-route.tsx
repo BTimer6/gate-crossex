@@ -20,7 +20,7 @@ import {
   type VenueFeeRate,
 } from './api.js';
 import type { FundingChartSeries } from './charts.js';
-import { cumulativeFundingHistory, cumulativeFundingPnl } from './cumulative-funding-history.js';
+import { cumulativeFundingHistory, cumulativeFundingPnl, realizedFundingEdgeWindows } from './cumulative-funding-history.js';
 import { fundingPercentScaledTo8h } from './funding-rates.js';
 import { marketSymbol } from './market-symbol.js';
 import { usePairCandleHistory } from './pair-candle-history.js';
@@ -78,6 +78,13 @@ const POSITION_FUNDING_RANGES = [
   { days: 30, label: '30D' },
 ] as const;
 type PositionFundingDuration = typeof POSITION_FUNDING_RANGES[number]['days'];
+/** The summary always reports realized funding from the full 30-day fetch, independent of the chart range. */
+const POSITION_FUNDING_FETCH_DAYS = 30;
+const REALIZED_FUNDING_TILES = [
+  { days: 1, labelKey: 'Cumulative 24-hour', digits: 4 },
+  { days: 7, labelKey: 'Cumulative 7-day', digits: 3 },
+  { days: 30, labelKey: 'Cumulative 30-day', digits: 3 },
+] as const;
 
 function useInstrumentCatalog(): CrossExInstrument[] | null {
   const [instruments, setInstruments] = useState<CrossExInstrument[] | null>(null);
@@ -476,7 +483,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const leftInstrument = instruments?.find((instrument) => instrument.symbol === leftHistorySymbol);
   const rightInstrument = instruments?.find((instrument) => instrument.symbol === rightHistorySymbol);
   const positionFundingRangeLabel = POSITION_FUNDING_RANGES.find((range) => range.days === positionFundingDuration)?.label ?? '30D';
-  const positionFundingHistoryKey = `${leftHistorySymbol}:${rightHistorySymbol}:${positionFundingRangeLabel}`;
+  const positionFundingHistoryKey = `${leftHistorySymbol}:${rightHistorySymbol}`;
   const priceDifferenceHistoryInterval = PAIR_HISTORY_RANGES[priceDifferenceRange].interval;
   const priceDifferenceHistoryKey = `${leftHistorySymbol}:${rightHistorySymbol}:${priceDifferenceHistoryInterval}`;
   const priceDifferenceHistory = usePairCandleHistory(
@@ -562,41 +569,64 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     rightOverview?.fundingRate8h,
   );
   const fundingEdge = leftFunding !== null && rightFunding !== null
-    ? Math.abs(leftFunding - rightFunding)
+    ? (directionFlipped ? rightFunding - leftFunding : leftFunding - rightFunding)
     : null;
   const positionFundingHistoryIsCurrent = positionFundingHistory.key === positionFundingHistoryKey;
   const positionFundingSeries = useMemo<FundingChartSeries[]>(() => {
     if (!positionFundingHistoryIsCurrent) return [];
+    const chartRangeFrom = positionFundingHistory.rangeFrom === null
+      ? null
+      : positionFundingHistory.rangeFrom + Math.max(0, POSITION_FUNDING_FETCH_DAYS - positionFundingDuration) * 86_400_000;
     const venueSeries = [
       { symbol: leftHistorySymbol, venue: leftExchange },
       { symbol: rightHistorySymbol, venue: rightExchange },
     ].flatMap(({ symbol, venue }) => {
       const entry = positionFundingHistory.entries[symbol];
       if (!entry || entry.status !== 'ok') return [];
-      const points = cumulativeFundingHistory(entry.points, positionFundingHistory.rangeFrom);
+      const settlements = chartRangeFrom === null ? entry.points : entry.points.filter((point) => point.timestamp > chartRangeFrom);
+      const points = cumulativeFundingHistory(settlements, chartRangeFrom);
       if (points.length === 0) return [];
       return [{
-        id: symbol,
-        label: venue.name,
-        color: FUNDING_VENUE_COLORS[venue.id.toUpperCase()] ?? '#8aa9ff',
-        points,
+        symbol,
+        series: {
+          id: `${symbol}:${positionFundingRangeLabel}`,
+          label: venue.name,
+          color: FUNDING_VENUE_COLORS[venue.id.toUpperCase()] ?? '#8aa9ff',
+          points,
+        },
       }];
     });
-    const leftSeries = venueSeries.find((series) => series.id === leftHistorySymbol);
-    const rightSeries = venueSeries.find((series) => series.id === rightHistorySymbol);
-    if (!leftSeries || !rightSeries) return venueSeries;
+    const leftSeries = venueSeries.find((entry) => entry.symbol === leftHistorySymbol)?.series;
+    const rightSeries = venueSeries.find((entry) => entry.symbol === rightHistorySymbol)?.series;
+    const chartSeries = venueSeries.map((entry) => entry.series);
+    if (!leftSeries || !rightSeries) return chartSeries;
     const longSeries = directionFlipped ? leftSeries : rightSeries;
     const shortSeries = directionFlipped ? rightSeries : leftSeries;
     const pnlPoints = cumulativeFundingPnl(longSeries.points, shortSeries.points);
-    if (pnlPoints.length === 0) return venueSeries;
-    return [...venueSeries, {
-      id: `${positionFundingHistoryKey}:pnl:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`,
+    if (pnlPoints.length === 0) return chartSeries;
+    return [...chartSeries, {
+      id: `${positionFundingHistoryKey}:${positionFundingRangeLabel}:pnl:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`,
       label: `${t('Cumulative funding PnL')} · ${t(directionFlipped ? 'Buy' : 'Sell')} A / ${t(directionFlipped ? 'Sell' : 'Buy')} B`,
       color: theme === 'light' ? '#009b7d' : '#18d6ad',
       points: pnlPoints,
       style: 'area',
     }];
-  }, [directionFlipped, leftExchange, leftHistorySymbol, positionFundingHistory.entries, positionFundingHistory.rangeFrom, positionFundingHistoryIsCurrent, positionFundingHistoryKey, rightExchange, rightHistorySymbol, t, theme]);
+  }, [directionFlipped, leftExchange, leftHistorySymbol, positionFundingDuration, positionFundingHistory.entries, positionFundingHistory.rangeFrom, positionFundingHistoryIsCurrent, positionFundingHistoryKey, positionFundingRangeLabel, rightExchange, rightHistorySymbol, t, theme]);
+  const realizedFundingWindows = useMemo(() => {
+    if (!positionFundingHistoryIsCurrent || positionFundingHistory.rangeFrom === null) return null;
+    const leftEntry = positionFundingHistory.entries[leftHistorySymbol];
+    const rightEntry = positionFundingHistory.entries[rightHistorySymbol];
+    if (leftEntry?.status !== 'ok' || rightEntry?.status !== 'ok') return null;
+    const longPoints = (directionFlipped ? leftEntry : rightEntry).points;
+    const shortPoints = (directionFlipped ? rightEntry : leftEntry).points;
+    return realizedFundingEdgeWindows(
+      longPoints,
+      shortPoints,
+      positionFundingHistory.rangeFrom,
+      POSITION_FUNDING_FETCH_DAYS,
+      REALIZED_FUNDING_TILES.map((tile) => tile.days),
+    );
+  }, [directionFlipped, leftHistorySymbol, positionFundingHistory.entries, positionFundingHistory.rangeFrom, positionFundingHistoryIsCurrent, rightHistorySymbol]);
   const positionFundingHistoryStatus = positionFundingHistoryIsCurrent ? positionFundingHistory.status : 'loading';
   const tradingEnabled = tradingMode === 'live';
   const configuredPerOrder = mode === 'position' ? positionOrderQuantity : orderQuantity;
@@ -705,7 +735,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       entries: {},
       rangeFrom: null,
     });
-    void api.fundingHistorySeries([leftHistorySymbol, rightHistorySymbol], positionFundingDuration)
+    void api.fundingHistorySeries([leftHistorySymbol, rightHistorySymbol], POSITION_FUNDING_FETCH_DAYS)
       .then((response) => {
         if (cancelled) return;
         setPositionFundingHistory({
@@ -725,7 +755,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         });
       });
     return () => { cancelled = true; };
-  }, [leftHistorySymbol, mode, positionFundingDuration, positionFundingHistoryKey, rightHistorySymbol]);
+  }, [leftHistorySymbol, mode, positionFundingHistoryKey, rightHistorySymbol]);
 
   useEffect(() => {
     if (availableStrategyAssets.length > 0 && !availableStrategyAssets.some((option) => option.asset === asset)) {
@@ -846,11 +876,19 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             : t('Live trading is locked. Use the trading-mode switch in the top bar to enable it.')}</p></div>}
         </article>
         {mode === 'position' && <div className="funding-edge expanded position-funding-summary terminal-panel">
-          <div><span>{t('Funding-rate edge')}</span><strong>{fundingEdge === null ? '—' : `${fundingEdge.toFixed(4)}%`}</strong><small>{t('Per 8h')}</small></div>
-          <div><span>APR</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 1095).toFixed(2)}%`}</strong><small>{t('Annualized')}</small></div>
-          <div><span>{t('Projected 24h')}</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 3).toFixed(4)}%`}</strong><small>3 {t('intervals')}</small></div>
-          <div><span>{t('Projected 7d')}</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 21).toFixed(3)}%`}</strong><small>21 {t('intervals')}</small></div>
-          <div><span>{t('Projected 30d')}</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 90).toFixed(3)}%`}</strong><small>90 {t('intervals')}</small></div>
+          <div><span>{t('Funding-rate edge')}</span><strong className={fundingEdge !== null && fundingEdge < 0 ? 'negative' : undefined}>{fundingEdge === null ? '—' : `${fundingEdge >= 0 ? '+' : ''}${fundingEdge.toFixed(4)}%`}</strong><small>{t('Per 8h')}</small></div>
+          <div><span>{t('Current edge APR')}</span><strong className={fundingEdge !== null && fundingEdge < 0 ? 'negative' : undefined}>{fundingEdge === null ? '—' : `${fundingEdge >= 0 ? '+' : ''}${(fundingEdge * 1095).toFixed(2)}%`}</strong><small>{t('Annualized')}</small></div>
+          {REALIZED_FUNDING_TILES.map((tile, index) => {
+            const realizedWindow = realizedFundingWindows?.[index] ?? null;
+            const value = realizedWindow?.value ?? null;
+            return <div key={tile.days}>
+              <span>{t(tile.labelKey)}</span>
+              <strong className={value !== null && value < 0 ? 'negative' : undefined}>{value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(tile.digits)}%`}</strong>
+              <small>{value === null
+                ? (positionFundingHistoryStatus === 'loading' ? t('Loading…') : t('No data'))
+                : `${realizedWindow?.settlements ?? 0} ${t('settlements')}`}</small>
+            </div>;
+          })}
         </div>}
         {mode === 'position' && <article className="premium-history-panel strategy-funding-history terminal-panel">
           <header className="premium-history-head">
@@ -875,7 +913,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             <Suspense fallback={<div className="funding-history-chart chart-module-loading" role="status">{t('Loading venue histories…')}</div>}>
               <FundingHistoryChart
                 series={positionFundingSeries}
-                seriesKey={`${positionFundingHistoryKey}:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`}
+                seriesKey={`${positionFundingHistoryKey}:${positionFundingRangeLabel}:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`}
                 theme={theme}
                 locale={language === 'zh' ? 'zh-CN' : 'en-US'}
                 placeholder={positionFundingHistoryStatus === 'loading' ? t('Loading venue histories…') : t('Funding history unavailable.')}
