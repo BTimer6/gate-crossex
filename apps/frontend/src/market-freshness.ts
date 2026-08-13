@@ -2,7 +2,7 @@ import { CANDLE_INTERVAL_MILLISECONDS } from '@gate-crossex/shared-types';
 import type { Candle, CandleInterval, LiveMarket, MarketSnapshot } from './api.js';
 
 export const STRATEGY_MARKET_FRESHNESS_MS = 15_000;
-export const STRATEGY_MARKET_PAIR_MAX_SKEW_MS = 5_000;
+export const STRATEGY_MARKET_MAX_TRANSPORT_LAG_MS = 3_000;
 export const STRATEGY_FUTURE_QUOTE_TOLERANCE_MS = 2_000;
 
 export interface FreshMarketPair {
@@ -10,7 +10,7 @@ export interface FreshMarketPair {
   right: LiveMarket;
 }
 
-export type MarketPairWaitReason = 'feed' | 'missing' | 'non_live' | 'stale' | 'skew';
+export type MarketPairWaitReason = 'feed' | 'missing' | 'non_live' | 'stale' | 'delayed';
 
 export type MarketPairFreshness =
   | { pair: FreshMarketPair; reason: null }
@@ -49,14 +49,19 @@ export function assessMarketPairFreshness(
   }
   const leftUpdatedAt = Date.parse(left.updatedAt);
   const rightUpdatedAt = Date.parse(right.updatedAt);
+  const leftReceivedAt = Date.parse(left.receivedAt);
+  const rightReceivedAt = Date.parse(right.receivedAt);
   const usableTimestamp = (timestamp: number) => Number.isFinite(timestamp)
     && now - timestamp <= STRATEGY_MARKET_FRESHNESS_MS
     && timestamp - now <= STRATEGY_FUTURE_QUOTE_TOLERANCE_MS;
   if (!usableTimestamp(leftUpdatedAt) || !usableTimestamp(rightUpdatedAt)) {
     return { pair: null, reason: 'stale' };
   }
-  if (Math.abs(leftUpdatedAt - rightUpdatedAt) > STRATEGY_MARKET_PAIR_MAX_SKEW_MS) {
-    return { pair: null, reason: 'skew' };
+  const timelyDelivery = (sourceTimestamp: number, receivedTimestamp: number) =>
+    Number.isFinite(receivedTimestamp)
+    && receivedTimestamp - sourceTimestamp <= STRATEGY_MARKET_MAX_TRANSPORT_LAG_MS;
+  if (!timelyDelivery(leftUpdatedAt, leftReceivedAt) || !timelyDelivery(rightUpdatedAt, rightReceivedAt)) {
+    return { pair: null, reason: 'delayed' };
   }
   return { pair: { left, right }, reason: null };
 }

@@ -1337,7 +1337,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         ? 'Waiting for live WebSocket quotes from both markets.'
         : livePairFreshness.reason === 'stale'
           ? 'A selected quote is stale; waiting for its next update.'
-          : 'Fresh quotes arrived too far apart; synchronizing the pair…');
+          : 'A selected quote was delayed by more than 3 seconds; waiting for a timely update.');
   const adrLive = displayPair?.left ?? null;
   const hedgeLive = displayPair?.right ?? null;
   const adrPrice = Number(adrLive?.lastPrice ?? 0);

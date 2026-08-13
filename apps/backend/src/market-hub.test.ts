@@ -66,12 +66,37 @@ describe('CrossEx websocket liveness', () => {
     if (typeof address === 'string' || !address) throw new Error('missing server address');
     let connections = 0;
     server.on('connection', () => { connections += 1; });
-    const hub = new CrossExMarketHub(`ws://127.0.0.1:${address.port}`, { heartbeatIntervalMs: 25, staleAfterMs: 10_000 });
+    const hub = new CrossExMarketHub(`ws://127.0.0.1:${address.port}`, {
+      heartbeatIntervalMs: 10, marketIdlePingAfterMs: 25, staleAfterMs: 10_000,
+    });
     try {
       hub.start();
       await waitFor(() => connections === 1);
       // No pongs and no data: the hub must terminate the dead socket and dial again.
       await waitFor(() => connections >= 2, 5_000);
+    } finally {
+      hub.stop();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('probes an otherwise healthy socket after all market channels are idle', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const address = server.address();
+    if (typeof address === 'string' || !address) throw new Error('missing server address');
+    const socketPromise = new Promise<WebSocketDefault>((resolve) => server.once('connection', resolve));
+    const hub = new CrossExMarketHub(`ws://127.0.0.1:${address.port}`, {
+      heartbeatIntervalMs: 10, marketIdlePingAfterMs: 40, staleAfterMs: 10_000,
+    });
+    try {
+      hub.start();
+      const socket = await socketPromise;
+      let pingCount = 0;
+      socket.on('ping', () => { pingCount += 1; });
+      await waitFor(() => pingCount > 0);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(hub.snapshot().connectionState).toBe('healthy');
     } finally {
       hub.stop();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -130,6 +155,7 @@ describe('CrossEx price provenance', () => {
     } }));
     await waitFor(() => hub.market(symbol)?.source === 'gate_crossex_websocket');
     expect(hub.market(symbol)?.updatedAt).toBe(new Date(tickerTs).toISOString());
+    expect(Date.parse(hub.market(symbol)?.receivedAt ?? '')).toBeGreaterThan(tickerTs);
 
     // A later funding push updates its own fields but must not refresh price freshness.
     socket.send(JSON.stringify({ time: 3, channel: 'funding_rate', event: 'update', result: { s: symbol, r: '0.0005', T: 1_771_990_900_000 } }));

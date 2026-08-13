@@ -35,8 +35,8 @@ export interface StrategyEngineOptions {
   requoteIntervalMs?: number;
   /** Market data older than this is considered unusable for triggering. */
   marketFreshnessMs?: number;
-  /** Maximum source-timestamp difference between the two prices in one trigger calculation. */
-  marketPairMaxSkewMs?: number;
+  /** Maximum delay from the exchange source timestamp to local WebSocket receipt. */
+  marketMaxTransportLagMs?: number;
   /** Small allowance for clock skew; quotes further in the future are rejected. */
   futureQuoteToleranceMs?: number;
   /** Cooldown between hedge-repair attempts. */
@@ -258,7 +258,7 @@ export class StrategyEngine {
       orderTimeoutMs: options.orderTimeoutMs ?? 20_000,
       requoteIntervalMs: options.requoteIntervalMs ?? 2_000,
       marketFreshnessMs: options.marketFreshnessMs ?? 15_000,
-      marketPairMaxSkewMs: options.marketPairMaxSkewMs ?? 5_000,
+      marketMaxTransportLagMs: options.marketMaxTransportLagMs ?? 3_000,
       futureQuoteToleranceMs: options.futureQuoteToleranceMs ?? 2_000,
       repairCooldownMs: options.repairCooldownMs ?? 3_000,
       now: options.now ?? Date.now,
@@ -680,25 +680,26 @@ export class StrategyEngine {
     if (this.markets.connectionState && this.markets.connectionState() !== 'healthy') return null;
     const market = this.markets.market(symbol);
     if (!market || market.source !== 'gate_crossex_websocket') return null;
-    const age = this.options.now() - Date.parse(market.updatedAt);
+    const sourceTimestamp = Date.parse(market.updatedAt);
+    const receivedTimestamp = Date.parse(market.receivedAt);
+    const age = this.options.now() - sourceTimestamp;
+    const transportLag = receivedTimestamp - sourceTimestamp;
     if (!Number.isFinite(age)
+      || !Number.isFinite(transportLag)
       || age > this.options.marketFreshnessMs
-      || age < -this.options.futureQuoteToleranceMs) return null;
+      || age < -this.options.futureQuoteToleranceMs
+      || transportLag > this.options.marketMaxTransportLagMs) return null;
     return market;
   }
 
   private freshMarketPair(
     leftSymbol: string,
     rightSymbol: string,
-  ): { left: LiveMarket; right: LiveMarket; leftUpdatedAt: number; rightUpdatedAt: number } | null {
+  ): { left: LiveMarket; right: LiveMarket } | null {
     const left = this.freshMarket(leftSymbol);
     const right = this.freshMarket(rightSymbol);
     if (!left || !right) return null;
-    const leftUpdatedAt = Date.parse(left.updatedAt);
-    const rightUpdatedAt = Date.parse(right.updatedAt);
-    if (!Number.isFinite(leftUpdatedAt) || !Number.isFinite(rightUpdatedAt)
-      || Math.abs(leftUpdatedAt - rightUpdatedAt) > this.options.marketPairMaxSkewMs) return null;
-    return { left, right, leftUpdatedAt, rightUpdatedAt };
+    return { left, right };
   }
 
   private strategyLedger(strategyId: string): StrategyLedgerCache {
@@ -1300,8 +1301,6 @@ export class StrategyEngine {
     premium: Decimal;
     adrPrice: Decimal;
     hedgePrice: Decimal;
-    leftUpdatedAt: number;
-    rightUpdatedAt: number;
   } | null {
     const legs = legsOf(config);
     const adrSide = intent === 'entry' ? legs.left.side : oppositeSide(legs.left.side);
@@ -1317,8 +1316,6 @@ export class StrategyEngine {
       premium: adrPrice.div(fairValue).minus(1).mul(100),
       adrPrice,
       hedgePrice,
-      leftUpdatedAt: pair.leftUpdatedAt,
-      rightUpdatedAt: pair.rightUpdatedAt,
     };
   }
 

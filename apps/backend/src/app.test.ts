@@ -752,7 +752,8 @@ describe('local backend', () => {
       open24h: '63000', high24h: '65000', low24h: '62000', volume24h: '100',
       quoteVolume24h: '6400000', fundingRate: '0.0001',
       nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
-      openInterestValue: '6400000', updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+      openInterestValue: '6400000', receivedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
     });
     const { app, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
     gateway.extraSymbols.push({
@@ -802,7 +803,8 @@ describe('local backend', () => {
         askPrice: price, askSize: '10', open24h: price, high24h: price, low24h: price,
         volume24h: '100', quoteVolume24h: '10000', fundingRate: '0',
         nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
-        openInterestValue: '10000', updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+        openInterestValue: '10000', receivedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
       };
     };
     const { app, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });

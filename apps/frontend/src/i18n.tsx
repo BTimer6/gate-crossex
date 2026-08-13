@@ -77,7 +77,7 @@ const chinese: Record<string, string> = {
   'Subscribing to both selected markets…': '正在订阅两个所选市场…',
   'Waiting for live WebSocket quotes from both markets.': '正在等待两个市场的 WebSocket 实时行情。',
   'A selected quote is stale; waiting for its next update.': '一个所选市场的行情已过期，正在等待下一次更新。',
-  'Fresh quotes arrived too far apart; synchronizing the pair…': '两个新鲜行情的到达时间相差过大，正在同步该交易对…',
+  'A selected quote was delayed by more than 3 seconds; waiting for a timely update.': '一个所选市场的行情传输延迟超过 3 秒，正在等待及时更新。',
   'Historical premium': '历史溢价', 'Selected venue pair': '所选交易所组合', 'Live pair': '实时组合', 'Stale history': '历史数据已过期', 'No data': '暂无数据', Unavailable: '暂不可用', Loading: '加载中',
   'Loading premium history…': '正在加载溢价历史…', 'Premium history unavailable': '溢价历史暂不可用',
   'No overlapping candles for this venue pair.': '该交易所组合暂无重叠K线数据。',

@@ -714,6 +714,9 @@ export const LiveMarketSchema = z.object({
   nextFundingAt: z.string(),
   openInterest: z.string(),
   openInterestValue: z.string(),
+  /** Backend wall-clock time when the latest ticker frame was received. */
+  receivedAt: z.string(),
+  /** Exchange source timestamp carried by the latest ticker frame. */
   updatedAt: z.string(),
   source: z.enum(['gate_crossex_websocket', 'demo_seed']),
 });

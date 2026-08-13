@@ -5,7 +5,7 @@ declare module 'ws' {
     readonly readyState: number;
     readonly bufferedAmount: number;
     constructor(url: string);
-    on(event: 'open' | 'close' | 'error' | 'pong', listener: (...args: unknown[]) => void): this;
+    on(event: 'open' | 'close' | 'error' | 'ping' | 'pong', listener: (...args: unknown[]) => void): this;
     on(event: 'message', listener: (data: { toString(): string }) => void): this;
     send(data: string): void;
     ping(): void;
