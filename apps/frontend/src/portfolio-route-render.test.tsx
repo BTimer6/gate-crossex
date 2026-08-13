@@ -49,12 +49,12 @@ describe('portfolio risk rendering', () => {
       </LanguageContext.Provider>,
     );
 
-    expect(html).toContain('Current total initial margin rate');
+    expect(html).toContain('Current total initial margin ratio');
     expect(html).toContain('240%');
-    expect(html).toContain('Initial margin rate explanation');
-    expect(html).toContain('Current total maintenance margin rate');
+    expect(html).toContain('Above 110%, margin can be transferred out');
+    expect(html).toContain('Current total maintenance margin ratio');
     expect(html).toContain('480%');
-    expect(html).toContain('Maintenance margin rate explanation');
+    expect(html).toContain('At or below 100%, CrossEx force-liquidates positions.');
     expect(html).toContain('Exchange ADL: 4/5 (raw rank 3)');
     expect(html).toContain('CrossEx ADL: 4/5');
     expect(html.match(/adl-light-set danger/g)).toHaveLength(2);

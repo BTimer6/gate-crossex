@@ -201,7 +201,7 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
         <label><span>{t('Number of orders')}</span><input type="number" inputMode="numeric" min="2" max="100" step="1" value={closeOrderCount} onChange={(event) => setCloseOrderCount(event.target.value)} disabled={closing} /></label>
         <label><span>{t('Time gap between orders')}</span><div><input type="number" inputMode="numeric" min="1" max="86400" step="1" value={closeIntervalSeconds} onChange={(event) => setCloseIntervalSeconds(event.target.value)} disabled={closing} /><b>{t('seconds')}</b></div></label>
       </div>}
-      <p className="close-position-warning">{t(splitClose ? 'Split close warning' : 'Close position warning')}</p>
+      <p className="close-position-warning">{t(splitClose ? 'Confirming immediately executes the first market reduce-only order; the backend strategy submits the remaining orders at the configured interval. Actual fill prices may vary with market volatility and liquidity.' : 'Confirming immediately submits a market reduce-only order. The actual fill price may vary with market volatility and liquidity.')}</p>
       <div className="confirm-order-actions">
         <button className="confirm-back" data-dialog-autofocus onClick={onDismiss} disabled={closing}>{t('Go back')}</button>
         <button className="confirm-submit sell" onClick={() => void closePositions()} disabled={closing || !percentageValid || (splitClose && !splitValid)}><strong>{closing ? t(splitClose ? 'Starting close strategy…' : 'Closing position…') : t('Confirm close')}</strong><span>{splitClose ? `${closeOrderCount || '—'} ${t('orders')} · ${closeIntervalSeconds || '—'}s · ${closePercentage}%` : `${t('Market reduce-only')} · ${closePercentage}%`}</span></button>

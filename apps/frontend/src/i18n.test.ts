@@ -15,6 +15,11 @@ describe('English and Chinese translations', () => {
     ['zh', 'Pause strategies and switch account?', '暂停策略并切换账户？'],
     ['zh', 'Sign in with Gate API credentials', '使用 Gate API 密钥登录'],
     ['zh', 'Open secure credential setup', '打开 Gate API 密钥设置'],
+    ['zh', 'Current total initial margin ratio', '当前总起始保证金率'],
+    ['zh', 'Current total maintenance margin ratio', '当前总维持保证金率'],
+    ['zh', 'Margin balance divided by total maintenance margin. At or below 100%, CrossEx force-liquidates positions.', '保证金余额除以总维持保证金。当比率等于或低于 100% 时，CrossEx 将强制平仓。'],
+    ['zh', 'Execute a fixed two-venue position, then stop', '在两个交易所执行固定仓位后停止'],
+    ['zh', 'Open hedge strategy', '打开配对策略'],
   ] as const)('translates %s %s', (language, key, expected) => {
     expect(translate(language, key)).toBe(expected);
   });

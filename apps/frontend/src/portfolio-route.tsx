@@ -678,12 +678,12 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <em>{initialMargin !== null ? `${t('Initial margin')} $${formatAmount(initialMargin)}` : '—'}</em>
       </article>
       <article>
-        <MetricLabel label={t('Current total initial margin rate')} explanation={t('Initial margin rate explanation')} />
+        <MetricLabel label={t('Current total initial margin ratio')} explanation={t('Margin balance divided by total initial margin. Above 110%, margin can be transferred out; between 100% and 110%, outbound margin transfers are blocked; below 100%, the system automatically cancels open orders and only reduce-only orders are accepted.')} />
         <strong className={initialMarginRate !== null && initialMarginRate < 100 ? 'negative' : initialMarginRate !== null && initialMarginRate < 110 ? 'margin-rate-warning' : ''}>{initialMarginRate !== null ? `${formatAmount(initialMarginRate, 2)}%` : '—'}</strong>
         <em>{t('Margin balance divided by total initial margin')}</em>
       </article>
       <article>
-        <MetricLabel label={t('Current total maintenance margin rate')} explanation={t('Maintenance margin rate explanation')} />
+        <MetricLabel label={t('Current total maintenance margin ratio')} explanation={t('Margin balance divided by total maintenance margin. At or below 100%, CrossEx force-liquidates positions.')} />
         <strong className={maintenanceMarginRate !== null && maintenanceMarginRate <= 100 ? 'negative' : ''}>{maintenanceMarginRate !== null ? `${formatAmount(maintenanceMarginRate, 2)}%` : '—'}</strong>
         <em>{t('Margin balance divided by total maintenance margin')}</em>
       </article>
