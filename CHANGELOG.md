@@ -2,6 +2,25 @@
 
 All notable changes to Gate CrossEx are documented in this file.
 
+## [0.2.2] - 2026-08-14
+
+### Added
+
+- Added secure multi-account credential profiles with switching, renaming, deletion, and account-aware strategy ownership.
+- Added a shared grouped-position view across Trade, Strategies, and Portfolio, including live ADL risk indicators and position-closing controls.
+- Added direction-aware realized funding analytics and streamed premium-history data for paired strategies.
+
+### Changed
+
+- Strengthened strategy launch, execution, recovery, and ticker-delivery checks while reducing redundant authenticated and market-data work.
+- Improved venue selectors, responsive layouts, light-theme coverage, typography, translations, and accessibility checks.
+
+### Fixed
+
+- Serialized credential mutations against live orders, leverage changes, strategy operations, and transfers.
+- Prevented stale positions, fee schedules, portfolio activity, and transfer state from leaking across account switches.
+- Bounded supplemental ADL enrichment so unavailable or rate-limited rank data cannot stall portfolio refreshes.
+
 ## [0.2.1] - 2026-08-10
 
 ### Added
