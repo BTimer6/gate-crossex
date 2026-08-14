@@ -791,6 +791,59 @@ describe('local backend', () => {
     expect(stop.json()).toMatchObject({ status: 'STOPPED' });
   });
 
+  it('resumes a paused strategy only with explicit live-trading intent', async () => {
+    const marketHub = new CrossExMarketHub('ws://127.0.0.1:1');
+    marketHub.market = (symbol: string) => ({
+      symbol, venue: symbol.split('_')[0] as 'BINANCE' | 'OKX', asset: 'BTC',
+      lastPrice: '64000', bidPrice: '63999', bidSize: '10', askPrice: '64001', askSize: '10',
+      open24h: '63000', high24h: '65000', low24h: '62000', volume24h: '100',
+      quoteVolume24h: '6400000', fundingRate: '0.0001',
+      nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
+      openInterestValue: '6400000', receivedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+    });
+    const { app, database, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
+    gateway.extraSymbols.push(catalogSymbol('OKX_FUTURE_BTC_USDT', 'OKX'));
+    const host = { host: '127.0.0.1:17840' };
+    expect((await app.inject({ method: 'GET', url: '/api/crossex/instruments', headers: host })).statusCode).toBe(200);
+
+    const id = 'PAIR-RESUME01';
+    const now = new Date().toISOString();
+    const config = {
+      kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'SELL', rightSide: 'BUY', entryBps: '10', totalAmount: '0.01',
+      perOrderQuantity: '0.01', leftLeverage: '5', rightLeverage: '5', reduceOnly: false,
+      executionMethod: 'TAKER_TAKER',
+    };
+    database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
+      filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
+      credential_profile_label, created_at, updated_at, stopped_at)
+      VALUES (?, 'position', 'live', 'PAUSED', ?, 0, '0', '0', '0', '0', ?, 'Gate CrossEx', ?, ?, NULL)`)
+      .run(id, JSON.stringify(config), DEFAULT_CREDENTIAL_PROFILE, now, now);
+
+    const missingIntent = await app.inject({ method: 'POST', url: `/api/strategies/${id}/resume`, headers: host });
+    expect(missingIntent.statusCode).toBe(403);
+    expect(missingIntent.json()).toEqual({ error: 'missing_trading_intent' });
+
+    const resumed = await app.inject({
+      method: 'POST', url: `/api/strategies/${id}/resume`,
+      headers: { ...host, 'x-gct-trading-intent': 'resume-strategy' },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json()).toMatchObject({ id, status: 'RUNNING' });
+    const logs = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs`, headers: host });
+    expect(logs.json().logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy resumed', condition: 'Manual resume' }),
+    ]));
+
+    const duplicate = await app.inject({
+      method: 'POST', url: `/api/strategies/${id}/resume`,
+      headers: { ...host, 'x-gct-trading-intent': 'resume-strategy' },
+    });
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toEqual({ error: 'strategy_not_paused' });
+  });
+
   it('updates a running ADR premium bot take profit through the API', async () => {
     const marketHub = new CrossExMarketHub('ws://127.0.0.1:1');
     const originalMarket = marketHub.market.bind(marketHub);

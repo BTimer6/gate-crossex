@@ -517,6 +517,83 @@ export class StrategyEngine {
     return stopped;
   }
 
+  async resumeStrategy(id: string, credentialProfileId: string): Promise<StrategyRecord> {
+    if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
+    const record = this.runtime.getStrategy(id);
+    if (record.status !== 'PAUSED') throw new StrategyEngineError('strategy_not_paused', 409);
+    if (record.accountProfileId !== null && record.accountProfileId !== credentialProfileId) {
+      throw new StrategyEngineError('strategy_account_not_active', 409);
+    }
+    if (this.actors.has(id)) throw new StrategyEngineError('strategy_already_active', 409);
+    if (this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING').length >= 10) {
+      throw new StrategyEngineError('too_many_running_strategies', 409);
+    }
+
+    // PAUSED normally means every order was already confirmed terminal. Re-prove that invariant
+    // here so a stale or externally modified database row can never re-arm live execution while
+    // an older remote order is still working.
+    const quiesced = await this.runtime.quiesceOpenOrders({
+      strategyId: id,
+      timeoutMs: this.options.orderTimeoutMs,
+    });
+    if (quiesced.unresolved.length > 0) {
+      throw new StrategyEngineError('strategy_resume_unresolved_orders', 409,
+        quiesced.unresolved.map(({ order }) => order.id).join(','));
+    }
+
+    const config = record.config;
+    if (config.closePlan) {
+      for (const target of config.closePlan.targets) {
+        if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
+          throw new StrategyEngineError('unknown_strategy_market', 400);
+        }
+      }
+      this.validateClosePlanOrderSizes(config);
+      await this.runtime.prepareReduceOnlyStrategy(config.closePlan.targets.map((target) => ({
+        symbol: target.symbol,
+        venue: target.symbol.split('_', 1)[0] ?? '',
+        side: target.side,
+        leverage: '1',
+        estimatedQuantity: target.quantity,
+        estimatedPrice: '0',
+        positionSide: target.positionSide,
+      })));
+    } else {
+      const legs = legsOf(config);
+      for (const leg of [legs.left, legs.right]) {
+        if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
+          throw new StrategyEngineError('unknown_strategy_market', 400);
+        }
+      }
+      this.validateStrategyOrderSizes(config, legs);
+      await this.prepareStrategy(config, legs);
+    }
+
+    // Re-check after the asynchronous account and order preflights. Another request may have
+    // locked trading, resumed this strategy, or consumed the final running-strategy slot in the
+    // meantime.
+    if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
+    const current = this.runtime.getStrategy(id);
+    if (current.status !== 'PAUSED') throw new StrategyEngineError('strategy_not_paused', 409);
+    if (current.accountProfileId !== null && current.accountProfileId !== credentialProfileId) {
+      throw new StrategyEngineError('strategy_account_not_active', 409);
+    }
+    if (this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING').length >= 10) {
+      throw new StrategyEngineError('too_many_running_strategies', 409);
+    }
+
+    const now = new Date().toISOString();
+    const updated = this.database.prepare(`UPDATE execution_strategies
+      SET status = 'RUNNING', stopped_at = NULL, updated_at = ?
+      WHERE id = ? AND status = 'PAUSED'`).run(now, id);
+    if (updated.changes !== 1) throw new StrategyEngineError('strategy_not_paused', 409);
+    this.runtime.addStrategyLog(id, 'info', 'Strategy resumed', 'Manual resume', '—', 'Preflight passed · monitoring live spreads');
+    const resumed = this.runtime.getStrategy(id);
+    this.attach(resumed);
+    this.runtime.emitStrategyUpdate(resumed);
+    return resumed;
+  }
+
   async updatePremiumTakeProfit(id: string, raw: unknown): Promise<StrategyRecord> {
     const input = UpdatePremiumTakeProfitInputSchema.parse(raw);
     if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);

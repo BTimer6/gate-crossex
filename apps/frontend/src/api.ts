@@ -350,6 +350,10 @@ export const api = {
     method: 'POST',
     headers: { 'x-gct-trading-intent': 'stop-strategy' },
   }),
+  resumeStrategy: (id: string) => request(StrategyRecordSchema, `/api/strategies/${encodeURIComponent(id)}/resume`, {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'resume-strategy' },
+  }),
   strategyLogs: (id: string) => request(StrategyLogsResponseSchema, `/api/strategies/${encodeURIComponent(id)}/logs`),
   candles: (
     symbol: string,

@@ -62,6 +62,7 @@ import { StrategyAssetSearch } from './strategy-asset-search.js';
 import { localizeStrategyLogCondition, localizeStrategyLogResult, prepareStrategyLogs, type DisplayStrategyLog } from './strategy-logs.js';
 import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
 import { groupStrategyPositions, prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
+import { StrategyLaunchConfirmation } from './strategy-launch-confirmation.js';
 import { useLanguage, type Language } from './i18n.js';
 import { numericFutureFeeRate } from './fee-rates.js';
 import { executionPageWindow } from './execution-pagination.js';
@@ -174,6 +175,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const { language, t } = useLanguage();
   const [activeStrategyTab, setActiveStrategyTab] = useState<'running' | 'positions' | 'historical'>('running');
   const [stoppingIds, setStoppingIds] = useState<string[]>([]);
+  const [resumingIds, setResumingIds] = useState<string[]>([]);
   const [selectedLogStrategyId, setSelectedLogStrategyId] = useState<string | null>(null);
   const [selectedStrategyLogs, setSelectedStrategyLogs] = useState<DisplayStrategyLog[]>([]);
   const [logLoadState, setLogLoadState] = useState<{ status: 'idle' | 'loading' | 'loaded' | 'error'; message?: string }>({ status: 'idle' });
@@ -245,7 +247,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   // A failed stop must never be silent: the strategy would keep trading while the user
   // believes it is halted.
   async function stopStrategy(id: string) {
-    if (stoppingIds.includes(id)) return;
+    if (stoppingIds.includes(id) || resumingIds.includes(id)) return;
     setStoppingIds((current) => [...current, id]);
     try {
       await api.stopStrategy(id);
@@ -255,6 +257,24 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       setStopNotice(`${t('Stop failed')} (${id}): ${error instanceof ApiError ? error.message : t('Backend unavailable')}`);
     } finally {
       setStoppingIds((current) => current.filter((item) => item !== id));
+    }
+  }
+
+  async function resumeStrategy(id: string) {
+    if (tradingMode !== 'live') {
+      onOpenModeDialog();
+      return;
+    }
+    if (resumingIds.includes(id) || stoppingIds.includes(id)) return;
+    setResumingIds((current) => [...current, id]);
+    setStopNotice(null);
+    try {
+      await api.resumeStrategy(id);
+      await onStrategiesChanged();
+    } catch (error) {
+      setStopNotice(`${t('Resume failed')} (${id}): ${error instanceof ApiError ? error.message : t('Backend unavailable')}`);
+    } finally {
+      setResumingIds((current) => current.filter((item) => item !== id));
     }
   }
 
@@ -373,7 +393,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <span><button className="logs-button" onClick={() => void openLogs(strategy.id)}>{t('View logs')}</button></span>
         <span>{strategyRuntime(strategy, showingHistory)}</span>
         <span className={`strategy-status ${strategy.status.toLowerCase()}`}><i />{strategy.status}<small>{strategy.progress.toFixed(0)}%</small></span>
-        {!showingHistory && <span><button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
+        {!showingHistory && <span className="strategy-actions">{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
       </div>;
     })}</div>{showingHistory && historicalStrategies.length >= HISTORICAL_STRATEGIES_PAGE_SIZE && <div className="funding-pagination strategy-pagination"><span className="page-range">{historyStart + 1}–{Math.min(historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE, historicalStrategies.length)} / {historicalStrategies.length}</span><div className="page-controls"><button onClick={() => setHistoryPage((current) => Math.max(1, current - 1))} disabled={historyPage === 1}>{t('Prev')}</button><span className="page-indicator">{t('Page')} {historyPage} / {historyPages}</span><button onClick={() => setHistoryPage((current) => Math.min(historyPages, current + 1))} disabled={historyPage === historyPages}>{t('Next')}</button></div><span className="page-size">10 {t('per page')}</span></div>}{stopNotice && <div className="launch-notice error panel-notice">{stopNotice}</div>}{visibleStrategies.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t(showingHistory ? 'No historical strategies' : 'No strategies running')}</strong><small>{t(showingHistory ? 'Stopped and completed strategies will appear here.' : 'Configure a strategy above and start it when ready.')}</small></div>}
       </>}
@@ -459,6 +479,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [leftRiskPositionValue, setLeftRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [rightRiskPositionValue, setRightRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [priceDifferenceRange, setPriceDifferenceRange] = useState<PairHistoryRange>('24H');
   const [positionFundingDuration, setPositionFundingDuration] = useState<PositionFundingDuration>(30);
@@ -768,6 +789,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   }, [priceDifferenceSeriesKey]);
 
   async function launchStrategy() {
+    if (launching) return;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -794,8 +816,18 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
       setLaunching(false);
+      setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
     }
+  }
+
+  function requestStrategyLaunch() {
+    if (!tradingEnabled) {
+      onOpenModeDialog();
+      return;
+    }
+    if (launching || !strategyInputsValid) return;
+    setConfirmingLaunch(true);
   }
 
   const leftSide = directionFlipped ? 'Buy' : 'Sell';
@@ -999,7 +1031,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           })}</dl>
           {marginInsufficient && <div className="launch-warning"><span>!</span><p>{t('Configured maximum exposure exceeds the available margin.')}</p></div>}
           {positionRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
-          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={() => tradingEnabled ? void launchStrategy() : onOpenModeDialog()} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
+          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
           {mode === 'position' && <p className="background-strategy-note">{t('Runs in background; manage active strategies below.')}</p>}
           {mode === 'position' && <div className="launch-warning"><span>ⓘ</span><p>{tradingEnabled
@@ -1009,6 +1041,24 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       </aside>
     </section>
 
+    {confirmingLaunch && <StrategyLaunchConfirmation
+      market={`${asset} · ${leftExchange.name} ⇄ ${rightExchange.name}`}
+      rows={[
+        { label: t('Direction'), value: `${t(leftSide)} ${leftExchange.name} ⇄ ${t(rightSide)} ${rightExchange.name}` },
+        { label: t('Entry'), value: `≥ ${threshold || '0'} bps` },
+        ...(mode === 'auto' ? [{ label: t('Take profit'), value: `≤ ${takeProfitThreshold || '0'} bps` }] : []),
+        { label: t(mode === 'position' ? 'Total execution' : 'Max position'), value: `${mode === 'position' ? amount : maxPosition} ${asset}` },
+        { label: t('Per order'), value: `${mode === 'position' ? positionOrderQuantity : orderQuantity} ${asset}` },
+        ...(mode === 'position' ? [
+          { label: t('Leverage'), value: `${leftLeverage}× / ${rightLeverage}×` },
+          { label: t('Reduce only'), value: t(reduceOnly ? 'Yes' : 'No') },
+        ] : []),
+        { label: t('Execution'), value: configuredExecutionMethod.replaceAll('–', '-') },
+      ]}
+      busy={launching}
+      onCancel={() => setConfirmingLaunch(false)}
+      onConfirm={() => { void launchStrategy(); }}
+    />}
     <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
   </div>;
 }
@@ -1222,6 +1272,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const [adrRiskPositionValue, setAdrRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [hedgeRiskPositionValue, setHedgeRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [premiumRange, setPremiumRange] = useState<PairHistoryRange>('24H');
   const [premiumCandles, setPremiumCandles] = useState<{
@@ -1539,10 +1590,12 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const exitComparator = shortPremium ? '≤' : '≥';
   const entryReady = livePair !== null && premiumNow !== null
     && (shortPremium ? premiumNow >= Number(entryPremium) : premiumNow <= Number(entryPremium));
+  const premiumLaunchReady = livePair !== null && !marginInsufficient && !leverageInvalid && premiumReviewValid;
 
   useEffect(() => setHoveredPremium(null), [historySeriesKey]);
 
   async function launchStrategy() {
+    if (launching) return;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -1574,8 +1627,18 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
       setLaunching(false);
+      setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
     }
+  }
+
+  function requestStrategyLaunch() {
+    if (!tradingEnabled) {
+      onOpenModeDialog();
+      return;
+    }
+    if (launching || !premiumLaunchReady) return;
+    setConfirmingLaunch(true);
   }
 
   return <div className="alternate-view strategy-view">
@@ -1706,12 +1769,29 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
           </dl>
           {!reduceOnly && foreignOppositePositions.length > 0 && <div className="launch-warning"><span>ⓘ</span><p>{t('Positions on another venue do not reduce this strategy’s margin requirement. Only positions on the selected exchange are offset.')}</p></div>}
           {premiumRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
-          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={() => tradingEnabled ? void launchStrategy() : onOpenModeDialog()} disabled={launching || (tradingEnabled && (!livePair || marginInsufficient || leverageInvalid || !premiumReviewValid))}>{launching ? t('Launching…') : !tradingEnabled ? t('Live trading locked') : !livePair ? t('Loading live data…') : premiumRiskLimitExceeded ? t('Position exceeds leverage limit') : premiumRiskReviewUnavailable ? t('Loading position limits…') : !premiumInputsValid ? t('Enter valid strategy amounts') : leverageInvalid ? t('Invalid leverage') : marginInsufficient ? t('Insufficient margin') : t(reduceOnly ? 'Launch reduce-only strategy' : 'Launch strategy')}</button>
+          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !premiumLaunchReady)}>{launching ? t('Launching…') : !tradingEnabled ? t('Live trading locked') : !livePair ? t('Loading live data…') : premiumRiskLimitExceeded ? t('Position exceeds leverage limit') : premiumRiskReviewUnavailable ? t('Loading position limits…') : !premiumInputsValid ? t('Enter valid strategy amounts') : leverageInvalid ? t('Invalid leverage') : marginInsufficient ? t('Insufficient margin') : t(reduceOnly ? 'Launch reduce-only strategy' : 'Launch strategy')}</button>
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
         </article>
       </aside>
     </section>
 
+    {confirmingLaunch && <StrategyLaunchConfirmation
+      market={`${ADR_ASSET} / ${ADR_HEDGE_ASSET} · ${adrExchange.name} ⇄ ${hedgeExchange.name}`}
+      rows={[
+        { label: t('Direction'), value: `${t(adrSide)} ${ADR_ASSET} ⇄ ${t(hedgeSide)} ${ADR_HEDGE_ASSET}` },
+        { label: t(reduceOnly ? 'Trigger' : 'Entry'), value: `${entryComparator} ${entryPremium || '0'}%` },
+        ...(!reduceOnly ? [{ label: t('Take profit'), value: `${exitComparator} ${takeProfitPremium || '0'}%` }] : []),
+        { label: t(reduceOnly ? 'Max close amount' : 'Max position'), value: `${maxPosition} ${ADR_ASSET}` },
+        { label: t('Per order'), value: `${perOrderQuantity} ${ADR_ASSET}` },
+        { label: t('Hedge per order'), value: hedgePerOrderText ?? '—' },
+        ...(!reduceOnly ? [{ label: t('Leverage'), value: `${adrLeverage}× / ${hedgeLeverage}×` }] : []),
+        { label: t('Hedge sizing'), value: t(hedgeMode === 'EQUAL_NOTIONAL' ? 'Equal notional' : 'Share ratio') },
+        { label: t('Execution'), value: t('Taker–Taker') },
+      ]}
+      busy={launching}
+      onCancel={() => setConfirmingLaunch(false)}
+      onConfirm={() => { void launchStrategy(); }}
+    />}
     <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
   </div>;
 }

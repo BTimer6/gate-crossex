@@ -81,6 +81,33 @@ describe('local API request coordination', () => {
     expect(new Headers(deleteCall?.[1]?.headers).get('x-gct-credential-intent')).toBe('delete-account');
   });
 
+  it('sends explicit live-trading intent when resuming a strategy', async () => {
+    const strategy = {
+      id: 'PAIR-RESUME01', kind: 'position', status: 'RUNNING',
+      accountProfileId: 'gate-crossex-default', accountLabel: 'Gate CrossEx',
+      config: {
+        kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+        leftSide: 'SELL', rightSide: 'BUY', entryBps: '10', totalAmount: '0.1',
+        perOrderQuantity: '0.1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+      },
+      progress: 0, filledQuantity: '0', filledLeft: '0', filledRight: '0', openPosition: '0',
+      realizedPnl: '0', createdAt: '2026-08-14T00:00:00.000Z',
+      updatedAt: '2026-08-14T00:01:00.000Z', stoppedAt: null,
+    };
+    const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) => {
+      void _path;
+      void _init;
+      return new Response(JSON.stringify(strategy));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.resumeStrategy(strategy.id)).resolves.toMatchObject({ id: strategy.id, status: 'RUNNING' });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/strategies/PAIR-RESUME01/resume');
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.method).toBe('POST');
+    expect(new Headers(init?.headers).get('x-gct-trading-intent')).toBe('resume-strategy');
+  });
+
   it('rejects a successful response that violates the shared runtime contract', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       mode: 'live',

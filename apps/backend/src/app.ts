@@ -1516,6 +1516,37 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }
   });
 
+  app.post('/api/strategies/:id/resume', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'resume-strategy') return reply.code(403).send({ error: 'missing_trading_intent' });
+    },
+  }, async (request, reply) => {
+    const parsed = z.object({ id: z.string().regex(STRATEGY_ID) }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_id' });
+    if (!activeCredentialProfileId) return reply.code(409).send({ error: 'credential_not_configured' });
+    try {
+      // Resume repeats launch preflight, so its order-size checks need the same authoritative
+      // instrument catalog as a newly submitted strategy.
+      if (tradingSession.liveTradingEnabled && !readInstrumentCatalog(database)) {
+        try { await fetchInstrumentCatalog(); }
+        catch (error) {
+          request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'strategy resume instrument preflight failed');
+          return reply.code(503).send({ error: 'strategy_instrument_constraints_unavailable' });
+        }
+      }
+      return await strategyEngine.resumeStrategy(parsed.data.id, activeCredentialProfileId);
+    }
+    catch (error) {
+      if (error instanceof TradingRuntimeError) {
+        if (error.label) request.log.warn({ code: error.code, label: error.label }, 'strategy resume rejected');
+        return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
+      }
+      request.log.error({ error }, 'strategy resume failed');
+      return reply.code(500).send({ error: 'strategy_resume_failed' });
+    }
+  });
+
   app.patch('/api/strategies/:id/take-profit', {
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
     preHandler: async (request, reply) => {

@@ -681,6 +681,34 @@ describe('strategy engine', () => {
     expect(gateway.createdOrders).toHaveLength(1);
   });
 
+  it('manually resumes a paused strategy only on its active account', async () => {
+    const { engine, runtime, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig, {
+      profileId: DEFAULT_CREDENTIAL_PROFILE,
+      label: 'Primary Trading',
+    });
+    expect(engine.pauseRunningStrategiesForCredentialChange(DEFAULT_CREDENTIAL_PROFILE)).toBe(1);
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+
+    await expect(engine.resumeStrategy(record.id, 'another-account')).rejects.toMatchObject({
+      code: 'strategy_account_not_active', statusCode: 409,
+    });
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+
+    await expect(engine.resumeStrategy(record.id, DEFAULT_CREDENTIAL_PROFILE)).resolves.toMatchObject({
+      id: record.id, status: 'RUNNING',
+    });
+    expect(engine.listActiveStrategyIds()).toEqual([record.id]);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy resumed', condition: 'Manual resume' }),
+    ]));
+    await expect(engine.resumeStrategy(record.id, DEFAULT_CREDENTIAL_PROFILE)).rejects.toMatchObject({
+      code: 'strategy_not_paused', statusCode: 409,
+    });
+  });
+
   it('rests a post-only maker quote and hedges each maker fill on the taker venue', async () => {
     const { engine, runtime, gateway, markets } = await createHarness();
     markets.set('BINANCE_FUTURE_BTC_USDT', '100000', '100001');
