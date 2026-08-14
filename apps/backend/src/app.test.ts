@@ -73,6 +73,7 @@ const portfolioFixture: GateCrossExPortfolio = {
 class FakeCrossExGateway implements TradingCrossExGateway {
   readonly receivedCredentials: GateCredentials[] = [];
   readonly createdOrders: CrossExOrderRequest[] = [];
+  readonly createdOrderCredentials: GateCredentials[] = [];
   readonly cancelledOrders: string[] = [];
   readonly leverageUpdates: Array<{ symbol: string; leverage: string }> = [];
   readonly createdTransfers: CrossExTransferRequest[] = [];
@@ -80,12 +81,15 @@ class FakeCrossExGateway implements TradingCrossExGateway {
   symbolQueryCount = 0;
   riskQueryCount = 0;
   feeQueryCount = 0;
+  positionsQueryCount = 0;
   portfolioQueryCount = 0;
   transferCoinQueryCount = 0;
   failSymbols = false;
   failPortfolio = false;
   private readonly remoteOrders = new Map<string, { request: CrossExOrderRequest; state: string }>();
   private portfolioBlock: Promise<void> | null = null;
+  private positionsBlock: Promise<void> | null = null;
+  private feeBlock: Promise<void> | null = null;
 
   async queryAccount(credentials: GateCredentials): Promise<GateCrossExAccount> {
     this.receivedCredentials.push({ ...credentials });
@@ -120,8 +124,20 @@ class FakeCrossExGateway implements TradingCrossExGateway {
 
   async queryPositions(credentials: GateCredentials): Promise<GateCrossExPortfolio['positions']> {
     this.receivedCredentials.push({ ...credentials });
+    this.positionsQueryCount += 1;
+    if (this.positionsBlock) {
+      const block = this.positionsBlock;
+      this.positionsBlock = null;
+      await block;
+    }
     if (this.failPortfolio) throw new GateApiError(0, 'NETWORK_ERROR');
     return portfolioFixture.positions;
+  }
+
+  blockNextPositions(): () => void {
+    let release!: () => void;
+    this.positionsBlock = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+    return release;
   }
 
 
@@ -152,6 +168,7 @@ class FakeCrossExGateway implements TradingCrossExGateway {
 
   async createOrder(credentials: GateCredentials, order: CrossExOrderRequest): Promise<GateOrderActionResponse> {
     this.receivedCredentials.push({ ...credentials });
+    this.createdOrderCredentials.push({ ...credentials });
     this.createdOrders.push({ ...order });
     const orderId = `live-${this.createdOrders.length}`;
     this.remoteOrders.set(orderId, { request: { ...order }, state: 'OPEN' });
@@ -200,10 +217,22 @@ class FakeCrossExGateway implements TradingCrossExGateway {
   async queryFeeRates(credentials: GateCredentials): Promise<GateFeeRate[]> {
     this.receivedCredentials.push({ ...credentials });
     this.feeQueryCount += 1;
+    if (this.feeBlock) {
+      const block = this.feeBlock;
+      this.feeBlock = null;
+      await block;
+    }
+    const accountRate = credentials.apiKey.includes('secondary') ? '0.00099' : '0.00006';
     return [
-      { exchange_type: 'BINANCE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00006', future_taker_fee: '0.00022', special_fee_list: [{ symbol: 'BINANCE_FUTURE_BTC_USDT', maker_fee_rate: '0.00001', taker_fee_rate: '0.00002' }] },
+      { exchange_type: 'BINANCE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: accountRate, future_taker_fee: '0.00022', special_fee_list: [{ symbol: 'BINANCE_FUTURE_BTC_USDT', maker_fee_rate: '0.00001', taker_fee_rate: '0.00002' }] },
       { exchange_type: 'GATE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00005', future_taker_fee: '0.0002' },
     ];
+  }
+
+  blockNextFeeRates(): () => void {
+    let release!: () => void;
+    this.feeBlock = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+    return release;
   }
 
   async queryTransferCoins(): Promise<GateTransferCoin[]> {
@@ -387,6 +416,18 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     if (Date.now() > deadline) throw new Error('condition not reached in time');
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
   }
+}
+
+const SECONDARY_PROFILE_ID = 'gate-crossex-account-11111111-1111-4111-8111-111111111111';
+
+async function addSecondaryProfile(context: Pick<TestContext, 'database' | 'vault'>): Promise<void> {
+  await context.vault.set(SECONDARY_PROFILE_ID, {
+    apiKey: 'secondary-api-key',
+    apiSecret: 'secondary-api-secret',
+  });
+  context.database.prepare(`INSERT INTO credential_metadata
+    (id, label, provider, created_at, last_verified_at)
+    VALUES (?, 'Secondary account', 'memory_test_only', '2026-08-14T08:00:00.000Z', '2026-08-14T08:00:00.000Z')`).run(SECONDARY_PROFILE_ID);
 }
 
 function catalogSymbol(symbol: string, venue: string): GateCrossExSymbol {
@@ -1902,6 +1943,99 @@ describe('local backend', () => {
     expect(reports.statusCode).toBe(200);
     expect(reports.json().reports).toHaveLength(2);
     expect(reports.json().reports[0]).toMatchObject({ status: 'stale' });
+  });
+
+  it('waits for an accepted order workflow before switching credentials', async () => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    const { app, gateway } = context;
+    await addSecondaryProfile(context);
+    const releasePositions = gateway.blockNextPositions();
+
+    const orderRequest = app.inject({
+      method: 'POST',
+      url: '/api/trading/orders',
+      headers: { host: '127.0.0.1:17840', 'x-gct-trading-intent': 'place-order' },
+      payload: {
+        symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC',
+        quantity: '0.01', price: '64000', reduceOnly: false,
+      },
+    });
+    await waitFor(() => gateway.positionsQueryCount === 1);
+
+    let switchSettled = false;
+    const switchRequest = app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${SECONDARY_PROFILE_ID}/activate`,
+      headers: { host: '127.0.0.1:5173', 'x-gct-credential-intent': 'switch-account' },
+    }).finally(() => { switchSettled = true; });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+    expect(switchSettled).toBe(false);
+
+    releasePositions();
+    const [order, switched] = await Promise.all([orderRequest, switchRequest]);
+    expect(order.statusCode).toBe(200);
+    expect(switched.statusCode).toBe(200);
+    expect(switched.json()).toMatchObject({ activeProfileId: SECONDARY_PROFILE_ID, readOnly: true });
+    expect(gateway.createdOrderCredentials).toEqual([{ apiKey: 'test-key', apiSecret: 'test-secret' }]);
+    expect(gateway.cancelledOrders).toEqual(['live-1']);
+  });
+
+  it('drops an old-account positions response that finishes after an account switch', async () => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    const { app, gateway } = context;
+    await addSecondaryProfile(context);
+    const releasePositions = gateway.blockNextPositions();
+
+    const oldPositions = app.inject({
+      method: 'GET',
+      url: '/api/crossex/positions-snapshot',
+      headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'positions-snapshot' },
+    });
+    await waitFor(() => gateway.positionsQueryCount === 1);
+    const switched = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${SECONDARY_PROFILE_ID}/activate`,
+      headers: { host: '127.0.0.1:5173', 'x-gct-credential-intent': 'switch-account' },
+    });
+    expect(switched.statusCode).toBe(200);
+
+    releasePositions();
+    const staleResponse = await oldPositions;
+    expect(staleResponse.statusCode).toBe(409);
+    expect(staleResponse.json()).toEqual({ error: 'credential_context_changed' });
+    const snapshot = await app.inject({
+      method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' },
+    });
+    expect(snapshot.json().positions).toEqual([]);
+  });
+
+  it('keeps an old-account fee request from repopulating the new account cache', async () => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    const { app, gateway } = context;
+    await addSecondaryProfile(context);
+    const releaseFees = gateway.blockNextFeeRates();
+    const feeHeaders = { host: '127.0.0.1:17840', 'x-gct-read-intent': 'fee-rates' };
+
+    const oldFees = app.inject({ method: 'GET', url: '/api/crossex/fees', headers: feeHeaders });
+    await waitFor(() => gateway.feeQueryCount === 1);
+    const switched = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${SECONDARY_PROFILE_ID}/activate`,
+      headers: { host: '127.0.0.1:5173', 'x-gct-credential-intent': 'switch-account' },
+    });
+    expect(switched.statusCode).toBe(200);
+
+    const newFees = await app.inject({ method: 'GET', url: '/api/crossex/fees', headers: feeHeaders });
+    expect(newFees.statusCode).toBe(200);
+    expect(newFees.json().fees[0]).toMatchObject({ venue: 'BINANCE', futureMakerFee: '0.00099' });
+
+    releaseFees();
+    const staleResponse = await oldFees;
+    expect(staleResponse.statusCode).toBe(409);
+    expect(staleResponse.json()).toEqual({ error: 'credential_context_changed' });
+    const cached = await app.inject({ method: 'GET', url: '/api/crossex/fees', headers: feeHeaders });
+    expect(cached.json().fees[0]).toMatchObject({ futureMakerFee: '0.00099' });
+    expect(gateway.feeQueryCount).toBe(2);
   });
 
   it('adds and switches saved accounts while clearing the previous account state', async () => {

@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { contiguousCandleTail, type CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
@@ -14,7 +14,6 @@ import {
   type MarketCatalogAsset,
   type MarketSnapshot,
   type OrderBookSnapshot,
-  type Position,
   type PublicMarketSnapshot,
   type PublicTrade,
   type TradingMode,
@@ -50,7 +49,6 @@ import {
   priceText,
   projectedPositionValue,
   quoteFor,
-  signedAmount,
   signedPortfolioQuantity,
   symbolParts,
   ticketIssues,
@@ -60,17 +58,15 @@ import {
   type OrderType,
   type Side,
 } from './route-shared.js';
-import { aggregatePositionFundingFee, positionFundingFee } from './position-funding-fees.js';
-import { canonicalPositionAsset, positionGroupKey, positionGroupLabel } from './position-grouping.js';
-import { PositionCloseDialog } from './position-close-dialog.js';
+import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
 import { numericFutureFeeRate } from './fee-rates.js';
 import { useLanguage } from './i18n.js';
 import { formatExecutionDateTime } from './execution-date-time.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
 import { orderDisplayPrice } from './order-display-price.js';
-import { AdlIndicators } from './adl-indicator.js';
-import { adlRanksForPositions } from './adl-ranking.js';
+import { PositionsTable } from './positions-table.js';
+import { prepareExecutionPositionRows, type PositionTableRow } from './strategy-positions.js';
 
 const CandleChart = lazy(() => import('./charts.js').then((module) => ({ default: module.CandleChart })));
 
@@ -261,7 +257,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [amount, setAmount] = useState('');
   const [allocation, setAllocation] = useState(0);
   const [bottomTab, setBottomTab] = useState('Positions (0)');
-  const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -768,7 +763,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
       </aside>
     </section>
 
-    <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} instruments={instrumentCatalog} bottomTab={bottomTab} setBottomTab={setBottomTab} expandedPosition={expandedPosition} setExpandedPosition={setExpandedPosition} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
+    <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} instruments={instrumentCatalog} bottomTab={bottomTab} setBottomTab={setBottomTab} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
     {confirming && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => setConfirming(false)}>
       <section ref={confirmDialogRef} tabIndex={-1} className="confirm-order-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-order-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>
@@ -827,14 +822,12 @@ function EmptyTable({ label }: { label: string }) {
   return <div className="empty-state"><span>◎</span><strong>{t(`No ${label.toLowerCase()}`)}</strong><p>{t('The backend will add rows here as executions occur.')}</p></div>;
 }
 
-function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBottomTab, expandedPosition, setExpandedPosition, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
+function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBottomTab, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
   snapshot: TradingSnapshot | null;
   portfolio: AuthenticatedPortfolioSnapshot | null;
   instruments: CrossExInstrument[] | null;
   bottomTab: string;
   setBottomTab: (tab: string) => void;
-  expandedPosition: string | null;
-  setExpandedPosition: (value: string | null) => void;
   onTradingChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
   notify: (kind: 'ok' | 'error', title: string, text: string) => void;
@@ -843,25 +836,15 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
 }) {
   const { t } = useLanguage();
   const [cancellingIds, setCancellingIds] = useState<string[]>([]);
-  const [closeTargets, setCloseTargets] = useState<Position[] | null>(null);
-  const [tablePages, setTablePages] = useState({ positions: 1, openOrders: 1, orderHistory: 1, tradeHistory: 1 });
+  const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
+  const [tablePages, setTablePages] = useState({ openOrders: 1, orderHistory: 1, tradeHistory: 1 });
   const positions = snapshot?.positions.filter((position) => Number(position.quantity) !== 0) ?? [];
   const orders = snapshot?.orders ?? [];
   const openOrders = orders.filter((order) => OPEN_ORDER_STATES.includes(order.state));
   const fills = snapshot?.fills ?? [];
-  const groups = Object.values(positions.reduce<Record<string, Position[]>>((result, position) => {
-    const part = symbolParts(position.symbol);
-    (result[positionGroupKey(part.asset, part.venue)] ??= []).push(position);
-    return result;
-  }, {}));
-  const positionsPage = executionPageWindow(groups.length, tablePages.positions);
+  const positionRows = useMemo(() => snapshot ? prepareExecutionPositionRows(snapshot, portfolio, { allowStalePortfolio: true }) : [], [snapshot, portfolio]);
   const tabs = [`Positions (${positions.length})`, `Open orders (${openOrders.length})`, 'Order history', 'Trade history'];
   const active = bottomTab.startsWith('Positions') ? tabs[0] : bottomTab.startsWith('Open orders') ? tabs[1] : bottomTab;
-  const notionalFor = (position: Position) => Math.abs(Number(position.quantity) * Number(position.mark_price));
-  const portfolioPositions = portfolio?.snapshot.futuresPositions ?? [];
-  const fundingFeeCell = (value: number | null, quote: string) => <td className={value !== null && value > 0 ? 'positive' : value !== null && value < 0 ? 'negative' : ''}>
-    {value === null ? '—' : `${signedAmount(value)} ${quote}`}
-  </td>;
   useEffect(() => {
     if (!active.startsWith('Positions') || positions.length === 0) return;
     let refreshInProgress = false;
@@ -875,23 +858,27 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   useEffect(() => {
     setTablePages((current) => {
       const next = {
-        positions: executionPageWindow(groups.length, current.positions).page,
         openOrders: executionPageWindow(openOrders.length, current.openOrders).page,
         orderHistory: executionPageWindow(orders.length, current.orderHistory).page,
         tradeHistory: executionPageWindow(fills.length, current.tradeHistory).page,
       };
-      return next.positions === current.positions
-        && next.openOrders === current.openOrders
+      return next.openOrders === current.openOrders
         && next.orderHistory === current.orderHistory
         && next.tradeHistory === current.tradeHistory ? current : next;
     });
-  }, [groups.length, openOrders.length, orders.length, fills.length]);
-  const requestClose = (targets: Position[]) => {
+  }, [openOrders.length, orders.length, fills.length]);
+  const requestClose = (targets: PositionTableRow[]) => {
     if (tradingMode !== 'live') {
       onOpenModeDialog();
       return;
     }
-    setCloseTargets(targets);
+    setCloseTargets(targets.map((position) => ({
+      id: `${position.symbol}:${position.positionId}`,
+      positionId: position.positionId,
+      symbol: position.symbol,
+      quantity: String(position.quantity),
+      markPrice: String(position.markPrice),
+    })));
   };
   // A silently failed cancel looks identical to a dead order — surface the failure and keep the
   // row locked while the request is in flight so a double click cannot fire twice.
@@ -910,50 +897,12 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   };
   return <section className="positions-panel terminal-panel">
     <div className="positions-head"><div className="panel-tabs">{tabs.map((tab) => { const match = tab.match(/^(.+?)( \(\d+\))?$/); return <button className={active === tab ? 'active' : ''} onClick={() => setBottomTab(tab)} key={tab}>{t(match?.[1] ?? tab)}{match?.[2] ?? ''}</button>; })}</div></div>
-    {active.startsWith('Positions') && (groups.length ? <><div className="positions-table table-wrap"><table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('ADL indicator')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th><th>{t('Close position')}</th></tr></thead><tbody>{groups.slice(positionsPage.start, positionsPage.end).map((legs) => {
-      const firstPart = symbolParts(legs[0].symbol);
-      const assets = [...new Set(legs.map((leg) => {
-        const part = symbolParts(leg.symbol);
-        return canonicalPositionAsset(part.asset, part.venue);
-      }))];
-      const asset = assets[0];
-      const mixedAssets = assets.length > 1;
-      const groupLabel = positionGroupLabel(assets);
-      const quantity = legs.reduce((sum, leg) => sum + Number(leg.quantity), 0);
-      const grossQuantity = legs.reduce((sum, leg) => sum + Math.abs(Number(leg.quantity)), 0);
-      const grossNotional = legs.reduce((sum, leg) => sum + notionalFor(leg), 0);
-      const venueCount = new Set(legs.map((leg) => symbolParts(leg.symbol).venue)).size;
-      const pnl = legs.reduce((sum, leg) => sum + (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity), 0);
-      const weightedEntryPrice = legs.reduce((sum, leg) => sum + Number(leg.entry_price) * Math.abs(Number(leg.quantity)), 0) / grossQuantity;
-      const weightedMarkPrice = legs.reduce((sum, leg) => sum + Number(leg.mark_price) * Math.abs(Number(leg.quantity)), 0) / grossQuantity;
-      const fullyHedged = mixedAssets
-        ? legs.some((leg) => Number(leg.quantity) > 0) && legs.some((leg) => Number(leg.quantity) < 0)
-        : grossQuantity > 0 && Math.abs(quantity) <= Math.max(1e-12, grossQuantity * 1e-9);
-      const key = `${positionGroupKey(firstPart.asset, firstPart.venue)}-PERP`;
-      const adlRanks = adlRanksForPositions(legs.map((leg) => ({
-        positionId: leg.position_id,
-        symbol: leg.symbol,
-        venue: symbolParts(leg.symbol).venue,
-      })), portfolioPositions);
-      if (legs.length === 1) {
-        const leg = legs[0];
-        const part = symbolParts(leg.symbol);
-        return <tr key={key}><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small className={quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(quantity >= 0 ? 'Long' : 'Short')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{quantity.toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td><AdlIndicators ranks={adlRanks} /></td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>;
-      }
-      const aggregateFundingFee = aggregatePositionFundingFee(legs, portfolioPositions);
-      return <Fragment key={key}><tr className="aggregate-row"><td><button className={expandedPosition === key ? 'expand-position expanded' : 'expand-position'} onClick={() => setExpandedPosition(expandedPosition === key ? null : key)}>›</button><strong>{groupLabel} PERP</strong><small className={fullyHedged ? 'hedged-tag' : quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(fullyHedged ? 'Hedged' : quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{venueCount} {t(venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{mixedAssets ? '—' : `${quantity.toFixed(4)} ${asset}`}</td><td>${formatAmount(grossNotional)}</td><td>{mixedAssets ? '—' : compactPrice(weightedEntryPrice)}</td><td>{mixedAssets ? '—' : compactPrice(weightedMarkPrice)}</td><td>—</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT</td><td>{legs.reduce((sum, leg) => sum + Number(leg.realized_pnl), 0).toFixed(2)} USDT</td>{fundingFeeCell(aggregateFundingFee, 'USDT')}<td><button className="row-action close-position-action" onClick={() => requestClose(legs)}>{t('Close all')}</button></td></tr>{expandedPosition === key && legs.map((leg, index) => { const part = symbolParts(leg.symbol); const legPnl = (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity); return <tr className="position-leg" key={leg.symbol}><td><span className="leg-branch">↳</span><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{Number(leg.quantity).toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td><AdlIndicators ranks={[adlRanks[index]]} /></td><td className={legPnl >= 0 ? 'positive' : 'negative'}>{legPnl >= 0 ? '+' : ''}{legPnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>; })}</Fragment>;
-    })}</tbody></table></div><ExecutionPagination itemCount={groups.length} page={positionsPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, positions: page }))} /></> : <EmptyTable label="positions" />)}
+    {active.startsWith('Positions') && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestClose} /> : <EmptyTable label="positions" />)}
     {active.startsWith('Open orders') && (openOrders.length ? <OrderTable orders={openOrders} page={tablePages.openOrders} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
     {active === 'Order history' && (orders.length ? <OrderTable orders={orders} page={tablePages.orderHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, orderHistory: page }))} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
     {active === 'Trade history' && (fills.length ? <FillTable fills={fills} page={tablePages.tradeHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /> : <EmptyTable label="trade history" />)}
     {closeTargets && <PositionCloseDialog
-      targets={closeTargets.map((position) => ({
-        id: `${position.symbol}:${position.position_id}`,
-        positionId: position.position_id,
-        symbol: position.symbol,
-        quantity: position.quantity,
-        markPrice: position.mark_price,
-      }))}
+      targets={closeTargets}
       portfolio={portfolio}
       instruments={instruments}
       onDismiss={() => setCloseTargets(null)}

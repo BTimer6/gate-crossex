@@ -7,6 +7,7 @@ describe('English and Chinese translations', () => {
     ['zh', 'More', '更多'],
     ['zh', 'Best ask', '最优卖价'],
     ['zh', 'ADL indicator', 'ADL 指标'],
+    ['zh', 'It indicates the position in ADL ranking. When all lights are lit, the position is at the top of the ADL preference hierarchy.', '它表示该持仓在 ADL 排名中的位置。所有指示条均亮起时，该持仓处于 ADL 事件优先级的最高位置。'],
     ['zh', 'Manage and switch accounts', '管理和切换账户'],
     ['zh', 'Current account', '当前账户'],
     ['zh', 'Edit account name', '编辑账户名称'],

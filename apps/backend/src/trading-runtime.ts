@@ -220,6 +220,8 @@ export interface TradingRuntimeOptions {
   /** Delay between attempts to settle a PENDING_SUBMIT row whose submission outcome is unknown. */
   submitResolvePollMs?: number;
   submitResolveMaxAttempts?: number;
+  /** Account-wide barrier shared with credential replacement/switch/deletion. */
+  runAuthenticatedWrite?: <T>(work: () => Promise<T>) => Promise<T>;
 }
 
 export interface StrategyMarginLeg {
@@ -248,6 +250,7 @@ export class TradingRuntime {
   private readonly remoteRefreshes = new Map<string, Promise<ExecutionOrder | null>>();
   private readonly cancelRequests = new Map<string, Promise<ExecutionOrder>>();
   private readonly preparedStatements = new Map<string, Database.Statement>();
+  private readonly runAuthenticatedWrite: <T>(work: () => Promise<T>) => Promise<T>;
 
   constructor(
     private readonly database: Database.Database,
@@ -258,6 +261,7 @@ export class TradingRuntime {
   ) {
     this.submitResolvePollMs = options.submitResolvePollMs ?? 2_500;
     this.submitResolveMaxAttempts = options.submitResolveMaxAttempts ?? 24;
+    this.runAuthenticatedWrite = options.runAuthenticatedWrite ?? (async (work) => work());
   }
 
   subscribe(listener: RuntimeListener): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
@@ -732,6 +736,14 @@ export class TradingRuntime {
   }
 
   async createOrder(
+    raw: unknown,
+    metadata?: PlaceOrderMetadata,
+    referencePrice?: string,
+  ): Promise<ExecutionOrder> {
+    return this.runAuthenticatedWrite(() => this.createOrderWithStableCredentials(raw, metadata, referencePrice));
+  }
+
+  private async createOrderWithStableCredentials(
     raw: unknown,
     metadata?: PlaceOrderMetadata,
     referencePrice?: string,

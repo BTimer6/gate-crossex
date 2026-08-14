@@ -401,6 +401,7 @@ test.describe.serial('local trading terminal', () => {
     try {
       await page.goto('/');
       const riskDialog = page.getByRole('dialog', { name: 'Risk disclaimer' });
+      await riskDialog.waitFor({ state: 'visible', timeout: 2_000 }).catch(() => undefined);
       if (await riskDialog.isVisible()) {
         await riskDialog.getByRole('checkbox', { name: 'I have read and understand the risks above.' }).check();
         await riskDialog.getByRole('button', { name: /Continue in read-only mode/ }).click();
@@ -415,6 +416,17 @@ test.describe.serial('local trading terminal', () => {
       await expect(legs).toHaveCount(2);
       await expect(legs.filter({ hasText: 'Hyperliquid' })).toContainText('+1.25 USDC');
       await expect(legs.filter({ hasText: 'Bybit' })).toContainText('-0.25 USDT');
+
+      const adlSignal = legs.filter({ hasText: 'Bybit' }).locator('.adl-signal');
+      await expect(adlSignal.locator('.adl-lights i')).toHaveCount(5);
+      await adlSignal.hover();
+      const tooltip = page.getByRole('tooltip');
+      await expect(tooltip).toContainText('It indicates the position in ADL ranking.');
+      await expect(tooltip).toContainText('BYBIT · Exchange ADL: unavailable · CrossEx ADL: unavailable');
+      const [signalBox, tooltipBox] = await Promise.all([adlSignal.boundingBox(), tooltip.boundingBox()]);
+      expect(signalBox).not.toBeNull();
+      expect(tooltipBox).not.toBeNull();
+      expect((tooltipBox?.y ?? 0) + (tooltipBox?.height ?? 0)).toBeLessThan(signalBox?.y ?? 0);
     } finally {
       await page.request.delete('/__e2e/grouped-positions');
     }

@@ -101,8 +101,9 @@ describe('strategy positions', () => {
 
   it('groups same-asset venue legs with the aggregate values used by the trading page', () => {
     const row = (overrides: Partial<StrategyPositionRow>): StrategyPositionRow => ({
-      id: 'row', venue: 'BYBIT', asset: 'HYPE', quote: 'USDT', side: 'Long', quantity: 100,
+      id: 'row', positionId: 'row', symbol: 'BYBIT_FUTURE_HYPE_USDT', venue: 'BYBIT', asset: 'HYPE', quote: 'USDT', side: 'Long', quantity: 100,
       value: 5_200, entryPrice: 51, markPrice: 52, leverage: '5', unrealizedPnl: 100,
+      realizedPnl: 0, fundingFee: 0,
       ...overrides,
     });
 
@@ -118,8 +119,8 @@ describe('strategy positions', () => {
 
   it('groups SKHY and SKHYNIX as one expandable premium pair', () => {
     const rows: StrategyPositionRow[] = [
-      { id: 'adr', venue: 'GATE', asset: 'SKHY', quote: 'USDT', side: 'Short', quantity: -1, value: 230, entryPrice: 230, markPrice: 229, leverage: '5', unrealizedPnl: 1 },
-      { id: 'local', venue: 'BINANCE', asset: 'SKHYNIX', quote: 'USDT', side: 'Long', quantity: 0.1, value: 170, entryPrice: 1700, markPrice: 1710, leverage: '5', unrealizedPnl: 1 },
+      { id: 'adr', positionId: 'adr', symbol: 'GATE_FUTURE_SKHY_USDT', venue: 'GATE', asset: 'SKHY', quote: 'USDT', side: 'Short', quantity: -1, value: 230, entryPrice: 230, markPrice: 229, leverage: '5', unrealizedPnl: 1, realizedPnl: 0, fundingFee: 0 },
+      { id: 'local', positionId: 'local', symbol: 'BINANCE_FUTURE_SKHYNIX_USDT', venue: 'BINANCE', asset: 'SKHYNIX', quote: 'USDT', side: 'Long', quantity: 0.1, value: 170, entryPrice: 1700, markPrice: 1710, leverage: '5', unrealizedPnl: 1, realizedPnl: 0, fundingFee: 0 },
     ];
 
     expect(groupStrategyPositions(rows)).toEqual([expect.objectContaining({
@@ -130,8 +131,8 @@ describe('strategy positions', () => {
 
   it('groups a Hyperliquid SKHX alias with SKHYNIX positions', () => {
     const rows: StrategyPositionRow[] = [
-      { id: 'gate', venue: 'GATE', asset: 'SKHYNIX', quote: 'USDT', side: 'Long', quantity: 0.1, value: 170, entryPrice: 1700, markPrice: 1710, leverage: '5', unrealizedPnl: 1 },
-      { id: 'hyperliquid', venue: 'HYPERLIQUID', asset: 'SKHX', quote: 'USDC', side: 'Short', quantity: -0.1, value: 171, entryPrice: 1710, markPrice: 1700, leverage: '5', unrealizedPnl: 1 },
+      { id: 'gate', positionId: 'gate', symbol: 'GATE_FUTURE_SKHYNIX_USDT', venue: 'GATE', asset: 'SKHYNIX', quote: 'USDT', side: 'Long', quantity: 0.1, value: 170, entryPrice: 1700, markPrice: 1710, leverage: '5', unrealizedPnl: 1, realizedPnl: 0, fundingFee: 0 },
+      { id: 'hyperliquid', positionId: 'hyperliquid', symbol: 'HYPERLIQUID_FUTURE_SKHX_USDC', venue: 'HYPERLIQUID', asset: 'SKHX', quote: 'USDC', side: 'Short', quantity: -0.1, value: 171, entryPrice: 1710, markPrice: 1700, leverage: '5', unrealizedPnl: 1, realizedPnl: 0, fundingFee: 0 },
     ];
 
     expect(groupStrategyPositions(rows)).toEqual([expect.objectContaining({
@@ -142,8 +143,8 @@ describe('strategy positions', () => {
 
   it('keeps SKHX on other venues separate because aliases are venue-scoped', () => {
     const rows: StrategyPositionRow[] = [
-      { id: 'gate-skhx', venue: 'GATE', asset: 'SKHX', quote: 'USDT', side: 'Long', quantity: 1, value: 10, entryPrice: 10, markPrice: 10, leverage: '5', unrealizedPnl: 0 },
-      { id: 'gate-skhynix', venue: 'GATE', asset: 'SKHYNIX', quote: 'USDT', side: 'Short', quantity: -1, value: 10, entryPrice: 10, markPrice: 10, leverage: '5', unrealizedPnl: 0 },
+      { id: 'gate-skhx', positionId: 'gate-skhx', symbol: 'GATE_FUTURE_SKHX_USDT', venue: 'GATE', asset: 'SKHX', quote: 'USDT', side: 'Long', quantity: 1, value: 10, entryPrice: 10, markPrice: 10, leverage: '5', unrealizedPnl: 0, realizedPnl: 0, fundingFee: 0 },
+      { id: 'gate-skhynix', positionId: 'gate-skhynix', symbol: 'GATE_FUTURE_SKHYNIX_USDT', venue: 'GATE', asset: 'SKHYNIX', quote: 'USDT', side: 'Short', quantity: -1, value: 10, entryPrice: 10, markPrice: 10, leverage: '5', unrealizedPnl: 0, realizedPnl: 0, fundingFee: 0 },
     ];
 
     expect(groupStrategyPositions(rows).map((group) => group.key)).toEqual([

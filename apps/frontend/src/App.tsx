@@ -555,6 +555,8 @@ function App() {
   const preferencesReadyRef = useRef(false);
   const catalogFetchedAtRef = useRef(0);
   const feesLoadedRef = useRef(false);
+  const feeRequestGenerationRef = useRef(0);
+  const feeProfileRef = useRef<string | null | undefined>(undefined);
   const tradingSnapshotRef = useRef<TradingSnapshot | null>(null);
   tradingSnapshotRef.current = tradingSnapshot;
   const t = useMemo(() => (key: string) => translate(language, key), [language]);
@@ -668,18 +670,23 @@ function App() {
     setStrategies((await api.strategies()).strategies);
   }, []);
   const refreshFees = useCallback(() => {
+    const requestGeneration = ++feeRequestGenerationRef.current;
     setFeesReady(false);
     setFeesError(null);
     void api.fees()
       .then((response) => {
+        if (requestGeneration !== feeRequestGenerationRef.current) return;
         feesLoadedRef.current = true;
         setFees(response.fees);
       })
       .catch((error: unknown) => {
+        if (requestGeneration !== feeRequestGenerationRef.current) return;
         setFeesError(error instanceof ApiError ? error.code : 'fee_rates_unavailable');
         reportBackendConnectivityError(error);
       })
-      .finally(() => setFeesReady(true));
+      .finally(() => {
+        if (requestGeneration === feeRequestGenerationRef.current) setFeesReady(true);
+      });
   }, [reportBackendConnectivityError]);
 
   const watchMarket = useCallback((symbol: string, interval: CandleInterval) => {
@@ -1053,11 +1060,11 @@ function App() {
     if (workspace === 'Funding Rates') return fundingDetailAsset
       ? <FundingDetailView asset={fundingDetailAsset} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
-    if (workspace === 'Portfolio') return <PortfolioView tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
+    if (workspace === 'Portfolio') return <PortfolioView key={connection?.activeProfileId ?? 'no-active-account'} tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
     if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -1117,12 +1124,23 @@ function App() {
     }
   }, [accountNameDraft, applyAccountConnection, connection?.activeProfileId, connection?.label, reportBackendConnectivityError]);
 
-  useEffect(() => {
-    // Fee schedules are account-scoped; the next fee-consuming workspace visit refetches them.
+  useLayoutEffect(() => {
+    const activeProfileId = connection?.activeProfileId ?? null;
+    if (feeProfileRef.current === undefined) {
+      feeProfileRef.current = activeProfileId;
+      return;
+    }
+    if (feeProfileRef.current === activeProfileId) return;
+    feeProfileRef.current = activeProfileId;
+    feeRequestGenerationRef.current += 1;
     feesLoadedRef.current = false;
+    setFees([]);
+    setFeesReady(false);
+    setFeesError(null);
+    if (workspace === 'Trade' || workspace === 'Strategy' || workspace === 'Trading Fees') refreshFees();
     setEditingAccountName(false);
     setAccountRenameError(null);
-  }, [connection?.activeProfileId]);
+  }, [connection?.activeProfileId, refreshFees, workspace]);
 
   useEffect(() => {
     if (settingsOpen) return;

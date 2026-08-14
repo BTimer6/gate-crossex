@@ -145,10 +145,10 @@ describe('Gate APIv4 signing', () => {
       const value = String(url);
       if (value.endsWith('/crossex/accounts')) return new Response(JSON.stringify(account));
       if (value.endsWith('/crossex/positions')) return new Response(JSON.stringify([position]));
-      if (value.endsWith('/crossex/adl_rank?symbol=BINANCE_FUTURE_BTC_USDT')) return new Response(JSON.stringify([{
+      if (value.endsWith('/crossex/adl_rank?symbol=BINANCE_FUTURE_BTC_USDT')) return new Response(JSON.stringify({
         user_id: 'user-1', symbol: 'BINANCE_FUTURE_BTC_USDT',
         crossex_adl_rank: '4', exchange_adl_rank: '3',
-      }]));
+      }));
       if (value.endsWith('/crossex/margin_positions')) return new Response('[]');
       if (value.endsWith('/crossex/open_orders')) return new Response(JSON.stringify([order]));
       if (value.endsWith('/crossex/history_trades?page=1&limit=100')) return new Response(JSON.stringify([trade]));
@@ -165,6 +165,21 @@ describe('Gate APIv4 signing', () => {
     })]);
     expect(portfolio.openOrders[0]?.client_order_id).toBe('c1');
     expect(portfolio.recentTrades[0]?.transaction_id).toBe('t1');
+  });
+
+  it('also accepts an array-shaped ADL response', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify([{
+      user_id: 'user-1', symbol: 'OKX_FUTURE_BTC_USDT',
+      crossex_adl_rank: '2', exchange_adl_rank: '1',
+    }])));
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000, undefined, 0);
+
+    await expect(client.queryAdlRanks(
+      { apiKey: 'test-api-key', apiSecret: 'test-secret' },
+      ['OKX_FUTURE_BTC_USDT'],
+    )).resolves.toEqual([expect.objectContaining({
+      symbol: 'OKX_FUTURE_BTC_USDT', crossex_adl_rank: '2', exchange_adl_rank: '1',
+    })]);
   });
 
   it('keeps the portfolio usable when supplemental ADL data is unavailable', async () => {
@@ -191,6 +206,21 @@ describe('Gate APIv4 signing', () => {
 
     await expect(client.queryPortfolio({ apiKey: 'test-api-key', apiSecret: 'test-secret' }))
       .resolves.toMatchObject({ positions: [position], adlRanks: [] });
+  });
+
+  it('stops supplemental ADL enrichment after the first rate limit', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ label: 'RATE_LIMITED' }),
+      { status: 429, headers: { 'Retry-After': '30' } },
+    ));
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000, undefined, 0);
+
+    await expect(client.queryAdlRanks(
+      { apiKey: 'test-api-key', apiSecret: 'test-secret' },
+      ['BINANCE_FUTURE_BTC_USDT', 'OKX_FUTURE_BTC_USDT', 'BYBIT_FUTURE_BTC_USDT'],
+    )).resolves.toEqual([]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('validates nullable fields from the public CrossEx symbol catalog', async () => {

@@ -34,7 +34,7 @@ function portfolio(): AuthenticatedPortfolioSnapshot {
 }
 
 describe('portfolio risk rendering', () => {
-  it('renders both account-wide rates, their explanations, and both five-light ADL scales', () => {
+  it('renders both account-wide rates, their explanations, and the compact ADL signal', () => {
     const html = renderToStaticMarkup(
       <LanguageContext.Provider value={{ language: 'en', theme: 'dark', t: (key) => key, setLanguage: vi.fn() }}>
         <PortfolioView
@@ -57,7 +57,7 @@ describe('portfolio risk rendering', () => {
     expect(html).toContain('At or below 100%, CrossEx force-liquidates positions.');
     expect(html).toContain('Exchange ADL: 4/5 (raw rank 3)');
     expect(html).toContain('CrossEx ADL: 4/5');
-    expect(html.match(/adl-light-set danger/g)).toHaveLength(2);
-    expect(html.match(/class="lit"/g)).toHaveLength(8);
+    expect(html.match(/adl-signal danger/g)).toHaveLength(1);
+    expect(html.match(/class="lit"/g)).toHaveLength(4);
   });
 });

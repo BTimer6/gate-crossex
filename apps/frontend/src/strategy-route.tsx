@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
@@ -34,7 +34,6 @@ import {
   DEFAULT_ADR_RATIO,
   FUNDING_VENUE_COLORS,
   PAIR_HISTORY_RANGES,
-  VenueCell,
   assessMarginCapacity,
   balanceFor,
   balanceUnitFor,
@@ -47,7 +46,6 @@ import {
   priceText,
   projectedPositionValue,
   quoteFor,
-  signedAmount,
   signedPortfolioQuantity,
   streamedAssets,
   symbolParts,
@@ -61,13 +59,11 @@ import { strategyAssetOptions, strategyVenueSymbol } from './strategy-asset-opti
 import { StrategyAssetSearch } from './strategy-asset-search.js';
 import { localizeStrategyLogCondition, localizeStrategyLogResult, prepareStrategyLogs, type DisplayStrategyLog } from './strategy-logs.js';
 import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
-import { groupStrategyPositions, prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
+import { prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
+import { PositionsTable } from './positions-table.js';
 import { StrategyLaunchConfirmation } from './strategy-launch-confirmation.js';
 import { useLanguage, type Language } from './i18n.js';
 import { numericFutureFeeRate } from './fee-rates.js';
-import { executionPageWindow } from './execution-pagination.js';
-import { ExecutionPagination } from './execution-pagination-control.js';
-import { AdlIndicators } from './adl-indicator.js';
 
 const PremiumHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PremiumHistoryChart })));
 const PriceDifferenceHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PriceDifferenceHistoryChart })));
@@ -151,12 +147,10 @@ function strategyStartTime(createdAt: string, language: Language): { date: strin
 }
 
 function strategyCloseTarget(position: StrategyPositionRow): ClosePositionTarget {
-  const symbol = `${position.venue}_FUTURE_${position.asset}_${position.quote}`;
-  const positionId = position.id.includes(':') ? position.id.slice(position.id.indexOf(':') + 1) : position.id;
   return {
-    id: `${symbol}:${positionId}`,
-    positionId,
-    symbol,
+    id: `${position.symbol}:${position.positionId}`,
+    positionId: position.positionId,
+    symbol: position.symbol,
     quantity: String(position.quantity),
     markPrice: String(position.markPrice),
   };
@@ -185,8 +179,6 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const [takeProfitDraft, setTakeProfitDraft] = useState('');
   const [updatingTakeProfitId, setUpdatingTakeProfitId] = useState<string | null>(null);
   const [historyPage, setHistoryPage] = useState(1);
-  const [positionPage, setPositionPage] = useState(1);
-  const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
   const [closeNotice, setCloseNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const runningStrategies = strategies.filter((strategy) => ['RUNNING', 'PAUSED'].includes(strategy.status));
@@ -204,8 +196,6 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     () => prepareStrategyPositions(authenticatedPortfolio, tradingSnapshot),
     [authenticatedPortfolio, tradingSnapshot],
   );
-  const positionGroups = useMemo(() => groupStrategyPositions(positionsView.rows), [positionsView.rows]);
-  const positionsPage = executionPageWindow(positionGroups.length, positionPage);
   const selectedLogStrategy = strategies.find((strategy) => strategy.id === selectedLogStrategyId) ?? null;
   const logDialogRef = useDialogFocus(Boolean(selectedLogStrategy), () => setSelectedLogStrategyId(null));
 
@@ -220,10 +210,6 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   useEffect(() => {
     setHistoryPage((current) => Math.min(current, historyPages));
   }, [historyPages]);
-
-  useEffect(() => {
-    setPositionPage((current) => executionPageWindow(positionGroups.length, current).page);
-  }, [positionGroups.length]);
 
   useEffect(() => {
     if (!closeNotice) return;
@@ -337,25 +323,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <button role="tab" aria-selected={showingHistory} className={showingHistory ? 'active' : ''} onClick={() => { setActiveStrategyTab('historical'); setHistoryPage(1); setEditingTakeProfitId(null); }}>{t('Historical')} <span>({historicalStrategies.length})</span></button>
       </div>
       {showingPositions ? <>
-        {positionsView.status === 'fresh' && positionGroups.length > 0 && <><div className="strategy-positions-table positions-table table-wrap">
-          <table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('ADL indicator')}</th><th>{t('Unrealized PnL')}</th><th>{t('Close position')}</th></tr></thead><tbody>
-            {positionGroups.slice(positionsPage.start, positionsPage.end).map((group) => {
-              if (group.legs.length === 1) {
-                const position = group.legs[0];
-                const venue = exchanges.find((item) => item.id === position.venue.toLowerCase());
-                return <tr key={group.key}><td><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small className={position.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(position.side)}</small></td><td><VenueCell id={position.venue.toLowerCase()} name={venue?.name ?? position.venue} short={venue?.short ?? position.venue.slice(0, 2)} /></td><td>{formatAmount(position.quantity, 4)} {position.asset}</td><td>${formatAmount(position.value)}</td><td>{priceText(position.entryPrice)}</td><td>{priceText(position.markPrice)}</td><td>{position.leverage ? `${position.leverage}×` : '—'}</td><td><AdlIndicators ranks={[{ key: position.id, venue: position.venue, crossExRank: position.crossExAdlRank, exchangeRank: position.exchangeAdlRank }]} /></td><td className={position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{signedAmount(position.unrealizedPnl)}</td><td><button className="row-action close-position-action" onClick={() => requestPositionClose([position])}>{t('Close position')}</button></td></tr>;
-              }
-              const expanded = expandedPosition === group.key;
-              return <Fragment key={group.key}>
-                <tr className="aggregate-row"><td><button type="button" className={expanded ? 'expand-position expanded' : 'expand-position'} aria-expanded={expanded} aria-label={`${t('Positions')} · ${group.label}`} onClick={() => setExpandedPosition(expanded ? null : group.key)}>›</button><strong>{group.label} PERP</strong><small className={group.fullyHedged ? 'hedged-tag' : group.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(group.fullyHedged ? 'Hedged' : group.quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{group.venueCount} {t(group.venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{group.mixedAssets ? '—' : `${formatAmount(group.quantity, 4)} ${group.asset}`}</td><td>${formatAmount(group.grossNotional)}</td><td>{group.mixedAssets ? '—' : priceText(group.weightedEntryPrice)}</td><td>{group.mixedAssets ? '—' : priceText(group.weightedMarkPrice)}</td><td>{group.leverage ? `${group.leverage}×` : '—'}</td><td>—</td><td className={group.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{signedAmount(group.unrealizedPnl)}</td><td><button className="row-action close-position-action" onClick={() => requestPositionClose(group.legs)}>{t('Close all')}</button></td></tr>
-                {expanded && group.legs.map((position) => {
-                  const venue = exchanges.find((item) => item.id === position.venue.toLowerCase());
-                  return <tr className="position-leg" key={position.id}><td><span className="leg-branch">↳</span><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueCell id={position.venue.toLowerCase()} name={venue?.name ?? position.venue} short={venue?.short ?? position.venue.slice(0, 2)} /></td><td>{formatAmount(position.quantity, 4)} {position.asset}</td><td>{formatAmount(position.value)} {position.quote}</td><td>{priceText(position.entryPrice)}</td><td>{priceText(position.markPrice)}</td><td>{position.leverage ? `${position.leverage}×` : '—'}</td><td><AdlIndicators ranks={[{ key: position.id, venue: position.venue, crossExRank: position.crossExAdlRank, exchangeRank: position.exchangeAdlRank }]} /></td><td className={position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{signedAmount(position.unrealizedPnl)} {position.quote}</td><td><button className="row-action close-position-action" onClick={() => requestPositionClose([position])}>{t('Close position')}</button></td></tr>;
-                })}
-              </Fragment>;
-            })}
-          </tbody></table>
-        </div><ExecutionPagination itemCount={positionGroups.length} page={positionsPage.page} onPageChange={setPositionPage} /></>}
+        {positionsView.status === 'fresh' && positionsView.rows.length > 0 && <PositionsTable rows={positionsView.rows} onClose={requestPositionClose} />}
         {positionsView.status === 'fresh' && positionsView.rows.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t('No open positions')}</strong><small>{t('The live account has no open futures positions.')}</small></div>}
         {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
         {positionsView.status === 'unavailable' && <div className="no-strategies"><span>◎</span><strong>{t('Position data unavailable')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}

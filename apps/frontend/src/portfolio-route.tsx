@@ -7,6 +7,7 @@ import type {
   CrossExTransferBalance,
   CrossExTransferCoin,
   CrossExTransferRequest,
+  CrossExInstrument,
   LiveBalance,
   PrivateStreamStatus,
   TradingMode,
@@ -29,8 +30,10 @@ import { maximumTransferAmount } from './transfer-amount.js';
 import { transferAccountsFor, transferFeeForRoute } from './transfer-rules.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { ExecutionPagination } from './execution-pagination-control.js';
-import { AdlIndicators } from './adl-indicator.js';
 import { marginRatePercent } from './portfolio-metrics.js';
+import { PositionsTable } from './positions-table.js';
+import type { PositionTableRow } from './strategy-positions.js';
+import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
 
 function VenueFromCode({ code }: { code: string }) {
   const exchange = exchanges.find((item) => item.id === code.toLowerCase());
@@ -65,26 +68,6 @@ interface PortfolioViewProps {
 type PortfolioTab = 'positions' | 'orders' | 'fills' | 'margin';
 type ActivityTab = 'transfers' | 'funding-fees' | 'account-book';
 
-interface PortfolioPositionRow {
-  id: string;
-  symbol: string;
-  venue: string;
-  asset: string;
-  quote: string;
-  side: 'Long' | 'Short';
-  quantity: number;
-  value: number;
-  entryPrice: number;
-  markPrice: number;
-  upnl: number;
-  upnlRate: number | null;
-  leverage: string | null;
-  realized: number | null;
-  fundingFee: number | null;
-  crossExAdlRank: string | null;
-  exchangeAdlRank: string | null;
-}
-
 function venueDisplayName(code: string): string {
   return exchanges.find((exchange) => exchange.id === code.toLowerCase())?.name ?? code;
 }
@@ -110,7 +93,7 @@ const TRANSFER_ROUTE_MESSAGES: Record<CrossExTransferRouteError, string> = {
 export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStream, tradingMode, onOpenModeDialog, onRefresh }: PortfolioViewProps) {
   const { language, t } = useLanguage();
   const [tab, setTab] = useState<PortfolioTab>('positions');
-  const [tablePages, setTablePages] = useState({ positions: 1, openOrders: 1, tradeHistory: 1, margin: 1 });
+  const [tablePages, setTablePages] = useState({ openOrders: 1, tradeHistory: 1, margin: 1 });
   const [refreshing, setRefreshing] = useState(false);
   const [activityTab, setActivityTab] = useState<ActivityTab>('transfers');
   const [activity, setActivity] = useState<CrossExPortfolioActivityResponse | null>(null);
@@ -128,6 +111,9 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   const [pendingTransfer, setPendingTransfer] = useState<CrossExTransferRequest | null>(null);
   const [transferring, setTransferring] = useState(false);
   const [transferFeedback, setTransferFeedback] = useState<{ tone: 'success' | 'error'; message: string } | null>(null);
+  const [instruments, setInstruments] = useState<CrossExInstrument[] | null>(null);
+  const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
+  const [closeNotice, setCloseNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const confirmDialogRef = useRef<HTMLElement | null>(null);
   const transferMonitorGeneration = useRef(0);
   const locale = language === 'zh' ? 'zh-CN' : 'en-GB';
@@ -136,7 +122,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
 
   // The authenticated snapshot is the venue's own accounting (leverage, margin, venue-marked PnL);
   // the local execution store stands in only while no snapshot has ever loaded.
-  const positionRows = useMemo<PortfolioPositionRow[]>(() => {
+  const positionRows = useMemo<PositionTableRow[]>(() => {
     if (snapshot?.futuresPositions) {
       return snapshot.futuresPositions
         .filter((position) => (parseNumber(position.quantity) ?? 0) !== 0)
@@ -145,9 +131,9 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           const quantity = parseNumber(position.quantity) ?? 0;
           const markPrice = parseNumber(position.markPrice) ?? 0;
           const reportedValue = Math.abs(parseNumber(position.value) ?? 0);
-          const rate = parseNumber(position.unrealizedPnlRate);
           return {
             id: position.positionId || position.symbol,
+            positionId: position.positionId,
             symbol: position.symbol,
             venue: part.venue,
             asset: part.asset,
@@ -157,10 +143,9 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
             value: reportedValue > 0 ? reportedValue : Math.abs(quantity * markPrice),
             entryPrice: parseNumber(position.entryPrice) ?? 0,
             markPrice,
-            upnl: parseNumber(position.unrealizedPnl) ?? 0,
-            upnlRate: rate === null ? null : rate * 100,
+            unrealizedPnl: parseNumber(position.unrealizedPnl) ?? 0,
             leverage: position.leverage || null,
-            realized: parseNumber(position.realizedPnl),
+            realizedPnl: parseNumber(position.realizedPnl),
             fundingFee: parseNumber(position.fundingFee),
             crossExAdlRank: position.crossExAdlRank ?? null,
             exchangeAdlRank: position.exchangeAdlRank ?? null,
@@ -176,6 +161,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         const markPrice = Number(position.mark_price) || 0;
         return {
           id: `${position.venue}:${position.symbol}`,
+          positionId: position.position_id,
           symbol: position.symbol,
           venue: position.venue,
           asset: symbolParts(position.symbol).asset,
@@ -185,11 +171,10 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
           value: Math.abs(quantity * markPrice),
           entryPrice,
           markPrice,
-          upnl: (markPrice - entryPrice) * quantity,
-          upnlRate: null,
+          unrealizedPnl: (markPrice - entryPrice) * quantity,
           leverage: null,
-          realized: parseNumber(position.realized_pnl),
-          fundingFee: null,
+          realizedPnl: parseNumber(position.realized_pnl),
+          fundingFee: parseNumber(position.funding_fee),
           crossExAdlRank: null,
           exchangeAdlRank: null,
         };
@@ -298,17 +283,15 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   useEffect(() => {
     setTablePages((current) => {
       const next = {
-        positions: executionPageWindow(positionRows.length, current.positions).page,
         openOrders: executionPageWindow(orderRows.length, current.openOrders).page,
         tradeHistory: executionPageWindow(fillRows.length, current.tradeHistory).page,
         margin: executionPageWindow(marginRows.length, current.margin).page,
       };
-      return next.positions === current.positions
-        && next.openOrders === current.openOrders
+      return next.openOrders === current.openOrders
         && next.tradeHistory === current.tradeHistory
         && next.margin === current.margin ? current : next;
     });
-  }, [positionRows.length, orderRows.length, fillRows.length, marginRows.length]);
+  }, [orderRows.length, fillRows.length, marginRows.length]);
 
   // Snapshot balances first for coverage, live stream rows on top: the asset channel pushes
   // between slower REST reconciliation checks.
@@ -360,6 +343,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
   useEffect(() => {
     void loadActivity();
     void loadTransferBalances();
+    void api.instruments().then((response) => setInstruments(response.items)).catch(() => undefined);
     void api.transferCoins()
       .then((response) => {
         setTransferCoins(response.items);
@@ -367,6 +351,12 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
       })
       .catch(() => setTransferCoinError(true));
   }, [loadActivity, loadTransferBalances]);
+
+  useEffect(() => {
+    if (!closeNotice) return;
+    const timer = window.setTimeout(() => setCloseNotice(null), 4_500);
+    return () => window.clearTimeout(timer);
+  }, [closeNotice]);
 
   useEffect(() => {
     if (!pendingTransfer) return;
@@ -462,7 +452,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     });
   }, [visibleTransfers.length, visibleFundingFees.length, visibleAccountBook.length]);
 
-  const futuresUnrealized = positionRows.reduce((sum, row) => sum + row.upnl, 0);
+  const futuresUnrealized = positionRows.reduce((sum, row) => sum + row.unrealizedPnl, 0);
   const unrealized = futuresUnrealized + marginRows.reduce((sum, row) => sum + row.upnl, 0);
   const exposure = positionRows.reduce((sum, row) => sum + row.value, 0) + marginRows.reduce((sum, row) => sum + row.value, 0);
   const openLegCount = positionRows.length + marginRows.length;
@@ -537,6 +527,20 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     if (refreshing) return;
     setRefreshing(true);
     try { await onRefresh(); } catch { /* The sync chip already reflects staleness. */ } finally { setRefreshing(false); }
+  }
+
+  function requestPositionClose(rows: PositionTableRow[]) {
+    if (tradingMode !== 'live') {
+      onOpenModeDialog();
+      return;
+    }
+    setCloseTargets(rows.map((position) => ({
+      id: `${position.symbol}:${position.positionId}`,
+      positionId: position.positionId,
+      symbol: position.symbol,
+      quantity: String(position.quantity),
+      markPrice: String(position.markPrice),
+    })));
   }
 
   function useMaximumAmount() {
@@ -652,7 +656,6 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
     ...(marginRows.length > 0 ? [{ id: 'margin' as const, label: 'Margin positions', count: marginRows.length }] : []),
   ];
   const activeTab: PortfolioTab = tab === 'margin' && marginRows.length === 0 ? 'positions' : tab;
-  const positionsPage = executionPageWindow(positionRows.length, tablePages.positions);
   const openOrdersPage = executionPageWindow(orderRows.length, tablePages.openOrders);
   const tradeHistoryPage = executionPageWindow(fillRows.length, tablePages.tradeHistory);
   const marginPage = executionPageWindow(marginRows.length, tablePages.margin);
@@ -859,22 +862,7 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         <span className="spacer" />
         <span className="table-source">{tableSource}</span>
       </div>
-      {activeTab === 'positions' && (positionRows.length ? <><div className="positions-table table-wrap"><table>
-        <thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Value')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('ADL indicator')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th></tr></thead>
-        <tbody>{positionRows.slice(positionsPage.start, positionsPage.end).map((row) => <tr key={row.id}>
-          <td><strong>{marketSymbol(row.asset, row.quote, 'perpetual')}</strong><small className={row.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(row.side)}</small></td>
-          <td><VenueFromCode code={row.venue} /></td>
-          <td>{formatAmount(Math.abs(row.quantity), 4)} {row.asset}</td>
-          <td>${formatAmount(row.value)}</td>
-          <td>{priceText(row.entryPrice)}</td>
-          <td>{priceText(row.markPrice)}</td>
-          <td>{row.leverage ? `${row.leverage}×` : '—'}</td>
-          <td><AdlIndicators ranks={[{ key: row.id, venue: row.venue, crossExRank: row.crossExAdlRank, exchangeRank: row.exchangeAdlRank }]} /></td>
-          <td className={row.upnl >= 0 ? 'positive' : 'negative'}>{signedAmount(row.upnl)}{row.upnlRate !== null && <span className="pnl-rate">{signedAmount(row.upnlRate)}%</span>}</td>
-          <td>{row.realized !== null ? signedAmount(row.realized) : '—'}</td>
-          <td className={row.fundingFee !== null && row.fundingFee > 0 ? 'positive' : row.fundingFee !== null && row.fundingFee < 0 ? 'negative' : ''}>{row.fundingFee !== null ? signedAmount(row.fundingFee) : '—'}</td>
-        </tr>)}</tbody>
-      </table></div><ExecutionPagination itemCount={positionRows.length} page={positionsPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, positions: page }))} /></> : <EmptyTable label="positions" />)}
+      {activeTab === 'positions' && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestPositionClose} /> : <EmptyTable label="positions" />)}
       {activeTab === 'orders' && (orderRows.length ? <><div className="positions-table table-wrap"><table>
         <thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th></tr></thead>
         <tbody>{orderRows.slice(openOrdersPage.start, openOrdersPage.end).map((row) => <tr key={row.id}>
@@ -919,6 +907,15 @@ export function PortfolioView({ tradingSnapshot, balances, portfolio, accountStr
         </tr>)}</tbody>
       </table></div><ExecutionPagination itemCount={marginRows.length} page={marginPage.page} onPageChange={(page) => setTablePages((current) => ({ ...current, margin: page }))} /></>}
     </section>
+    {closeTargets && <PositionCloseDialog
+      targets={closeTargets}
+      portfolio={portfolio}
+      instruments={instruments}
+      onDismiss={() => setCloseTargets(null)}
+      onCompleted={onRefresh}
+      notify={(kind, title, text) => setCloseNotice({ kind, title, text })}
+    />}
+    {closeNotice && <div className={closeNotice.kind === 'error' ? 'toast toast-error' : 'toast'} role={closeNotice.kind === 'error' ? 'alert' : 'status'}><span>{closeNotice.kind === 'error' ? '!' : '✓'}</span><div><strong>{closeNotice.title}</strong><p>{closeNotice.text}</p></div></div>}
     {pendingTransfer && <div className="modal-backdrop transfer-confirm-backdrop" onMouseDown={(event) => {
       if (event.target === event.currentTarget && !transferring) setPendingTransfer(null);
     }}>
