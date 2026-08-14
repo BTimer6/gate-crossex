@@ -10,6 +10,7 @@ export default tseslint.config(
       '**/dist/**',
       '**/dist-ts/**',
       '**/node_modules/**',
+      '.claude/worktrees/**',
       '.local-data/**',
       'logs/**',
     ],

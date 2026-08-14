@@ -700,10 +700,9 @@ test.describe.serial('local trading terminal', () => {
     const fundingDuration = fundingHistoryPanel.getByRole('group', { name: 'Duration' });
     await expect(fundingDuration.getByRole('button')).toHaveText(['24H', '7D', '30D']);
     await expect(fundingDuration.getByRole('button', { name: '30D' })).toHaveAttribute('aria-pressed', 'true');
-    const oneDayHistory = page.waitForRequest((request) => request.url().endsWith('/api/markets/funding-history/series')
-      && request.method() === 'POST' && request.postDataJSON().durationDays === 1);
+    // The strategy view prefetches the full 30-day series once; shorter ranges filter that data
+    // locally instead of issuing another history request.
     await fundingDuration.getByRole('button', { name: '24H' }).click();
-    await oneDayHistory;
     await expect(fundingDuration.getByRole('button', { name: '24H' })).toHaveAttribute('aria-pressed', 'true');
     await expect(fundingHistoryPanel.getByRole('heading', { name: /Cumulative funding/ })).toContainText('24H');
     const pnlLegend = page.locator('.funding-detail-legend > span').filter({ hasText: 'Cumulative funding PnL' });
