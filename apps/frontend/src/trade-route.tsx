@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { contiguousCandleTail, type CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
@@ -14,7 +14,6 @@ import {
   type MarketCatalogAsset,
   type MarketSnapshot,
   type OrderBookSnapshot,
-  type Position,
   type PublicMarketSnapshot,
   type PublicTrade,
   type TradingMode,
@@ -22,6 +21,7 @@ import {
   type VenueFeeRate,
 } from './api.js';
 import { MarketSelect } from './market-select.js';
+import { VenueSelect } from './venue-select.js';
 import { marketSymbol } from './market-symbol.js';
 import { compactPrice, decimalPlaces, formatBookAmount, formatGroupStep, fullBookAmount } from './number-format.js';
 import {
@@ -31,7 +31,6 @@ import {
   OPEN_ORDER_STATES,
   TIMEFRAMES,
   VenueCell,
-  VenueIcon,
   assetIcon,
   assetName,
   balanceFor,
@@ -50,7 +49,6 @@ import {
   priceText,
   projectedPositionValue,
   quoteFor,
-  signedAmount,
   signedPortfolioQuantity,
   symbolParts,
   ticketIssues,
@@ -60,11 +58,15 @@ import {
   type OrderType,
   type Side,
 } from './route-shared.js';
-import { aggregatePositionFundingFee, positionFundingFee } from './position-funding-fees.js';
-import { positionGroupKey, positionGroupLabel } from './position-grouping.js';
-import { PositionCloseDialog } from './position-close-dialog.js';
+import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
 import { numericFutureFeeRate } from './fee-rates.js';
 import { useLanguage } from './i18n.js';
+import { formatExecutionDateTime } from './execution-date-time.js';
+import { executionPageWindow } from './execution-pagination.js';
+import { ExecutionPagination } from './execution-pagination-control.js';
+import { orderDisplayPrice } from './order-display-price.js';
+import { PositionsTable } from './positions-table.js';
+import { prepareExecutionPositionRows, type PositionTableRow } from './strategy-positions.js';
 
 const CandleChart = lazy(() => import('./charts.js').then((module) => ({ default: module.CandleChart })));
 
@@ -255,21 +257,17 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [amount, setAmount] = useState('');
   const [allocation, setAllocation] = useState(0);
   const [bottomTab, setBottomTab] = useState('Positions (0)');
-  const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [skipFutureConfirmations, setSkipFutureConfirmations] = useState(false);
   const [exchangeId, setExchangeId] = useState('gate');
   const [pendingExchangeId, setPendingExchangeId] = useState<string | null>(null);
-  const [venueMenuOpen, setVenueMenuOpen] = useState(false);
-  const [venueHighlight, setVenueHighlight] = useState(0);
   const [reduceOnly, setReduceOnly] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [chartTab, setChartTab] = useState<'chart' | 'overview'>('chart');
   const [hoveredCandle, setHoveredCandle] = useState<Candle | null>(null);
   const [readyCandleKey, setReadyCandleKey] = useState<string | null>(null);
-  const [clock, setClock] = useState(() => Date.now());
   const [instrumentCatalog, setInstrumentCatalog] = useState<CrossExInstrument[] | null>(null);
   const [officialFundingSnapshot, setOfficialFundingSnapshot] = useState<PublicMarketSnapshot | null>(null);
   const [sizeUnits, setSizeUnits] = useState<Record<string, string> | null>(null);
@@ -282,10 +280,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const [leverageUpdating, setLeverageUpdating] = useState(false);
   const [leverageError, setLeverageError] = useState<string | null>(null);
   const leverageRef = useRef<HTMLDivElement | null>(null);
-  const venueRootRef = useRef<HTMLDivElement | null>(null);
-  const venueTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const venueItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const venueMenuId = useId();
   const exchangeLoadRef = useRef(0);
   const historyLoadingRef = useRef<Set<string>>(new Set());
   const historyExhaustedRef = useRef<Set<string>>(new Set());
@@ -408,71 +402,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   const venueIsAvailable = (venueId: string) =>
     catalogAsset === null || catalogAsset.venues.some((entry) => entry.venue === venueId.toUpperCase());
 
-  const enabledVenueIndexes = () => exchanges
-    .map((item, index) => venueIsAvailable(item.id) ? index : -1)
-    .filter((index) => index >= 0);
-
-  const focusVenue = (index: number) => {
-    setVenueHighlight(index);
-    requestAnimationFrame(() => venueItemRefs.current[index]?.focus());
-  };
-
-  const openVenueMenuFromKeyboard = (direction: 1 | -1) => {
-    const enabled = enabledVenueIndexes();
-    if (enabled.length === 0) return;
-    const selectedIndex = exchanges.findIndex((item) => item.id === exchangeId);
-    const selectedPosition = enabled.indexOf(selectedIndex);
-    const targetPosition = selectedPosition >= 0
-      ? (selectedPosition + (direction > 0 ? 0 : enabled.length - 1)) % enabled.length
-      : direction > 0 ? 0 : enabled.length - 1;
-    setVenueMenuOpen(true);
-    focusVenue(enabled[targetPosition]);
-  };
-
-  const chooseVenue = (nextExchangeId: string) => {
-    setVenueMenuOpen(false);
-    if (nextExchangeId !== exchangeId) selectExchange(nextExchangeId);
-    requestAnimationFrame(() => venueTriggerRef.current?.focus());
-  };
-
-  const onVenueTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-    event.preventDefault();
-    openVenueMenuFromKeyboard(event.key === 'ArrowDown' ? 1 : -1);
-  };
-
-  const onVenueMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    const enabled = enabledVenueIndexes();
-    if (enabled.length === 0) return;
-    const currentPosition = Math.max(0, enabled.indexOf(venueHighlight));
-    let targetPosition: number | null = null;
-    if (event.key === 'ArrowDown') targetPosition = (currentPosition + 1) % enabled.length;
-    else if (event.key === 'ArrowUp') targetPosition = (currentPosition - 1 + enabled.length) % enabled.length;
-    else if (event.key === 'Home') targetPosition = 0;
-    else if (event.key === 'End') targetPosition = enabled.length - 1;
-    if (targetPosition === null) return;
-    event.preventDefault();
-    focusVenue(enabled[targetPosition]);
-  };
-
-  useEffect(() => {
-    if (!venueMenuOpen) return;
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      if (venueRootRef.current && !venueRootRef.current.contains(event.target as Node)) setVenueMenuOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      setVenueMenuOpen(false);
-      venueTriggerRef.current?.focus();
-    };
-    document.addEventListener('mousedown', closeOnOutsideClick);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('mousedown', closeOnOutsideClick);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [venueMenuOpen]);
 
   useEffect(() => {
     // A pending venue page belongs to the asset and timeframe it was requested for. Invalidate it
@@ -617,11 +546,6 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   }, [candles, candleKey, symbol, interval, seedCandles]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
     setMaxLeverage(null);
     setRiskTiers(null);
@@ -728,49 +652,21 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
   return <>
     <section className="market-header">
       <div className="pair-title"><MarketSelect asset={asset} label={marketSymbol(asset, quote, 'perpetual')} venue={exchangeId.toUpperCase()} subtitle={`${assetName(asset)} ${t('Perpetual').toLowerCase()}`} icon={assetIcon(asset)} catalog={catalog} marketSnapshot={marketSnapshot} favorites={favorites} assetName={assetName} assetIcon={assetIcon} onSelect={onSelectAsset} t={t} /></div>
-      <div className="exchange-control" ref={venueRootRef}
-        onBlur={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setVenueMenuOpen(false);
-        }}>
-        <button ref={venueTriggerRef} className={`exchange-selector${venueMenuOpen ? ' open' : ''}`}
-          onClick={() => {
-            setVenueHighlight(Math.max(0, exchanges.findIndex((item) => item.id === exchangeId)));
-            setVenueMenuOpen((current) => !current);
-          }} onKeyDown={onVenueTriggerKeyDown}
-          aria-label={`${t('Execution venue')}: ${exchange.name}`} aria-haspopup="menu" aria-expanded={venueMenuOpen}
-          aria-controls={venueMenuOpen ? venueMenuId : undefined}>
-          <VenueIcon id={exchange.id} short={exchange.short} />
-          <span className="exchange-details">
-            <small>{t('Execution venue')}</small>
-            <span className="exchange-summary">
-              <strong>{exchange.name}</strong>
-              <span className="venue-health"><i />{pendingExchangeId ? t('Loading chart…') : liveMarket?.source === 'gate_crossex_websocket' ? t('Connected') : 'SEED'}</span>
-            </span>
-          </span>
-          <span className="exchange-chevron" aria-hidden="true">⌄</span>
-        </button>
-        {venueMenuOpen && <div id={venueMenuId} className="exchange-menu" role="menu" aria-label={t('Execution venue')}
-          onKeyDown={onVenueMenuKeyDown}>
-          <header><span>{t('Execution venue')}</span><small>{asset} {t('Perpetual').toLowerCase()}</small></header>
-          <div className="exchange-menu-list">
-            {exchanges.map((item, index) => {
-              const available = venueIsAvailable(item.id);
-              const selected = item.id === exchangeId;
-              return <button key={item.id} ref={(node) => { venueItemRefs.current[index] = node; }}
-                className={`${selected ? 'selected' : ''}${index === venueHighlight ? ' highlighted' : ''}`}
-                role="menuitemradio" aria-checked={selected} disabled={!available} tabIndex={index === venueHighlight ? 0 : -1}
-                onMouseEnter={() => { if (available) setVenueHighlight(index); }} onClick={() => chooseVenue(item.id)}>
-                <VenueIcon id={item.id} short={item.short} />
-                <span><strong>{item.name}</strong><small>{marketSymbol(asset, catalogAsset?.venues.find((venue) => venue.venue === item.id.toUpperCase())?.quote ?? quoteFor(item.id), 'perpetual')}</small></span>
-                {selected && <i className="exchange-check" aria-hidden="true">✓</i>}
-              </button>;
-            })}
-          </div>
-        </div>}
-      </div>
+      <VenueSelect
+        label={t('Execution venue')}
+        menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
+        status={<span className="venue-health"><i />{pendingExchangeId ? t('Loading chart…') : liveMarket?.source === 'gate_crossex_websocket' ? t('Connected') : 'SEED'}</span>}
+        options={exchanges.map((item) => ({
+          ...item,
+          disabled: !venueIsAvailable(item.id),
+          detail: marketSymbol(asset, catalogAsset?.venues.find((venue) => venue.venue === item.id.toUpperCase())?.quote ?? quoteFor(item.id), 'perpetual'),
+        }))}
+        value={exchangeId}
+        onSelect={selectExchange}
+      />
       <div className="headline-price"><strong>{priceText(displayedPrice)}</strong></div>
       <dl className="market-stats">
-        <div><dt>{t('Best bid')}</dt><dd>{priceText(Number(liveMarket?.bidPrice ?? displayedPrice))}</dd></div><div><dt>{t('24h high')}</dt><dd>{priceText(Number(liveMarket?.high24h ?? displayedPrice))}</dd></div><div><dt>{t('24h low')}</dt><dd>{priceText(Number(liveMarket?.low24h ?? displayedPrice))}</dd></div><div><dt>{t('24h volume')}</dt><dd>{liveMarket?.quoteVolume24h ? `$${(Number(liveMarket.quoteVolume24h) / 1_000_000).toFixed(1)}M` : '—'}</dd></div><div><dt>{t('Funding / Interval')}</dt><dd><span className={Number(liveMarket?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</span> · {formatCountdown(nextFundingAt, clock)}</dd></div>
+        <div><dt>{t('Best bid')}</dt><dd>{priceText(Number(liveMarket?.bidPrice ?? displayedPrice))}</dd></div><div><dt>{t('24h high')}</dt><dd>{priceText(Number(liveMarket?.high24h ?? displayedPrice))}</dd></div><div><dt>{t('24h low')}</dt><dd>{priceText(Number(liveMarket?.low24h ?? displayedPrice))}</dd></div><div><dt>{t('24h volume')}</dt><dd>{liveMarket?.quoteVolume24h ? `$${(Number(liveMarket.quoteVolume24h) / 1_000_000).toFixed(1)}M` : '—'}</dd></div><div><dt>{t('Funding / Interval')}</dt><dd><span className={Number(liveMarket?.fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</span> · <FundingCountdown target={nextFundingAt} /></dd></div>
       </dl>
       <button className="star-button" onClick={() => onToggleFavorite(symbol)} aria-label={`${isFavorite ? 'Remove' : 'Add'} ${asset} favorite`} aria-pressed={isFavorite}>{isFavorite ? '★' : '☆'}</button>
     </section>
@@ -805,7 +701,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
             <div><dt>{t('Maker fee')}</dt><dd>{makerFeeText}</dd></div>
             <div><dt>{t('Taker fee')}</dt><dd>{takerFeeText}</dd></div>
             <div><dt>{t('Funding / Interval')}</dt><dd>{((Number(liveMarket?.fundingRate ?? 0)) * 100).toFixed(4)}%</dd></div>
-            <div><dt>{t('Next funding')}</dt><dd>{formatCountdown(nextFundingAt, clock)}</dd></div>
+            <div><dt>{t('Next funding')}</dt><dd><FundingCountdown target={nextFundingAt} /></dd></div>
             <div><dt>{t('Status')}</dt><dd>{instrument.state}</dd></div>
           </dl>}
         </div>}
@@ -867,7 +763,7 @@ export function TradingView({ asset, catalog, onSelectAsset, marketSnapshot, tra
       </aside>
     </section>
 
-    <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} instruments={instrumentCatalog} bottomTab={bottomTab} setBottomTab={setBottomTab} expandedPosition={expandedPosition} setExpandedPosition={setExpandedPosition} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
+    <ExecutionTables snapshot={tradingSnapshot} portfolio={authenticatedPortfolio} instruments={instrumentCatalog} bottomTab={bottomTab} setBottomTab={setBottomTab} onTradingChanged={onTradingChanged} onPositionsRefresh={onPositionsRefresh} notify={showNotice} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} />
     {confirming && <div className="modal-backdrop confirm-order-backdrop" role="presentation" onMouseDown={() => setConfirming(false)}>
       <section ref={confirmDialogRef} tabIndex={-1} className="confirm-order-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-order-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>
@@ -911,19 +807,27 @@ function VenueFromCode({ code }: { code: string }) {
   return <VenueCell id={code.toLowerCase()} name={exchange?.name ?? code} short={exchange?.short ?? code.slice(0, 2)} />;
 }
 
+/** Self-ticking countdown so the per-second refresh re-renders this label, not the whole terminal. */
+function FundingCountdown({ target }: { target: string | undefined }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return <>{formatCountdown(target, now)}</>;
+}
+
 function EmptyTable({ label }: { label: string }) {
   const { t } = useLanguage();
   return <div className="empty-state"><span>◎</span><strong>{t(`No ${label.toLowerCase()}`)}</strong><p>{t('The backend will add rows here as executions occur.')}</p></div>;
 }
 
-function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBottomTab, expandedPosition, setExpandedPosition, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
+function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBottomTab, onTradingChanged, onPositionsRefresh, notify, tradingMode, onOpenModeDialog }: {
   snapshot: TradingSnapshot | null;
   portfolio: AuthenticatedPortfolioSnapshot | null;
   instruments: CrossExInstrument[] | null;
   bottomTab: string;
   setBottomTab: (tab: string) => void;
-  expandedPosition: string | null;
-  setExpandedPosition: (value: string | null) => void;
   onTradingChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
   notify: (kind: 'ok' | 'error', title: string, text: string) => void;
@@ -932,23 +836,15 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
 }) {
   const { t } = useLanguage();
   const [cancellingIds, setCancellingIds] = useState<string[]>([]);
-  const [closeTargets, setCloseTargets] = useState<Position[] | null>(null);
+  const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
+  const [tablePages, setTablePages] = useState({ openOrders: 1, orderHistory: 1, tradeHistory: 1 });
   const positions = snapshot?.positions.filter((position) => Number(position.quantity) !== 0) ?? [];
   const orders = snapshot?.orders ?? [];
   const openOrders = orders.filter((order) => OPEN_ORDER_STATES.includes(order.state));
   const fills = snapshot?.fills ?? [];
-  const groups = Object.values(positions.reduce<Record<string, Position[]>>((result, position) => {
-    const asset = symbolParts(position.symbol).asset;
-    (result[positionGroupKey(asset)] ??= []).push(position);
-    return result;
-  }, {}));
+  const positionRows = useMemo(() => snapshot ? prepareExecutionPositionRows(snapshot, portfolio, { allowStalePortfolio: true }) : [], [snapshot, portfolio]);
   const tabs = [`Positions (${positions.length})`, `Open orders (${openOrders.length})`, 'Order history', 'Trade history'];
   const active = bottomTab.startsWith('Positions') ? tabs[0] : bottomTab.startsWith('Open orders') ? tabs[1] : bottomTab;
-  const notionalFor = (position: Position) => Math.abs(Number(position.quantity) * Number(position.mark_price));
-  const portfolioPositions = portfolio?.snapshot.futuresPositions ?? [];
-  const fundingFeeCell = (value: number | null, quote: string) => <td className={value !== null && value > 0 ? 'positive' : value !== null && value < 0 ? 'negative' : ''}>
-    {value === null ? '—' : `${signedAmount(value)} ${quote}`}
-  </td>;
   useEffect(() => {
     if (!active.startsWith('Positions') || positions.length === 0) return;
     let refreshInProgress = false;
@@ -959,12 +855,30 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [active, positions.length, onPositionsRefresh]);
-  const requestClose = (targets: Position[]) => {
+  useEffect(() => {
+    setTablePages((current) => {
+      const next = {
+        openOrders: executionPageWindow(openOrders.length, current.openOrders).page,
+        orderHistory: executionPageWindow(orders.length, current.orderHistory).page,
+        tradeHistory: executionPageWindow(fills.length, current.tradeHistory).page,
+      };
+      return next.openOrders === current.openOrders
+        && next.orderHistory === current.orderHistory
+        && next.tradeHistory === current.tradeHistory ? current : next;
+    });
+  }, [openOrders.length, orders.length, fills.length]);
+  const requestClose = (targets: PositionTableRow[]) => {
     if (tradingMode !== 'live') {
       onOpenModeDialog();
       return;
     }
-    setCloseTargets(targets);
+    setCloseTargets(targets.map((position) => ({
+      id: `${position.symbol}:${position.positionId}`,
+      positionId: position.positionId,
+      symbol: position.symbol,
+      quantity: String(position.quantity),
+      markPrice: String(position.markPrice),
+    })));
   };
   // A silently failed cancel looks identical to a dead order — surface the failure and keep the
   // row locked while the request is in flight so a double click cannot fire twice.
@@ -983,41 +897,12 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   };
   return <section className="positions-panel terminal-panel">
     <div className="positions-head"><div className="panel-tabs">{tabs.map((tab) => { const match = tab.match(/^(.+?)( \(\d+\))?$/); return <button className={active === tab ? 'active' : ''} onClick={() => setBottomTab(tab)} key={tab}>{t(match?.[1] ?? tab)}{match?.[2] ?? ''}</button>; })}</div></div>
-    {active.startsWith('Positions') && (groups.length ? <div className="positions-table table-wrap"><table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Unrealized PnL')}</th><th>{t('Realized PnL')}</th><th>{t('Funding fee')}</th><th>{t('Close position')}</th></tr></thead><tbody>{groups.map((legs) => {
-      const asset = symbolParts(legs[0].symbol).asset;
-      const assets = [...new Set(legs.map((leg) => symbolParts(leg.symbol).asset))];
-      const mixedAssets = assets.length > 1;
-      const groupLabel = positionGroupLabel(assets);
-      const quantity = legs.reduce((sum, leg) => sum + Number(leg.quantity), 0);
-      const grossQuantity = legs.reduce((sum, leg) => sum + Math.abs(Number(leg.quantity)), 0);
-      const grossNotional = legs.reduce((sum, leg) => sum + notionalFor(leg), 0);
-      const venueCount = new Set(legs.map((leg) => symbolParts(leg.symbol).venue)).size;
-      const pnl = legs.reduce((sum, leg) => sum + (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity), 0);
-      const weightedEntryPrice = legs.reduce((sum, leg) => sum + Number(leg.entry_price) * Math.abs(Number(leg.quantity)), 0) / grossQuantity;
-      const weightedMarkPrice = legs.reduce((sum, leg) => sum + Number(leg.mark_price) * Math.abs(Number(leg.quantity)), 0) / grossQuantity;
-      const fullyHedged = mixedAssets
-        ? legs.some((leg) => Number(leg.quantity) > 0) && legs.some((leg) => Number(leg.quantity) < 0)
-        : grossQuantity > 0 && Math.abs(quantity) <= Math.max(1e-12, grossQuantity * 1e-9);
-      const key = `${positionGroupKey(asset)}-PERP`;
-      if (legs.length === 1) {
-        const leg = legs[0];
-        const part = symbolParts(leg.symbol);
-        return <tr key={key}><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small className={quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(quantity >= 0 ? 'Long' : 'Short')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{quantity.toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>;
-      }
-      const aggregateFundingFee = aggregatePositionFundingFee(legs, portfolioPositions);
-      return <Fragment key={key}><tr className="aggregate-row"><td><button className={expandedPosition === key ? 'expand-position expanded' : 'expand-position'} onClick={() => setExpandedPosition(expandedPosition === key ? null : key)}>›</button><strong>{groupLabel} PERP</strong><small className={fullyHedged ? 'hedged-tag' : quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(fullyHedged ? 'Hedged' : quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{venueCount} {t(venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{mixedAssets ? '—' : `${quantity.toFixed(4)} ${asset}`}</td><td>${formatAmount(grossNotional)}</td><td>{mixedAssets ? '—' : compactPrice(weightedEntryPrice)}</td><td>{mixedAssets ? '—' : compactPrice(weightedMarkPrice)}</td><td className={pnl >= 0 ? 'positive' : 'negative'}>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} USDT</td><td>{legs.reduce((sum, leg) => sum + Number(leg.realized_pnl), 0).toFixed(2)} USDT</td>{fundingFeeCell(aggregateFundingFee, 'USDT')}<td><button className="row-action close-position-action" onClick={() => requestClose(legs)}>{t('Close all')}</button></td></tr>{expandedPosition === key && legs.map((leg) => { const part = symbolParts(leg.symbol); const legPnl = (Number(leg.mark_price) - Number(leg.entry_price)) * Number(leg.quantity); return <tr className="position-leg" key={leg.symbol}><td><span className="leg-branch">↳</span><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueFromCode code={part.venue} /></td><td>{Number(leg.quantity).toFixed(4)} {part.asset}</td><td>{formatAmount(notionalFor(leg))} {part.quote}</td><td>{compactPrice(Number(leg.entry_price))}</td><td>{compactPrice(Number(leg.mark_price))}</td><td className={legPnl >= 0 ? 'positive' : 'negative'}>{legPnl >= 0 ? '+' : ''}{legPnl.toFixed(2)} {part.quote}</td><td>{Number(leg.realized_pnl).toFixed(2)} {part.quote}</td>{fundingFeeCell(positionFundingFee(leg, portfolioPositions), part.quote)}<td><button className="row-action close-position-action" onClick={() => requestClose([leg])}>{t('Close position')}</button></td></tr>; })}</Fragment>;
-    })}</tbody></table></div> : <EmptyTable label="positions" />)}
-    {active.startsWith('Open orders') && (openOrders.length ? <OrderTable orders={openOrders} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
-    {active === 'Order history' && (orders.length ? <OrderTable orders={orders} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
-    {active === 'Trade history' && (fills.length ? <FillTable fills={fills} /> : <EmptyTable label="trade history" />)}
+    {active.startsWith('Positions') && (positionRows.length ? <PositionsTable rows={positionRows} onClose={requestClose} /> : <EmptyTable label="positions" />)}
+    {active.startsWith('Open orders') && (openOrders.length ? <OrderTable orders={openOrders} page={tablePages.openOrders} onPageChange={(page) => setTablePages((current) => ({ ...current, openOrders: page }))} cancellable onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="open orders" />)}
+    {active === 'Order history' && (orders.length ? <OrderTable orders={orders} page={tablePages.orderHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, orderHistory: page }))} onCancel={cancel} busyOrderIds={cancellingIds} /> : <EmptyTable label="order history" />)}
+    {active === 'Trade history' && (fills.length ? <FillTable fills={fills} page={tablePages.tradeHistory} onPageChange={(page) => setTablePages((current) => ({ ...current, tradeHistory: page }))} /> : <EmptyTable label="trade history" />)}
     {closeTargets && <PositionCloseDialog
-      targets={closeTargets.map((position) => ({
-        id: `${position.symbol}:${position.position_id}`,
-        positionId: position.position_id,
-        symbol: position.symbol,
-        quantity: position.quantity,
-        markPrice: position.mark_price,
-      }))}
+      targets={closeTargets}
       portfolio={portfolio}
       instruments={instruments}
       onDismiss={() => setCloseTargets(null)}
@@ -1027,14 +912,16 @@ function ExecutionTables({ snapshot, portfolio, instruments, bottomTab, setBotto
   </section>;
 }
 
-function OrderTable({ orders, cancellable = false, onCancel, busyOrderIds }: { orders: ExecutionOrder[]; cancellable?: boolean; onCancel: (order: ExecutionOrder) => Promise<void>; busyOrderIds: string[] }) {
+function OrderTable({ orders, page, onPageChange, cancellable = false, onCancel, busyOrderIds }: { orders: ExecutionOrder[]; page: number; onPageChange: (page: number) => void; cancellable?: boolean; onCancel: (order: ExecutionOrder) => Promise<void>; busyOrderIds: string[] }) {
   const { language, t } = useLanguage();
-  return <div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th>{cancellable && <th />}</tr></thead><tbody>{orders.map((order) => { const part = symbolParts(order.symbol); const busy = busyOrderIds.includes(order.id); return <tr key={order.id}><td>{new Date(order.createdAt).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong>{order.strategyId && <small className="long-tag">{order.strategyId}</small>}</td><td><VenueFromCode code={part.venue} /></td><td><small className={order.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(order.side === 'BUY' ? 'Buy' : 'Sell')} · {t(order.type === 'LIMIT' ? 'Limit' : 'Market')}</small></td><td>{order.executedAveragePrice ?? order.price ?? t('Market')}</td><td>{order.quantity} {part.asset}</td><td>{order.executedQuantity}</td><td><span className={`status-tag ${order.state.toLowerCase()}`}>{order.state}</span></td><td>{order.remoteOrderId ?? order.clientOrderId}</td>{cancellable && <td><button className="row-action" onClick={() => void onCancel(order)} disabled={busy}>{busy ? t('Cancelling…') : t('Cancel')}</button></td>}</tr>; })}</tbody></table></div>;
+  const window = executionPageWindow(orders.length, page);
+  return <><div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side / Type')}</th><th>{t('Price')}</th><th>{t('Amount')}</th><th>{t('Filled')}</th><th>{t('Status')}</th><th>{t('Order ID')}</th>{cancellable && <th />}</tr></thead><tbody>{orders.slice(window.start, window.end).map((order) => { const part = symbolParts(order.symbol); const busy = busyOrderIds.includes(order.id); return <tr key={order.id}><td>{formatExecutionDateTime(order.createdAt, language)}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong>{order.strategyId && <small className="long-tag">{order.strategyId}</small>}</td><td><VenueFromCode code={part.venue} /></td><td><small className={order.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(order.side === 'BUY' ? 'Buy' : 'Sell')} · {t(order.type === 'LIMIT' ? 'Limit' : 'Market')}</small></td><td>{orderDisplayPrice(order, t('Market'))}</td><td>{order.quantity} {part.asset}</td><td>{order.executedQuantity}</td><td><span className={`status-tag ${order.state.toLowerCase()}`}>{order.state}</span></td><td>{order.remoteOrderId ?? order.clientOrderId}</td>{cancellable && <td><button className="row-action" onClick={() => void onCancel(order)} disabled={busy}>{busy ? t('Cancelling…') : t('Cancel')}</button></td>}</tr>; })}</tbody></table></div><ExecutionPagination itemCount={orders.length} page={window.page} onPageChange={onPageChange} /></>;
 }
 
-function FillTable({ fills }: { fills: ExecutionFill[] }) {
+function FillTable({ fills, page, onPageChange }: { fills: ExecutionFill[]; page: number; onPageChange: (page: number) => void }) {
   const { language, t } = useLanguage();
-  return <div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Execution price')}</th><th>{t('Size')}</th><th>{t('Fee')}</th><th>{t('Realized PnL')}</th><th>{t('Trade ID')}</th></tr></thead><tbody>{fills.map((fill) => { const part = symbolParts(fill.symbol); return <tr key={fill.id}><td>{new Date(fill.created_at).toLocaleTimeString(language === 'zh' ? 'zh-CN' : 'en-US')}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong></td><td><VenueFromCode code={part.venue} /></td><td><small className={fill.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(fill.side === 'BUY' ? 'Buy' : 'Sell')}</small></td><td>{fill.price}</td><td>{fill.quantity} {part.asset}</td><td>{Number(fill.fee).toFixed(4)}</td><td>{Number(fill.realized_pnl).toFixed(2)}</td><td>{fill.id.slice(0, 12)}</td></tr>; })}</tbody></table></div>;
+  const window = executionPageWindow(fills.length, page);
+  return <><div className="positions-table table-wrap"><table><thead><tr><th>{t('Time')}</th><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Side')}</th><th>{t('Execution price')}</th><th>{t('Size')}</th><th>{t('Fee')}</th><th>{t('Realized PnL')}</th><th>{t('Trade ID')}</th></tr></thead><tbody>{fills.slice(window.start, window.end).map((fill) => { const part = symbolParts(fill.symbol); return <tr key={fill.id}><td>{formatExecutionDateTime(fill.created_at, language)}</td><td><strong>{marketSymbol(part.asset, part.quote, 'perpetual')}</strong></td><td><VenueFromCode code={part.venue} /></td><td><small className={fill.side === 'BUY' ? 'long-tag' : 'short-tag'}>{t(fill.side === 'BUY' ? 'Buy' : 'Sell')}</small></td><td>{fill.price}</td><td>{fill.quantity} {part.asset}</td><td>{Number(fill.fee).toFixed(4)}</td><td>{Number(fill.realized_pnl).toFixed(2)}</td><td>{fill.id.slice(0, 12)}</td></tr>; })}</tbody></table></div><ExecutionPagination itemCount={fills.length} page={window.page} onPageChange={onPageChange} /></>;
 }
 
 /** Formats the max-size column: explicit totals for position/auto, levels × per-order for grids. */

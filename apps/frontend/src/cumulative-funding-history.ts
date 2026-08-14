@@ -33,6 +33,39 @@ export function cumulativeFundingHistory(
   return points;
 }
 
+export interface RealizedFundingWindow {
+  days: number;
+  /** Net realized funding percent (short venue minus long venue), or null when a venue has no settlements in the window. */
+  value: number | null;
+  /** Count of merged settlement timestamps inside the window. */
+  settlements: number;
+}
+
+/**
+ * Net realized funding for a hedged pair over trailing windows carved from one
+ * fetched range. Each window covers `(windowStart, rangeEnd]` and re-baselines
+ * both venues at its own start, so the value is the actual short-minus-long
+ * funding accumulated inside that window regardless of settlement cadence.
+ */
+export function realizedFundingEdgeWindows(
+  longSettlements: FundingSettlementPoint[],
+  shortSettlements: FundingSettlementPoint[],
+  rangeFrom: number,
+  rangeDays: number,
+  windowsDays: number[],
+): RealizedFundingWindow[] {
+  const DAY_MS = 86_400_000;
+  return windowsDays.map((days) => {
+    const from = rangeFrom + Math.max(0, rangeDays - days) * DAY_MS;
+    const longWindow = cumulativeFundingHistory(longSettlements.filter((point) => point.timestamp > from), from);
+    const shortWindow = cumulativeFundingHistory(shortSettlements.filter((point) => point.timestamp > from), from);
+    const pnl = cumulativeFundingPnl(longWindow, shortWindow);
+    if (pnl.length === 0) return { days, value: null, settlements: 0 };
+    // The first merged point is the shared zero baseline at the window start.
+    return { days, value: pnl[pnl.length - 1].value, settlements: Math.max(0, pnl.length - 1) };
+  });
+}
+
 /**
  * Combine two stepwise cumulative funding series into the net funding PnL for
  * a hedged position. Positive funding is paid by the long and earned by the

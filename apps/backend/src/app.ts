@@ -53,6 +53,7 @@ import type {
   VenueFeeRatesResponse,
 } from '@gate-crossex/shared-types';
 import type { BackendConfig } from './config.js';
+import { CredentialOperationBusyError, CredentialOperationGate } from './credential-operation-gate.js';
 import {
   CredentialVaultUnavailableError,
   DEFAULT_CREDENTIAL_PROFILE,
@@ -79,6 +80,8 @@ import {
   addAuditEvent,
   deleteCredentialMetadata,
   getCredentialMetadata,
+  listCredentialMetadata,
+  readActiveCredentialProfile,
   readInstrumentCatalog,
   readLatestPortfolioSnapshot,
   readPublicMarketSnapshot,
@@ -91,6 +94,7 @@ import {
   listReconciliationReports,
   savePortfolioSnapshot,
   saveReconciliationReport,
+  saveActiveCredentialProfile,
   upsertPublicMarketSnapshot,
   upsertCredentialMetadata,
 } from './repositories.js';
@@ -98,6 +102,7 @@ import {
   renderCredentialDeletedPage,
   renderCredentialEntryPage,
   renderCredentialSuccessPage,
+  renderCredentialSwitchSuccessPage,
   type SecureCredentialLanguage,
 } from './secure-credential-page.js';
 
@@ -168,6 +173,7 @@ function deriveMarketCatalog(items: CrossExInstrument[], fetchedAt: string): Der
 const CredentialContextSchema = z.object({
   intent: z.literal('live-trading').optional(),
   lang: z.enum(['en', 'zh']).optional(),
+  action: z.literal('add').optional(),
 });
 const CredentialFormSchema = CredentialContextSchema.extend({
   csrfToken: z.string().min(20).max(200),
@@ -193,6 +199,18 @@ function credentialPageMessage(language: SecureCredentialLanguage, english: stri
 
 const DeleteCredentialFormSchema = CredentialContextSchema.extend({
   csrfToken: z.string().min(20).max(200),
+});
+const CredentialProfileIdSchema = z.string().regex(/^gate-crossex-(?:default|account-[0-9a-f-]{36})$/);
+const SwitchCredentialFormSchema = CredentialContextSchema.extend({
+  csrfToken: z.string().min(20).max(200),
+  profileId: CredentialProfileIdSchema,
+});
+const CredentialProfileParamsSchema = z.object({ profileId: CredentialProfileIdSchema });
+const WebAccountSwitchSchema = z.object({
+  confirmPauseRunningStrategies: z.boolean().default(false),
+});
+const WebAccountRenameSchema = z.object({
+  label: z.string().trim().min(1).max(80).refine(noControlCharacters),
 });
 
 export interface BuildAppOptions {
@@ -277,7 +295,9 @@ function isAllowedBrowserOrigin(origin: string, hostHeader: string | undefined, 
 function isCsrfProtectedCredentialForm(method: string, url: string): boolean {
   if (method !== 'POST') return false;
   const pathname = url.split('?', 1)[0];
-  return pathname === '/secure/credentials' || pathname === '/secure/credentials/delete';
+  return pathname === '/secure/credentials'
+    || pathname === '/secure/credentials/delete'
+    || pathname === '/secure/credentials/switch';
 }
 
 function setSecureHtml(reply: FastifyReply, rendered: { html: string; csp: string }, statusCode = 200): FastifyReply {
@@ -358,7 +378,11 @@ function millisecondTimestamp(value: string | number): string {
   return Number.isFinite(milliseconds) && milliseconds > 0 ? new Date(milliseconds).toISOString() : String(value);
 }
 
-function normalizeFuturesPositions(positions: GateCrossExPosition[]): PortfolioFuturesPosition[] {
+function normalizeFuturesPositions(
+  positions: GateCrossExPosition[],
+  adlRanks: NonNullable<GateCrossExPortfolio['adlRanks']> = [],
+): PortfolioFuturesPosition[] {
+  const adlBySymbol = new Map(adlRanks.map((rank) => [rank.symbol, rank]));
   return positions.map((position) => ({
     positionId: position.position_id, symbol: position.symbol, positionSide: position.position_side,
     initialMargin: position.initial_margin, maintenanceMargin: position.maintenance_margin,
@@ -368,6 +392,8 @@ function normalizeFuturesPositions(positions: GateCrossExPosition[]): PortfolioF
     fee: position.fee, fundingFee: position.funding_fee, fundingTime: position.funding_time,
     createdAt: millisecondTimestamp(position.create_time), updatedAt: millisecondTimestamp(position.update_time),
     realizedPnl: position.closed_pnl,
+    crossExAdlRank: adlBySymbol.get(position.symbol)?.crossex_adl_rank ?? null,
+    exchangeAdlRank: adlBySymbol.get(position.symbol)?.exchange_adl_rank ?? null,
   }));
 }
 
@@ -389,7 +415,7 @@ function normalizePortfolio(portfolio: GateCrossExPortfolio, fetchedAt: string):
       borrowingMaintenanceMargin: asset.borrowing_maintenance_margin,
       availableBalance: asset.available_balance, liability: asset.liability,
     })),
-    futuresPositions: normalizeFuturesPositions(portfolio.positions),
+    futuresPositions: normalizeFuturesPositions(portfolio.positions, portfolio.adlRanks),
     marginPositions: portfolio.marginPositions.map((position) => ({
       positionId: position.position_id, symbol: position.symbol, positionSide: position.position_side,
       initialMargin: position.initial_margin, maintenanceMargin: position.maintenance_margin,
@@ -481,10 +507,93 @@ function safeCredentialError(error: unknown, language: SecureCredentialLanguage)
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
-  const { config, database, credentialVault, crossExGateway, publicMarketGateway } = options;
+  const { config, database, crossExGateway, publicMarketGateway } = options;
+  const storedCredentialVault = options.credentialVault;
+  const storedProfilesAtBoot = listCredentialMetadata(database);
+  for (const profile of storedProfilesAtBoot) {
+    if (profile.provider === 'os_keychain' || profile.provider === 'env_file') {
+      storedCredentialVault.setPreferredProvider?.(profile.id, profile.provider);
+    }
+  }
+  const persistedActiveProfile = readActiveCredentialProfile(database);
+  let activeCredentialProfileId: string | null = persistedActiveProfile === undefined
+    ? storedProfilesAtBoot.some((profile) => profile.id === DEFAULT_CREDENTIAL_PROFILE)
+      ? DEFAULT_CREDENTIAL_PROFILE
+      : storedProfilesAtBoot[0]?.id ?? DEFAULT_CREDENTIAL_PROFILE
+    : persistedActiveProfile && storedProfilesAtBoot.some((profile) => profile.id === persistedActiveProfile)
+      ? persistedActiveProfile
+      : null;
+  const resolveActiveProfile = (profile: string): string | null => (
+    profile === DEFAULT_CREDENTIAL_PROFILE ? activeCredentialProfileId : profile
+  );
+  const credentialVault: CredentialVault = {
+    provider: storedCredentialVault.provider,
+    availableProviders: storedCredentialVault.availableProviders,
+    async set(profile, credentials, provider) {
+      return storedCredentialVault.set(resolveActiveProfile(profile) ?? DEFAULT_CREDENTIAL_PROFILE, credentials, provider);
+    },
+    async get(profile) {
+      const resolved = resolveActiveProfile(profile);
+      return resolved ? storedCredentialVault.get(resolved) : null;
+    },
+    async getProvider(profile) {
+      const resolved = resolveActiveProfile(profile);
+      return resolved ? storedCredentialVault.getProvider(resolved) : null;
+    },
+    async delete(profile) {
+      const resolved = resolveActiveProfile(profile);
+      return resolved ? storedCredentialVault.delete(resolved) : false;
+    },
+    setPreferredProvider(profile, provider) {
+      const resolved = resolveActiveProfile(profile);
+      if (resolved) storedCredentialVault.setPreferredProvider?.(resolved, provider);
+    },
+  };
+  const activeProviderAtBoot = activeCredentialProfileId
+    ? await storedCredentialVault.getProvider(activeCredentialProfileId)
+    : null;
+  const activeMetadataAtBoot = activeCredentialProfileId
+    ? getCredentialMetadata(database, activeCredentialProfileId)
+    : null;
+  if (activeProviderAtBoot === 'env_file'
+    || activeMetadataAtBoot?.provider === 'env_file'
+    || (activeMetadataAtBoot !== null && activeProviderAtBoot === null)) {
+    // The .env fallback is deliberately user-editable outside the app, and any provider can be
+    // cleared outside this process. Never paint an authenticated cache whose account identity
+    // cannot be proven against the credential store available at this boot.
+    database.transaction(() => {
+      database.prepare('DELETE FROM live_balances').run();
+      database.prepare('DELETE FROM live_positions').run();
+      database.prepare('DELETE FROM portfolio_snapshots').run();
+      database.prepare('DELETE FROM reconciliation_reports').run();
+    })();
+  }
   const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl);
   const tradingSession = options.tradingSession ?? new TradingSession();
-  const tradingRuntime = new TradingRuntime(database, tradingSession, credentialVault, crossExGateway);
+  const credentialOperationGate = new CredentialOperationGate();
+  const runAuthenticatedWrite = async <T>(work: () => Promise<T>): Promise<T> => {
+    try {
+      return await credentialOperationGate.runAuthenticatedWrite(work);
+    } catch (error) {
+      if (error instanceof CredentialOperationBusyError) {
+        throw new TradingRuntimeError('credential_mutation_in_progress', 409);
+      }
+      throw error;
+    }
+  };
+  const acquireCredentialMutation = async (): Promise<() => void> => {
+    try {
+      return await credentialOperationGate.acquireCredentialMutation();
+    } catch (error) {
+      if (error instanceof CredentialOperationBusyError) {
+        throw new TradingRuntimeError('credential_mutation_in_progress', 409);
+      }
+      throw error;
+    }
+  };
+  const tradingRuntime = new TradingRuntime(database, tradingSession, credentialVault, crossExGateway, {
+    runAuthenticatedWrite,
+  });
   const privateStream = new CrossExPrivateStream(config.gatePrivateWebSocketUrl, credentialVault);
   const cachedPortfolioAtBoot = readLatestPortfolioSnapshot(database);
   const livePortfolio = new LivePortfolioStore(
@@ -513,7 +622,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
   const csrfTokens = new OneTimeCsrfTokens();
   let feeCache: { fees: VenueFeeRatesResponse['fees']; fetchedAt: string } | null = null;
-  let feeFetchInFlight: Promise<{ fees: VenueFeeRatesResponse['fees']; fetchedAt: string }> | null = null;
+  let feeFetchInFlight: {
+    generation: number;
+    promise: Promise<{ fees: VenueFeeRatesResponse['fees']; fetchedAt: string }>;
+  } | null = null;
   let transferCoinCache: { items: CrossExTransferCoinsResponse['items']; fetchedAt: string } | null = null;
   let transferCoinFetchInFlight: Promise<{ items: CrossExTransferCoinsResponse['items']; fetchedAt: string }> | null = null;
   let sizeUnitCache: { units: Record<string, string>; fetchedAt: string; complete: boolean; marketCount: number } | null = null;
@@ -562,14 +674,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     })().finally(() => { borosStrategyFetchInFlight = null; });
     return borosStrategyFetchInFlight;
   };
-  const selectableStorageProviders = credentialVault.availableProviders.filter(
+  const selectableStorageProviders = storedCredentialVault.availableProviders.filter(
     (provider): provider is SelectableCredentialStorageProvider => provider === 'os_keychain' || provider === 'env_file',
   );
-  const recordedCredentialProvider = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE)?.provider;
-  if (recordedCredentialProvider === 'os_keychain' || recordedCredentialProvider === 'env_file') {
-    credentialVault.setPreferredProvider?.(DEFAULT_CREDENTIAL_PROFILE, recordedCredentialProvider);
-  }
-  let positionsRefreshInProgress = false;
+  let positionsRefreshGeneration: number | null = null;
 
   const fetchTransferCoins = async (): Promise<{ items: CrossExTransferCoinsResponse['items']; fetchedAt: string }> => {
     if (transferCoinCache && Date.now() - Date.parse(transferCoinCache.fetchedAt) < 10 * 60_000) return transferCoinCache;
@@ -710,7 +818,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }
   };
 
+  let credentialGeneration = 0;
   const invalidateAuthenticatedState = (): void => {
+    credentialGeneration += 1;
     feeCache = null;
     livePortfolio.clear();
     tradingRuntime.clearAuthenticatedAccountState();
@@ -798,18 +908,23 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     warn: (symbol, reason) => app.log.warn({ symbol, reason }, 'funding history fetch failed'),
   });
 
-  let portfolioRefreshInFlight: Promise<LivePortfolioSnapshot> | null = null;
+  let portfolioRefreshInFlight: { generation: number; promise: Promise<LivePortfolioSnapshot> } | null = null;
   const refreshPortfolio = (): Promise<LivePortfolioSnapshot> => {
-    if (portfolioRefreshInFlight) return portfolioRefreshInFlight;
-    portfolioRefreshInFlight = (async () => {
+    if (portfolioRefreshInFlight?.generation === credentialGeneration) return portfolioRefreshInFlight.promise;
+    const refreshCredentialGeneration = credentialGeneration;
+    const pending = (async () => {
       let credentials: GateCredentials | null = null;
       try {
         credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
         if (!credentials) throw new TradingRuntimeError('credential_missing_from_vault', 409);
-        const metadata = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
+        const profileId = activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE;
+        const metadata = getCredentialMetadata(database, profileId);
         const previous = readLatestPortfolioSnapshot(database);
         const portfolioCheckpoint = livePortfolio.checkpoint();
         const portfolio = await crossExGateway.queryPortfolio(credentials);
+        if (refreshCredentialGeneration !== credentialGeneration) {
+          throw new TradingRuntimeError('credential_context_changed', 409);
+        }
         const fetchedAt = new Date().toISOString();
         const snapshot = normalizePortfolio(portfolio, fetchedAt);
         const recoveredExecutionFillCount = tradingRuntime.reconcileExecutionFills(snapshot.recentFills);
@@ -824,7 +939,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         })), fetchedAt);
         const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
         upsertCredentialMetadata(database, {
-          id: DEFAULT_CREDENTIAL_PROFILE,
+          id: profileId,
           label: metadata?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
           provider,
           createdAt: metadata?.createdAt ?? fetchedAt,
@@ -852,14 +967,17 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       } finally {
         credentials = null;
       }
-    })().finally(() => {
-      portfolioRefreshInFlight = null;
+    })();
+    const completed = pending.finally(() => {
+      if (portfolioRefreshInFlight?.promise === completed) portfolioRefreshInFlight = null;
     });
-    return portfolioRefreshInFlight;
+    portfolioRefreshInFlight = { generation: refreshCredentialGeneration, promise: completed };
+    return completed;
   };
 
   triggerPortfolioRefresh = () => {
     void refreshPortfolio().catch((error) => {
+      if (error instanceof TradingRuntimeError && error.code === 'credential_context_changed') return;
       if (!(error instanceof TradingRuntimeError && error.code === 'credential_missing_from_vault')) {
         app.log.warn({ reason: error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR' }, 'background portfolio reconciliation failed');
       }
@@ -930,13 +1048,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   app.get('/health', async (): Promise<HealthResponse> => {
     const databaseStatus = readDatabaseStatus(database);
+    const marketConnectionState = marketHub.connectionState();
     return {
       ok: databaseStatus.state === 'ok',
       version: process.env.npm_package_version ?? '0.1.0',
       environment: 'live',
       database: databaseStatus.state,
       apiDocsRetrievedAt: API_DOCS_RETRIEVED_AT,
-      connectionState: databaseStatus.state === 'ok' ? marketHub.snapshot().connectionState === 'disconnected' ? 'healthy' : marketHub.snapshot().connectionState : 'degraded',
+      connectionState: databaseStatus.state === 'ok' ? marketConnectionState === 'disconnected' ? 'healthy' : marketConnectionState : 'degraded',
     };
   });
 
@@ -953,16 +1072,22 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         currentMigration: databaseStatus.currentMigration,
       },
       security: {
-        credentialStorage: storedCredentialProvider(getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE)?.provider, credentialVault.provider),
+        credentialStorage: storedCredentialProvider(
+          activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId)?.provider : undefined,
+          credentialVault.provider,
+        ),
         credentialEntryPath: '/secure/credentials',
         browserJavaScriptHandlesSecrets: false,
       },
     };
   });
 
-  app.get('/api/onboarding/connection', async (): Promise<CredentialConnectionStatus> => {
-    const metadata = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
-    const detectedProvider = metadata ? null : await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE);
+  const credentialConnectionStatus = async (): Promise<CredentialConnectionStatus> => {
+    const metadata = activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId) : null;
+    const detectedProvider = metadata || !activeCredentialProfileId
+      ? null
+      : await storedCredentialVault.getProvider(activeCredentialProfileId);
+    const profiles = listCredentialMetadata(database);
     return {
       configured: metadata !== null || detectedProvider !== null,
       storage: storedCredentialProvider(metadata?.provider, detectedProvider ?? credentialVault.provider),
@@ -970,7 +1095,211 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       lastVerifiedAt: metadata?.lastVerifiedAt ?? null,
       secureEntryPath: '/secure/credentials',
       readOnly: !tradingSession.liveTradingEnabled,
+      activeProfileId: activeCredentialProfileId,
+      profiles: profiles.map((profile) => ({
+        id: profile.id,
+        label: profile.label,
+        storage: storedCredentialProvider(profile.provider, credentialVault.provider),
+        lastVerifiedAt: profile.lastVerifiedAt,
+        active: profile.id === activeCredentialProfileId,
+      })),
     };
+  };
+
+  app.get('/api/onboarding/connection', credentialConnectionStatus);
+
+  app.patch('/api/onboarding/accounts/:profileId', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-credential-intent'] !== 'rename-account') {
+        return reply.code(403).send({ error: 'missing_credential_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const profileParams = CredentialProfileParamsSchema.safeParse(request.params);
+    const renameRequest = WebAccountRenameSchema.safeParse(request.body);
+    if (!profileParams.success || !renameRequest.success) {
+      return reply.code(400).send({ error: 'invalid_account_name' });
+    }
+    const profile = getCredentialMetadata(database, profileParams.data.profileId);
+    if (!profile) return reply.code(404).send({ error: 'credential_profile_not_found' });
+    if (profile.id !== activeCredentialProfileId) {
+      return reply.code(409).send({ error: 'credential_profile_not_active' });
+    }
+    if (profile.label === renameRequest.data.label) return credentialConnectionStatus();
+
+    try {
+      database.transaction(() => {
+        upsertCredentialMetadata(database, { ...profile, label: renameRequest.data.label });
+        database.prepare(`
+          UPDATE execution_strategies
+          SET credential_profile_label = ?
+          WHERE credential_profile_id = ?
+        `).run(renameRequest.data.label, profile.id);
+        addAuditEvent(database, 'credential_profile_renamed', {
+          profile: profile.id,
+          previousLabel: profile.label,
+          nextLabel: renameRequest.data.label,
+          source: 'web_app',
+        });
+      })();
+      return credentialConnectionStatus();
+    } catch {
+      request.log.error({ profile: profile.id }, 'web account rename failed');
+      return reply.code(500).send({ error: 'credential_profile_rename_failed' });
+    }
+  });
+
+  app.post('/api/onboarding/accounts/:profileId/activate', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-credential-intent'] !== 'switch-account') {
+        return reply.code(403).send({ error: 'missing_credential_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = CredentialProfileParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_credential_profile' });
+    const switchRequest = WebAccountSwitchSchema.safeParse(request.body ?? {});
+    if (!switchRequest.success) return reply.code(400).send({ error: 'invalid_account_switch' });
+    const target = getCredentialMetadata(database, parsed.data.profileId);
+    if (!target) return reply.code(404).send({ error: 'credential_profile_not_found' });
+    if (target.id === activeCredentialProfileId) return credentialConnectionStatus();
+
+    let credentials: GateCredentials | null = null;
+    const previousActiveProfileId = activeCredentialProfileId;
+    let releaseCredentialMutation: (() => void) | null = null;
+    try {
+      releaseCredentialMutation = await acquireCredentialMutation();
+      const affectedStrategies = strategyEngine.runningStrategiesForCredentialProfile(previousActiveProfileId);
+      if (affectedStrategies.length > 0 && !switchRequest.data.confirmPauseRunningStrategies) {
+        return reply.code(409).send({
+          error: 'running_strategies_require_confirmation',
+          strategyCount: affectedStrategies.length,
+          strategyIds: affectedStrategies.map((strategy) => strategy.id),
+        });
+      }
+      await quiesceForCredentialMutation();
+      credentials = await storedCredentialVault.get(target.id);
+      if (!credentials) throw new TradingRuntimeError('credential_missing_from_vault', 409);
+      const account = await crossExGateway.queryAccount(credentials);
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId);
+      const verifiedAt = new Date().toISOString();
+      privateStream.stop();
+      database.transaction(() => {
+        upsertCredentialMetadata(database, { ...target, lastVerifiedAt: verifiedAt });
+        saveActiveCredentialProfile(database, target.id);
+        addAuditEvent(database, 'credential_profile_switched', {
+          fromProfile: previousActiveProfileId,
+          toProfile: target.id,
+          accountMode: account.account_mode,
+          pausedStrategyCount,
+          source: 'web_app',
+        });
+      })();
+      activeCredentialProfileId = target.id;
+      invalidateAuthenticatedState();
+      privateStream.start();
+      if (options.startMarketStream) triggerPortfolioRefresh?.();
+      return credentialConnectionStatus();
+    } catch (error) {
+      if (releaseCredentialMutation) {
+        activeCredentialProfileId = previousActiveProfileId;
+        try { saveActiveCredentialProfile(database, previousActiveProfileId); } catch { /* preserve original error */ }
+        privateStream.start();
+      }
+      request.log.warn({ reason: error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR' }, 'web account switch failed');
+      if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      if (error instanceof GateApiError) {
+        return reply.code(502).send({ error: 'credential_verification_failed', label: error.label });
+      }
+      return reply.code(500).send({ error: 'credential_profile_switch_failed' });
+    } finally {
+      credentials = null;
+      releaseCredentialMutation?.();
+    }
+  });
+
+  app.delete('/api/onboarding/accounts/:profileId', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-credential-intent'] !== 'delete-account') {
+        return reply.code(403).send({ error: 'missing_credential_intent' });
+      }
+    },
+  }, async (request, reply) => {
+    const parsed = CredentialProfileParamsSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_credential_profile' });
+    const profile = getCredentialMetadata(database, parsed.data.profileId);
+    if (!profile) return reply.code(404).send({ error: 'credential_profile_not_found' });
+
+    const deletingActiveProfile = profile.id === activeCredentialProfileId;
+    const previousActiveProfileId = activeCredentialProfileId;
+    let previousCredentials: GateCredentials | null = null;
+    let previousProvider: CredentialStorageProvider | null = null;
+    let vaultDeleted = false;
+    let releaseCredentialMutation: (() => void) | null = null;
+    try {
+      releaseCredentialMutation = await acquireCredentialMutation();
+      if (deletingActiveProfile) await quiesceForCredentialMutation();
+      const pausedStrategyCount = deletingActiveProfile
+        ? strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId)
+        : 0;
+      previousCredentials = await storedCredentialVault.get(profile.id);
+      previousProvider = await storedCredentialVault.getProvider(profile.id);
+      if (deletingActiveProfile) privateStream.stop();
+      vaultDeleted = await storedCredentialVault.delete(profile.id);
+      if (previousCredentials && !vaultDeleted) throw new Error('credential_store_reported_no_deletion');
+      try {
+        database.transaction(() => {
+          deleteCredentialMetadata(database, profile.id);
+          if (deletingActiveProfile) saveActiveCredentialProfile(database, null);
+          addAuditEvent(database, 'credential_deleted', {
+            profile: profile.id,
+            active: deletingActiveProfile,
+            pausedStrategyCount,
+            source: 'web_app',
+          });
+        })();
+      } catch (error) {
+        if (previousCredentials) {
+          await storedCredentialVault.set(profile.id, previousCredentials, previousProvider ?? undefined);
+          vaultDeleted = false;
+        }
+        throw error;
+      }
+      if (deletingActiveProfile) {
+        activeCredentialProfileId = null;
+        invalidateAuthenticatedState();
+        privateStream.start();
+      }
+      return credentialConnectionStatus();
+    } catch (error) {
+      if (vaultDeleted && previousCredentials) {
+        await storedCredentialVault.set(profile.id, previousCredentials, previousProvider ?? undefined)
+          .catch((rollbackError) => request.log.error({ err: rollbackError }, 'web account deletion rollback failed'));
+      }
+      if (releaseCredentialMutation) {
+        try {
+          database.transaction(() => {
+            upsertCredentialMetadata(database, profile);
+            if (deletingActiveProfile) saveActiveCredentialProfile(database, previousActiveProfileId);
+          })();
+          activeCredentialProfileId = previousActiveProfileId;
+        } catch { /* preserve deletion error */ }
+        if (deletingActiveProfile) privateStream.start();
+      }
+      request.log.warn({ profile: profile.id }, 'web account deletion failed');
+      if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
+        return reply.code(error.statusCode).send({ error: error.code });
+      }
+      return reply.code(500).send({ error: 'credential_profile_delete_failed' });
+    } finally {
+      previousCredentials = null;
+      releaseCredentialMutation?.();
+    }
   });
 
   app.get('/api/trading-mode', async () => ({ mode: tradingSession.current }));
@@ -990,65 +1319,77 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (requiresDisclaimer && !parsed.data.acceptDisclaimer) {
       return reply.code(400).send({ error: 'disclaimer_not_accepted' });
     }
-    const previous = tradingSession.current;
-    if (parsed.data.mode === previous) return { mode: previous };
+    const changeTradingMode = async () => {
+      const previous = tradingSession.current;
+      if (parsed.data.mode === previous) return { mode: previous };
 
-    if (parsed.data.mode === 'live') {
-      const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-      if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
-      try {
-        const account = await crossExGateway.queryAccount(credentials);
-        const verifiedAt = new Date().toISOString();
-        const existing = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
-        const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
-        upsertCredentialMetadata(database, {
-          id: DEFAULT_CREDENTIAL_PROFILE,
-          label: existing?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
-          provider,
-          createdAt: existing?.createdAt ?? verifiedAt,
-          lastVerifiedAt: verifiedAt,
-        });
-        addAuditEvent(database, 'live_mode_credential_verified', {
-          profile: DEFAULT_CREDENTIAL_PROFILE,
-          accountMode: account.account_mode,
-        });
-        await strategyEngine.prepareForLiveActivation();
-      } catch (error) {
-        if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
-          return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
+      if (parsed.data.mode === 'live') {
+        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
+        try {
+          const account = await crossExGateway.queryAccount(credentials);
+          const verifiedAt = new Date().toISOString();
+          const profileId = activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE;
+          const existing = getCredentialMetadata(database, profileId);
+          const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
+          upsertCredentialMetadata(database, {
+            id: profileId,
+            label: existing?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
+            provider,
+            createdAt: existing?.createdAt ?? verifiedAt,
+            lastVerifiedAt: verifiedAt,
+          });
+          addAuditEvent(database, 'live_mode_credential_verified', {
+            profile: profileId,
+            accountMode: account.account_mode,
+          });
+          await strategyEngine.prepareForLiveActivation();
+        } catch (error) {
+          if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
+            return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
+          }
+          const reason = error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR';
+          request.log.warn({ reason }, 'live-mode credential verification failed');
+          return reply.code(502).send({ error: 'credential_verification_failed' });
         }
-        const reason = error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR';
-        request.log.warn({ reason }, 'live-mode credential verification failed');
-        return reply.code(502).send({ error: 'credential_verification_failed' });
       }
-    }
 
-    // Lock first so no new order can pass createOrder while cancellation/quiescence is running.
-    const mode = tradingSession.set(parsed.data.mode);
-    let unresolvedOrderIds: string[] = [];
-    if (mode === 'readonly') {
-      const unresolved = await strategyEngine.suspendForTradingLock();
-      unresolvedOrderIds = unresolved.map(({ order }) => order.id);
-    } else {
-      strategyEngine.activatePersistedStrategies();
+      // Lock first so no new order can pass createOrder while cancellation/quiescence is running.
+      const mode = tradingSession.set(parsed.data.mode);
+      let unresolvedOrderIds: string[] = [];
+      if (mode === 'readonly') {
+        const unresolved = await strategyEngine.suspendForTradingLock();
+        unresolvedOrderIds = unresolved.map(({ order }) => order.id);
+      } else {
+        strategyEngine.activatePersistedStrategies(activeCredentialProfileId);
+      }
+      if (mode !== previous) {
+        addAuditEvent(database, 'trading_mode_changed', {
+          from: previous,
+          to: mode,
+          disclaimerAccepted: parsed.data.acceptDisclaimer,
+          unresolvedOrderCount: unresolvedOrderIds.length,
+        });
+        request.log.info({ from: previous, to: mode, unresolvedOrderCount: unresolvedOrderIds.length }, 'trading mode changed');
+      }
+      if (unresolvedOrderIds.length > 0) {
+        return reply.code(202).send({
+          mode,
+          warning: 'readonly_quiesce_incomplete',
+          unresolvedOrderIds,
+        });
+      }
+      return { mode };
+    };
+
+    try {
+      return parsed.data.mode === 'live'
+        ? await runAuthenticatedWrite(changeTradingMode)
+        : await changeTradingMode();
+    } catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
+      throw error;
     }
-    if (mode !== previous) {
-      addAuditEvent(database, 'trading_mode_changed', {
-        from: previous,
-        to: mode,
-        disclaimerAccepted: parsed.data.acceptDisclaimer,
-        unresolvedOrderCount: unresolvedOrderIds.length,
-      });
-      request.log.info({ from: previous, to: mode, unresolvedOrderCount: unresolvedOrderIds.length }, 'trading mode changed');
-    }
-    if (unresolvedOrderIds.length > 0) {
-      return reply.code(202).send({
-        mode,
-        warning: 'readonly_quiesce_incomplete',
-        unresolvedOrderIds,
-      });
-    }
-    return { mode };
   });
 
   app.get('/api/preferences', async (): Promise<UserPreferencesResponse> => ({ preferences: readUserPreferences(database) }));
@@ -1109,17 +1450,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const params = z.object({ symbol: z.string().regex(/^(GATE|BINANCE|OKX|BYBIT|KRAKEN|HYPERLIQUID|DERIBIT)_FUTURE_[A-Z0-9]+_(USDT|USDC|USD)$/) }).safeParse(request.params);
     const body = z.object({ leverage: z.string().regex(/^(?:[1-9]\d*)(?:\.\d+)?$/).refine((value) => Number(value) <= 200) }).safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ error: 'invalid_leverage' });
-    if (!tradingSession.liveTradingEnabled) return reply.code(403).send({ error: 'live_trading_locked' });
     const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
     if (!tradingGateway.setLeverage) return reply.code(503).send({ error: 'leverage_unavailable' });
     try {
-      const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-      if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
-      const result = await tradingGateway.setLeverage(credentials, params.data.symbol, body.data.leverage);
-      addAuditEvent(database, 'leverage_changed', { symbol: result.symbol, leverage: result.leverage });
-      request.log.info({ symbol: result.symbol, leverage: result.leverage }, 'leverage changed');
-      return result;
+      return await runAuthenticatedWrite(async () => {
+        if (!tradingSession.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
+        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+        const result = await tradingGateway.setLeverage!(credentials, params.data.symbol, body.data.leverage);
+        addAuditEvent(database, 'leverage_changed', { symbol: result.symbol, leverage: result.leverage });
+        request.log.info({ symbol: result.symbol, leverage: result.leverage }, 'leverage changed');
+        return result;
+      });
     } catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
       if (error instanceof GateApiError) return reply.code(error.statusCode >= 400 && error.statusCode < 500 ? 400 : 502).send({ error: 'leverage_rejected', label: error.label });
       request.log.error({ error }, 'leverage update failed');
       return reply.code(500).send({ error: 'leverage_update_failed' });
@@ -1163,7 +1507,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, async (request, reply) => {
     const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_order_id' });
-    try { return await tradingRuntime.cancelOrder(parsed.data.id); }
+    try { return await runAuthenticatedWrite(() => tradingRuntime.cancelOrder(parsed.data.id)); }
     catch (error) {
       if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
       if (error instanceof GateApiError) return reply.code(502).send({ error: 'gate_cancel_rejected', label: error.label });
@@ -1180,16 +1524,25 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     },
   }, async (request, reply) => {
     try {
-      // Strategy submission is an execution boundary: load exchange constraints here even when a
-      // direct API client has not visited the instrument pages first.
-      if (tradingSession.liveTradingEnabled && !readInstrumentCatalog(database)) {
-        try { await fetchInstrumentCatalog(); }
-        catch (error) {
-          request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'strategy instrument preflight failed');
-          return reply.code(503).send({ error: 'strategy_instrument_constraints_unavailable' });
+      return await runAuthenticatedWrite(async () => {
+        // Strategy submission is an execution boundary: load exchange constraints here even when a
+        // direct API client has not visited the instrument pages first.
+        if (tradingSession.liveTradingEnabled && !readInstrumentCatalog(database)) {
+          try { await fetchInstrumentCatalog(); }
+          catch (error) {
+            request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'strategy instrument preflight failed');
+            return reply.code(503).send({ error: 'strategy_instrument_constraints_unavailable' });
+          }
         }
-      }
-      return await strategyEngine.startStrategy(request.body);
+        const profileId = activeCredentialProfileId;
+        const profile = profileId ? getCredentialMetadata(database, profileId) : null;
+        if (!profileId) return reply.code(409).send({ error: 'credential_not_configured' });
+        const provider = await storedCredentialVault.getProvider(profileId);
+        return strategyEngine.startStrategy(request.body, {
+          profileId,
+          label: profile?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
+        });
+      });
     }
     catch (error) {
       if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_strategy', issues: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) });
@@ -1209,10 +1562,45 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, async (request, reply) => {
     const parsed = z.object({ id: z.string().regex(STRATEGY_ID) }).safeParse(request.params);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_id' });
-    try { return await strategyEngine.stopStrategy(parsed.data.id); }
+    try { return await runAuthenticatedWrite(() => strategyEngine.stopStrategy(parsed.data.id)); }
     catch (error) {
       if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
       return reply.code(500).send({ error: 'strategy_stop_failed' });
+    }
+  });
+
+  app.post('/api/strategies/:id/resume', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'resume-strategy') return reply.code(403).send({ error: 'missing_trading_intent' });
+    },
+  }, async (request, reply) => {
+    const parsed = z.object({ id: z.string().regex(STRATEGY_ID) }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_id' });
+    if (!activeCredentialProfileId) return reply.code(409).send({ error: 'credential_not_configured' });
+    try {
+      return await runAuthenticatedWrite(async () => {
+        // Resume repeats launch preflight, so its order-size checks need the same authoritative
+        // instrument catalog as a newly submitted strategy.
+        if (tradingSession.liveTradingEnabled && !readInstrumentCatalog(database)) {
+          try { await fetchInstrumentCatalog(); }
+          catch (error) {
+            request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'strategy resume instrument preflight failed');
+            return reply.code(503).send({ error: 'strategy_instrument_constraints_unavailable' });
+          }
+        }
+        const profileId = activeCredentialProfileId;
+        if (!profileId) throw new TradingRuntimeError('credential_not_configured', 409);
+        return strategyEngine.resumeStrategy(parsed.data.id, profileId);
+      });
+    }
+    catch (error) {
+      if (error instanceof TradingRuntimeError) {
+        if (error.label) request.log.warn({ code: error.code, label: error.label }, 'strategy resume rejected');
+        return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
+      }
+      request.log.error({ error }, 'strategy resume failed');
+      return reply.code(500).send({ error: 'strategy_resume_failed' });
     }
   });
 
@@ -1246,6 +1634,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     z.object({
       type: z.literal('watch.quotes'),
       symbols: z.array(MarketWatchSymbolSchema).max(20),
+    }),
+    z.object({
+      type: z.literal('watch.klines'),
+      watches: z.array(z.object({
+        symbol: MarketWatchSymbolSchema,
+        interval: z.enum(CANDLE_INTERVALS),
+      })).max(20),
     }),
     z.object({
       type: z.literal('watch.market'),
@@ -1342,10 +1737,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       tradeBatchSymbol = null;
       klineBatch.clear();
     };
+    const clearKlineBatch = () => {
+      if (klineBatchTimer) clearTimeout(klineBatchTimer);
+      klineBatchTimer = null;
+      klineBatch.clear();
+    };
     // The hub broadcasts book/trade/kline messages for the union of every client's watches, so
     // relay only this connection's watched market: another tab watching a second symbol must not
     // leak into this client's single-slot book state.
     let watched: { symbol: string; interval: CandleInterval } | null = null;
+    let watchedKlines = new Set<string>();
+    const watchesKline = (symbol: string, interval: CandleInterval) =>
+      (watched?.symbol === symbol && watched.interval === interval)
+      || watchedKlines.has(`${symbol}:${interval}`);
     const scopedSend = (message: MarketHubMessage) => {
       if (message.type === 'market.snapshot') {
         safeSend({ type: 'market.status', payload: {
@@ -1369,11 +1773,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         return;
       }
       if (message.type === 'kline.update') {
-        if (message.payload.symbol === watched?.symbol && message.payload.interval === watched?.interval) queueKlineUpdate(message);
+        if (watchesKline(message.payload.symbol, message.payload.interval)) queueKlineUpdate(message);
         return;
       }
       if (message.type === 'kline.snapshot'
-        && (message.payload.symbol !== watched?.symbol || message.payload.interval !== watched?.interval)) return;
+        && !watchesKline(message.payload.symbol, message.payload.interval)) return;
       safeSend(message);
     };
     const unsubscribeMarkets = marketHub.subscribe(scopedSend);
@@ -1389,10 +1793,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     statusHeartbeat.unref?.();
     let watchReleases: Array<() => void> = [];
     let quoteWatchRelease: (() => void) | null = null;
+    const klineWatchReleases: Array<() => void> = [];
     const clearWatch = () => { for (const release of watchReleases.splice(0)) release(); };
     const clearQuoteWatch = () => {
       quoteWatchRelease?.();
       quoteWatchRelease = null;
+    };
+    const clearKlineWatches = () => {
+      for (const release of klineWatchReleases.splice(0)) release();
+      watchedKlines = new Set();
+      clearKlineBatch();
     };
     safeSend({ type: 'mode.update', payload: { mode: tradingSession.current } });
     safeSend({ type: 'strategy.snapshot', payload: { strategies: tradingRuntime.listStrategies() } });
@@ -1414,6 +1824,22 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
             type: 'market.snapshot',
             payload: { ...snapshot, markets: snapshot.markets.filter((market) => marketSymbols.has(market.symbol)) },
           });
+        }
+        return;
+      }
+      if (watch.data.type === 'watch.klines') {
+        clearKlineWatches();
+        const unique = new Map(watch.data.watches.map((entry) => [`${entry.symbol}:${entry.interval}`, entry]));
+        const watches = [...unique.values()].filter((entry) => ensureMarketKnown(entry.symbol));
+        watchedKlines = new Set(watches.map((entry) => `${entry.symbol}:${entry.interval}`));
+        for (const entry of watches) {
+          klineWatchReleases.push(marketHub.watchKlines(entry.symbol, entry.interval));
+          candleStore.hydrate(entry.symbol, entry.interval);
+          safeSend({
+            type: 'kline.snapshot',
+            payload: { symbol: entry.symbol, interval: entry.interval, candles: marketHub.candles(entry.symbol, entry.interval) },
+          });
+          candleStore.prefetch(entry.symbol, entry.interval);
         }
         return;
       }
@@ -1440,6 +1866,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     socket.on('close', () => {
       clearWatch();
       clearQuoteWatch();
+      clearKlineWatches();
       clearMarketBatch();
       clearVolatileBatches();
       clearInterval(statusHeartbeat);
@@ -1646,7 +2073,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/markets/size-units', async (request) => {
     const cached = sizeUnitCache;
     // A dynamically registered market invalidates the cache (count changes) so its symbols get mapped.
-    if (cached && cached.complete && cached.marketCount === marketHub.snapshot().markets.length
+    if (cached && cached.complete && cached.marketCount === marketHub.marketCount()
       && Date.now() - Date.parse(cached.fetchedAt) < MARKET_REFERENCE_CACHE_MS) {
       return { units: cached.units, fetchedAt: cached.fetchedAt };
     }
@@ -1692,37 +2119,52 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
     },
   }, async (request, reply) => {
+    const requestCredentialGeneration = credentialGeneration;
     if (feeCache && Date.now() - Date.parse(feeCache.fetchedAt) < 10 * 60_000) {
       return { fees: feeCache.fees, fetchedAt: feeCache.fetchedAt, cacheStatus: 'fresh' } satisfies VenueFeeRatesResponse;
     }
     const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
     if (!tradingGateway.queryFeeRates) return reply.code(503).send({ error: 'fee_rates_unavailable' });
     try {
-      feeFetchInFlight ??= (async () => {
-        let credentials: GateCredentials | null = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-        try {
-          if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
-          const rates = await tradingGateway.queryFeeRates!(credentials);
-          const fetchedAt = new Date().toISOString();
-          const fees = rates.map((rate) => ({
-            venue: rate.exchange_type, spotMakerFee: rate.spot_maker_fee, spotTakerFee: rate.spot_taker_fee,
-            futureMakerFee: rate.future_maker_fee, futureTakerFee: rate.future_taker_fee,
-            specialFees: (rate.special_fee_list ?? []).map((special) => ({
-              symbol: special.symbol,
-              makerFee: special.maker_fee_rate,
-              takerFee: special.taker_fee_rate,
-            })),
-          }));
-          feeCache = { fees, fetchedAt };
-          return { fees, fetchedAt };
-        } finally {
-          credentials = null;
-        }
-      })().finally(() => { feeFetchInFlight = null; });
-      const refreshed = await feeFetchInFlight;
+      if (feeFetchInFlight?.generation !== credentialGeneration) {
+        const refreshCredentialGeneration = credentialGeneration;
+        const pending = (async () => {
+          let credentials: GateCredentials | null = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+          try {
+            if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+            const rates = await tradingGateway.queryFeeRates!(credentials);
+            if (refreshCredentialGeneration !== credentialGeneration) {
+              throw new TradingRuntimeError('credential_context_changed', 409);
+            }
+            const fetchedAt = new Date().toISOString();
+            const fees = rates.map((rate) => ({
+              venue: rate.exchange_type, spotMakerFee: rate.spot_maker_fee, spotTakerFee: rate.spot_taker_fee,
+              futureMakerFee: rate.future_maker_fee, futureTakerFee: rate.future_taker_fee,
+              specialFees: (rate.special_fee_list ?? []).map((special) => ({
+                symbol: special.symbol,
+                makerFee: special.maker_fee_rate,
+                takerFee: special.taker_fee_rate,
+              })),
+            }));
+            feeCache = { fees, fetchedAt };
+            return { fees, fetchedAt };
+          } finally {
+            credentials = null;
+          }
+        })();
+        const completed = pending.finally(() => {
+          if (feeFetchInFlight?.promise === completed) feeFetchInFlight = null;
+        });
+        feeFetchInFlight = { generation: refreshCredentialGeneration, promise: completed };
+      }
+      const refreshed = await feeFetchInFlight.promise;
       return { ...refreshed, cacheStatus: 'fresh' } satisfies VenueFeeRatesResponse;
     } catch (error) {
-      if (error instanceof TradingRuntimeError && error.code === 'credential_not_configured') {
+      if (requestCredentialGeneration !== credentialGeneration) {
+        return reply.code(409).send({ error: 'credential_context_changed' });
+      }
+      if (error instanceof TradingRuntimeError
+        && (error.code === 'credential_not_configured' || error.code === 'credential_context_changed')) {
         return reply.code(error.statusCode).send({ error: error.code });
       }
       request.log.warn({ reason: error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR' }, 'fee rate refresh failed');
@@ -1840,7 +2282,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, async (request, reply) => {
     const parsed = CrossExTransferRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_transfer' });
-    if (!tradingSession.liveTradingEnabled) return reply.code(403).send({ error: 'live_trading_locked' });
     const operationsGateway = crossExGateway as Partial<PortfolioOperationsCrossExGateway>;
     if (!operationsGateway.createTransfer || !operationsGateway.queryAccount || !operationsGateway.queryTransferCoins) {
       return reply.code(503).send({ error: 'transfers_unavailable' });
@@ -1848,58 +2289,63 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
     let credentials: GateCredentials | null = null;
     try {
-      credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-      if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
-      if (parsed.data.from === 'SPOT' && !operationsGateway.querySpotAccounts) {
-        return reply.code(503).send({ error: 'transfer_balances_unavailable' });
-      }
-      const [account, transferCoins, spotAccounts] = await Promise.all([
-        operationsGateway.queryAccount(credentials),
-        fetchTransferCoins(),
-        parsed.data.from === 'SPOT' ? operationsGateway.querySpotAccounts!(credentials) : Promise.resolve(null),
-      ]);
-      const routeError = crossExTransferRouteError(parsed.data, account.account_mode);
-      if (routeError) return reply.code(400).send({ error: 'invalid_transfer_route', label: routeError });
-      const canonicalTransfer = canonicalizeCrossExTransfer(parsed.data, account.account_mode);
+      return await runAuthenticatedWrite(async () => {
+        if (!tradingSession.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
+        credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+        if (parsed.data.from === 'SPOT' && !operationsGateway.querySpotAccounts) {
+          return reply.code(503).send({ error: 'transfer_balances_unavailable' });
+        }
+        const stableCredentials = credentials;
+        const [account, transferCoins, spotAccounts] = await Promise.all([
+          operationsGateway.queryAccount!(stableCredentials),
+          fetchTransferCoins(),
+          parsed.data.from === 'SPOT' ? operationsGateway.querySpotAccounts!(stableCredentials) : Promise.resolve(null),
+        ]);
+        const routeError = crossExTransferRouteError(parsed.data, account.account_mode);
+        if (routeError) return reply.code(400).send({ error: 'invalid_transfer_route', label: routeError });
+        const canonicalTransfer = canonicalizeCrossExTransfer(parsed.data, account.account_mode);
 
-      const coinRule = transferCoins.items.find((coin) => coin.coin === parsed.data.coin);
-      if (!coinRule || coinRule.disabled) {
-        return reply.code(400).send({ error: 'unsupported_transfer_coin', label: coinRule?.disabled ? 'TRANSFER_COIN_DISABLED' : 'TRANSFER_COIN_UNSUPPORTED' });
-      }
-      const amount = new Decimal(parsed.data.amount);
-      if (amount.lt(coinRule.minimumAmount)) {
-        return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_BELOW_MINIMUM' });
-      }
-      if (amount.decimalPlaces() > coinRule.precision) {
-        return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_PRECISION_EXCEEDED' });
-      }
+        const coinRule = transferCoins.items.find((coin) => coin.coin === parsed.data.coin);
+        if (!coinRule || coinRule.disabled) {
+          return reply.code(400).send({ error: 'unsupported_transfer_coin', label: coinRule?.disabled ? 'TRANSFER_COIN_DISABLED' : 'TRANSFER_COIN_UNSUPPORTED' });
+        }
+        const amount = new Decimal(parsed.data.amount);
+        if (amount.lt(coinRule.minimumAmount)) {
+          return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_BELOW_MINIMUM' });
+        }
+        if (amount.decimalPlaces() > coinRule.precision) {
+          return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_PRECISION_EXCEEDED' });
+        }
 
-      let sourceAvailable: string | null = null;
-      if (canonicalTransfer.from === 'SPOT') {
-        sourceAvailable = spotAccounts?.find((balance) => balance.currency === canonicalTransfer.coin)?.available ?? null;
-      } else if (canonicalTransfer.from === 'CROSSEX') {
-        sourceAvailable = canonicalTransfer.coin === 'USDT' ? account.available_margin : null;
-      } else {
-        const exchange = canonicalTransfer.from.slice('CROSSEX_'.length);
-        sourceAvailable = account.assets.find((asset) => asset.exchange_type === exchange && asset.coin === canonicalTransfer.coin)?.available_balance ?? null;
-      }
-      if (sourceAvailable === null) return reply.code(409).send({ error: 'source_balance_unavailable' });
-      if (amount.gt(sourceAvailable)) {
-        return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_EXCEEDS_AVAILABLE' });
-      }
+        let sourceAvailable: string | null = null;
+        if (canonicalTransfer.from === 'SPOT') {
+          sourceAvailable = spotAccounts?.find((balance) => balance.currency === canonicalTransfer.coin)?.available ?? null;
+        } else if (canonicalTransfer.from === 'CROSSEX') {
+          sourceAvailable = canonicalTransfer.coin === 'USDT' ? account.available_margin : null;
+        } else {
+          const exchange = canonicalTransfer.from.slice('CROSSEX_'.length);
+          sourceAvailable = account.assets.find((asset) => asset.exchange_type === exchange && asset.coin === canonicalTransfer.coin)?.available_balance ?? null;
+        }
+        if (sourceAvailable === null) return reply.code(409).send({ error: 'source_balance_unavailable' });
+        if (amount.gt(sourceAvailable)) {
+          return reply.code(400).send({ error: 'invalid_transfer_amount', label: 'TRANSFER_AMOUNT_EXCEEDS_AVAILABLE' });
+        }
 
-      const transfer = await operationsGateway.createTransfer(credentials, canonicalTransfer);
-      addAuditEvent(database, 'fund_transfer_submitted', {
-        transactionId: transfer.tx_id,
-        coin: canonicalTransfer.coin,
-        amount: canonicalTransfer.amount,
-        from: canonicalTransfer.from,
-        to: canonicalTransfer.to,
+        const transfer = await operationsGateway.createTransfer!(stableCredentials, canonicalTransfer);
+        addAuditEvent(database, 'fund_transfer_submitted', {
+          transactionId: transfer.tx_id,
+          coin: canonicalTransfer.coin,
+          amount: canonicalTransfer.amount,
+          from: canonicalTransfer.from,
+          to: canonicalTransfer.to,
+        });
+        request.log.info({ transactionId: transfer.tx_id, coin: canonicalTransfer.coin, from: canonicalTransfer.from, to: canonicalTransfer.to }, 'fund transfer submitted');
+        triggerPortfolioRefresh?.();
+        return { transactionId: transfer.tx_id, text: transfer.text };
       });
-      request.log.info({ transactionId: transfer.tx_id, coin: canonicalTransfer.coin, from: canonicalTransfer.from, to: canonicalTransfer.to }, 'fund transfer submitted');
-      triggerPortfolioRefresh?.();
-      return { transactionId: transfer.tx_id, text: transfer.text };
     } catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
       if (error instanceof GateApiError) {
         if (error.retryAfterMs !== undefined) {
           reply.header('Retry-After', String(Math.max(1, Math.ceil(error.retryAfterMs / 1_000))));
@@ -2036,7 +2482,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
     },
   }, async (request, reply) => {
-    const metadata = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
+    const profileId = activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE;
+    const metadata = getCredentialMetadata(database, profileId);
 
     let credentials: GateCredentials | null;
     try {
@@ -2046,14 +2493,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       const verifiedAt = new Date().toISOString();
       const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
       upsertCredentialMetadata(database, {
-        id: DEFAULT_CREDENTIAL_PROFILE,
+        id: profileId,
         label: metadata?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
         provider,
         createdAt: metadata?.createdAt ?? verifiedAt,
         lastVerifiedAt: verifiedAt,
       });
       addAuditEvent(database, 'crossex_read_only_account_verified', {
-        profile: DEFAULT_CREDENTIAL_PROFILE,
+        profile: profileId,
         accountMode: account.account_mode,
         venueCount: new Set(account.assets.map((asset) => asset.exchange_type)).size,
       });
@@ -2077,6 +2524,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       return await refreshPortfolio();
     } catch (error) {
       if (error instanceof TradingRuntimeError && error.code === 'credential_missing_from_vault') {
+        return reply.code(409).send({ error: error.code });
+      }
+      if (error instanceof TradingRuntimeError && error.code === 'credential_context_changed') {
         return reply.code(409).send({ error: error.code });
       }
       const reason = error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR';
@@ -2108,14 +2558,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
     },
   }, async (request, reply) => {
-    if (positionsRefreshInProgress) return reply.code(409).send({ error: 'positions_refresh_in_progress' });
-    positionsRefreshInProgress = true;
+    const refreshCredentialGeneration = credentialGeneration;
+    if (positionsRefreshGeneration === refreshCredentialGeneration) {
+      return reply.code(409).send({ error: 'positions_refresh_in_progress' });
+    }
+    positionsRefreshGeneration = refreshCredentialGeneration;
 
     let credentials: GateCredentials | null;
     try {
       credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
       if (!credentials) return reply.code(409).send({ error: 'credential_missing_from_vault' });
       const positions = await crossExGateway.queryPositions(credentials);
+      if (refreshCredentialGeneration !== credentialGeneration) {
+        return reply.code(409).send({ error: 'credential_context_changed' });
+      }
       tradingRuntime.reconcileLivePositions(normalizeFuturesPositions(positions));
       return tradingRuntime.snapshot();
     } catch (error) {
@@ -2124,7 +2580,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       return reply.code(502).send({ error: 'positions_snapshot_unavailable' });
     } finally {
       credentials = null;
-      positionsRefreshInProgress = false;
+      if (positionsRefreshGeneration === refreshCredentialGeneration) positionsRefreshGeneration = null;
     }
   });
 
@@ -2142,14 +2598,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/secure/credentials', async (request, reply) => {
     const liveTradingIntent = hasLiveTradingCredentialIntent(request.query);
     const language = secureCredentialLanguage(request.query);
-    const metadata = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
-    const detectedProvider = metadata ? null : await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE);
+    const adding = CredentialContextSchema.safeParse(request.query).data?.action === 'add';
+    const metadata = activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId) : null;
+    const detectedProvider = metadata || !activeCredentialProfileId
+      ? null
+      : await storedCredentialVault.getProvider(activeCredentialProfileId);
     return setSecureHtml(reply, renderCredentialEntryPage({
       csrfToken: csrfTokens.issue(),
       configured: metadata !== null || detectedProvider !== null,
-      storageAvailable: credentialVault.provider !== 'unavailable',
+      storageAvailable: storedCredentialVault.provider !== 'unavailable',
       storageProviders: selectableStorageProviders,
       configuredStorageProvider: metadata?.provider ?? detectedProvider ?? undefined,
+      profiles: listCredentialMetadata(database),
+      activeProfileId: activeCredentialProfileId,
+      adding,
       tradingEnabled: tradingSession.liveTradingEnabled,
       liveTradingIntent,
       language,
@@ -2160,13 +2622,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const parsed = CredentialFormSchema.safeParse(request.body);
     const liveTradingIntent = hasLiveTradingCredentialIntent(request.body);
     const language = secureCredentialLanguage(request.body);
+    const adding = parsed.success && parsed.data.action === 'add';
+    const activeMetadata = activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId) : null;
     if (!parsed.success || !csrfTokens.consume(parsed.data.csrfToken)) {
       return setSecureHtml(reply, renderCredentialEntryPage({
         csrfToken: csrfTokens.issue(),
-        configured: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE) !== null,
-        storageAvailable: credentialVault.provider !== 'unavailable',
+        configured: activeMetadata !== null,
+        storageAvailable: storedCredentialVault.provider !== 'unavailable',
         storageProviders: selectableStorageProviders,
-        configuredStorageProvider: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE)?.provider,
+        configuredStorageProvider: activeMetadata?.provider,
+        profiles: listCredentialMetadata(database),
+        activeProfileId: activeCredentialProfileId,
+        adding,
         tradingEnabled: tradingSession.liveTradingEnabled,
         liveTradingIntent,
         language,
@@ -2181,44 +2648,56 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     let previousCredentials: GateCredentials | null = null;
     let previousProvider: CredentialStorageProvider | null = null;
     let vaultMutated = false;
+    let releaseCredentialMutation: (() => void) | null = null;
+    const previousActiveProfileId = activeCredentialProfileId;
+    const profileId = adding
+      ? `gate-crossex-account-${randomUUID()}`
+      : activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE;
+    const previousProfileMetadata = getCredentialMetadata(database, profileId);
     try {
+      releaseCredentialMutation = await acquireCredentialMutation();
       await quiesceForCredentialMutation();
       const account = await crossExGateway.queryAccount(credentials);
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId);
       const verifiedAt = new Date().toISOString();
-      const storageProvider = parsed.data.storageProvider ?? credentialVault.provider;
-      previousCredentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-      previousProvider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE);
+      const storageProvider = parsed.data.storageProvider ?? storedCredentialVault.provider;
+      previousCredentials = await storedCredentialVault.get(profileId);
+      previousProvider = await storedCredentialVault.getProvider(profileId);
       privateStream.stop();
-      await credentialVault.set(DEFAULT_CREDENTIAL_PROFILE, credentials, storageProvider);
+      await storedCredentialVault.set(profileId, credentials, storageProvider);
       vaultMutated = true;
       try {
         database.transaction(() => {
-          const previous = getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
+          const previous = getCredentialMetadata(database, profileId);
           upsertCredentialMetadata(database, {
-            id: DEFAULT_CREDENTIAL_PROFILE,
+            id: profileId,
             label: parsed.data.label,
             provider: storageProvider,
             createdAt: previous?.createdAt ?? verifiedAt,
             lastVerifiedAt: verifiedAt,
           });
+          saveActiveCredentialProfile(database, profileId);
           addAuditEvent(database, 'credential_verified_and_stored', {
-            profile: DEFAULT_CREDENTIAL_PROFILE,
+            profile: profileId,
             provider: storageProvider,
             accountMode: account.account_mode,
+            addedProfile: adding,
+            pausedStrategyCount,
           });
         })();
       } catch (error) {
         if (previousCredentials) {
-          await credentialVault.set(DEFAULT_CREDENTIAL_PROFILE, previousCredentials, previousProvider ?? undefined);
+          await storedCredentialVault.set(profileId, previousCredentials, previousProvider ?? undefined);
         } else {
-          await credentialVault.delete(DEFAULT_CREDENTIAL_PROFILE);
+          await storedCredentialVault.delete(profileId);
         }
         vaultMutated = false;
         throw error;
       }
 
+      activeCredentialProfileId = profileId;
       invalidateAuthenticatedState();
-      privateStream.restart();
+      privateStream.start();
       if (options.startMarketStream) triggerPortfolioRefresh?.();
       return setSecureHtml(reply, renderCredentialSuccessPage({
         label: parsed.data.label,
@@ -2232,22 +2711,31 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       if (vaultMutated) {
         try {
           if (previousCredentials) {
-            await credentialVault.set(DEFAULT_CREDENTIAL_PROFILE, previousCredentials, previousProvider ?? undefined);
+            await storedCredentialVault.set(profileId, previousCredentials, previousProvider ?? undefined);
           } else {
-            await credentialVault.delete(DEFAULT_CREDENTIAL_PROFILE);
+            await storedCredentialVault.delete(profileId);
           }
+          database.transaction(() => {
+            if (previousProfileMetadata) upsertCredentialMetadata(database, previousProfileMetadata);
+            else deleteCredentialMetadata(database, profileId);
+            saveActiveCredentialProfile(database, previousActiveProfileId);
+          })();
+          activeCredentialProfileId = previousActiveProfileId;
         } catch (rollbackError) {
           request.log.error({ err: rollbackError }, 'credential rollback failed');
         }
       }
-      privateStream.restart();
+      if (releaseCredentialMutation) privateStream.start();
       request.log.warn({ reason: error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR' }, 'credential verification failed');
       return setSecureHtml(reply, renderCredentialEntryPage({
         csrfToken: csrfTokens.issue(),
-        configured: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE) !== null,
-        storageAvailable: credentialVault.provider !== 'unavailable',
+        configured: previousActiveProfileId ? getCredentialMetadata(database, previousActiveProfileId) !== null : false,
+        storageAvailable: storedCredentialVault.provider !== 'unavailable',
         storageProviders: selectableStorageProviders,
-        configuredStorageProvider: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE)?.provider,
+        configuredStorageProvider: previousActiveProfileId ? getCredentialMetadata(database, previousActiveProfileId)?.provider : undefined,
+        profiles: listCredentialMetadata(database),
+        activeProfileId: activeCredentialProfileId,
+        adding,
         tradingEnabled: tradingSession.liveTradingEnabled,
         liveTradingIntent,
         language,
@@ -2258,6 +2746,81 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     } finally {
       credentials = null;
       previousCredentials = null;
+      releaseCredentialMutation?.();
+    }
+  });
+
+  app.post('/secure/credentials/switch', async (request, reply) => {
+    const parsed = SwitchCredentialFormSchema.safeParse(request.body);
+    const language = secureCredentialLanguage(request.body);
+    const liveTradingIntent = hasLiveTradingCredentialIntent(request.body);
+    if (!parsed.success || !csrfTokens.consume(parsed.data.csrfToken)) {
+      return setSecureHtml(reply, renderCredentialEntryPage({
+        csrfToken: csrfTokens.issue(),
+        configured: activeCredentialProfileId !== null,
+        storageAvailable: storedCredentialVault.provider !== 'unavailable',
+        storageProviders: selectableStorageProviders,
+        profiles: listCredentialMetadata(database),
+        activeProfileId: activeCredentialProfileId,
+        tradingEnabled: tradingSession.liveTradingEnabled,
+        liveTradingIntent,
+        language,
+        errorMessage: credentialPageMessage(language, 'The account switch request was invalid or expired.', '账户切换请求无效或已过期。'),
+      }), 400);
+    }
+    const target = getCredentialMetadata(database, parsed.data.profileId);
+    if (!target) return reply.code(404).send({ error: 'credential_profile_not_found' });
+    let credentials: GateCredentials | null = null;
+    const previousActiveProfileId = activeCredentialProfileId;
+    let releaseCredentialMutation: (() => void) | null = null;
+    try {
+      releaseCredentialMutation = await acquireCredentialMutation();
+      await quiesceForCredentialMutation();
+      credentials = await storedCredentialVault.get(target.id);
+      if (!credentials) throw new TradingRuntimeError('credential_missing_from_vault', 409);
+      const account = await crossExGateway.queryAccount(credentials);
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(previousActiveProfileId);
+      const verifiedAt = new Date().toISOString();
+      privateStream.stop();
+      database.transaction(() => {
+        upsertCredentialMetadata(database, { ...target, lastVerifiedAt: verifiedAt });
+        saveActiveCredentialProfile(database, target.id);
+        addAuditEvent(database, 'credential_profile_switched', {
+          fromProfile: previousActiveProfileId,
+          toProfile: target.id,
+          accountMode: account.account_mode,
+          pausedStrategyCount,
+        });
+      })();
+      activeCredentialProfileId = target.id;
+      invalidateAuthenticatedState();
+      privateStream.start();
+      if (options.startMarketStream) triggerPortfolioRefresh?.();
+      return setSecureHtml(reply, renderCredentialSwitchSuccessPage({ label: target.label, language }));
+    } catch (error) {
+      if (releaseCredentialMutation) {
+        activeCredentialProfileId = previousActiveProfileId;
+        try { saveActiveCredentialProfile(database, previousActiveProfileId); } catch { /* preserve original error */ }
+        privateStream.start();
+      }
+      request.log.warn({ reason: error instanceof GateApiError ? error.label : 'LOCAL_CREDENTIAL_ERROR' }, 'credential profile switch failed');
+      return setSecureHtml(reply, renderCredentialEntryPage({
+        csrfToken: csrfTokens.issue(),
+        configured: previousActiveProfileId !== null,
+        storageAvailable: storedCredentialVault.provider !== 'unavailable',
+        storageProviders: selectableStorageProviders,
+        profiles: listCredentialMetadata(database),
+        activeProfileId: previousActiveProfileId,
+        tradingEnabled: tradingSession.liveTradingEnabled,
+        liveTradingIntent,
+        language,
+        errorMessage: safeCredentialError(error, language),
+      }), error instanceof StrategyEngineError || error instanceof TradingRuntimeError
+        ? error.statusCode
+        : error instanceof GateApiError ? 502 : 500);
+    } finally {
+      credentials = null;
+      releaseCredentialMutation?.();
     }
   });
 
@@ -2265,12 +2828,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const parsed = DeleteCredentialFormSchema.safeParse(request.body);
     const language = secureCredentialLanguage(request.body);
     if (!parsed.success || !csrfTokens.consume(parsed.data.csrfToken)) {
+      const metadata = activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId) : null;
       return setSecureHtml(reply, renderCredentialEntryPage({
         csrfToken: csrfTokens.issue(),
-        configured: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE) !== null,
-        storageAvailable: credentialVault.provider !== 'unavailable',
+        configured: metadata !== null,
+        storageAvailable: storedCredentialVault.provider !== 'unavailable',
         storageProviders: selectableStorageProviders,
-        configuredStorageProvider: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE)?.provider,
+        configuredStorageProvider: metadata?.provider,
+        profiles: listCredentialMetadata(database),
+        activeProfileId: activeCredentialProfileId,
         tradingEnabled: tradingSession.liveTradingEnabled,
         language,
         errorMessage: credentialPageMessage(language, 'The delete request was invalid or expired.', '删除请求无效或已过期。'),
@@ -2280,46 +2846,67 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     let previousCredentials: GateCredentials | null = null;
     let previousProvider: CredentialStorageProvider | null = null;
     let vaultDeleted = false;
+    const profileId = activeCredentialProfileId;
+    const previousMetadata = profileId ? getCredentialMetadata(database, profileId) : null;
+    let releaseCredentialMutation: (() => void) | null = null;
     try {
+      if (!profileId) throw new TradingRuntimeError('credential_not_configured', 409);
+      releaseCredentialMutation = await acquireCredentialMutation();
       await quiesceForCredentialMutation();
-      previousCredentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-      previousProvider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE);
+      const pausedStrategyCount = strategyEngine.pauseRunningStrategiesForCredentialChange(profileId);
+      previousCredentials = await storedCredentialVault.get(profileId);
+      previousProvider = await storedCredentialVault.getProvider(profileId);
       privateStream.stop();
-      vaultDeleted = await credentialVault.delete(DEFAULT_CREDENTIAL_PROFILE);
+      vaultDeleted = await storedCredentialVault.delete(profileId);
       if (previousCredentials && !vaultDeleted) throw new Error('credential_store_reported_no_deletion');
       try {
         database.transaction(() => {
-          deleteCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE);
-          addAuditEvent(database, 'credential_deleted', { profile: DEFAULT_CREDENTIAL_PROFILE });
+          deleteCredentialMetadata(database, profileId);
+          saveActiveCredentialProfile(database, null);
+          addAuditEvent(database, 'credential_deleted', { profile: profileId, pausedStrategyCount });
         })();
       } catch (error) {
         if (previousCredentials) {
-          await credentialVault.set(DEFAULT_CREDENTIAL_PROFILE, previousCredentials, previousProvider ?? undefined);
+          await storedCredentialVault.set(profileId, previousCredentials, previousProvider ?? undefined);
           vaultDeleted = false;
         }
         throw error;
       }
+      activeCredentialProfileId = null;
       invalidateAuthenticatedState();
-      privateStream.restart();
+      privateStream.start();
       return setSecureHtml(reply, renderCredentialDeletedPage({ language }));
     } catch {
       if (vaultDeleted && previousCredentials) {
-        await credentialVault.set(DEFAULT_CREDENTIAL_PROFILE, previousCredentials, previousProvider ?? undefined)
+        await storedCredentialVault.set(profileId ?? DEFAULT_CREDENTIAL_PROFILE, previousCredentials, previousProvider ?? undefined)
           .catch((rollbackError) => request.log.error({ err: rollbackError }, 'credential delete rollback failed'));
       }
-      privateStream.restart();
+      if (releaseCredentialMutation && profileId && previousMetadata) {
+        try {
+          database.transaction(() => {
+            upsertCredentialMetadata(database, previousMetadata);
+            saveActiveCredentialProfile(database, profileId);
+          })();
+          activeCredentialProfileId = profileId;
+        } catch { /* preserve deletion error */ }
+      }
+      if (releaseCredentialMutation) privateStream.start();
+      const metadata = activeCredentialProfileId ? getCredentialMetadata(database, activeCredentialProfileId) : null;
       return setSecureHtml(reply, renderCredentialEntryPage({
         csrfToken: csrfTokens.issue(),
-        configured: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE) !== null,
-        storageAvailable: credentialVault.provider !== 'unavailable',
+        configured: metadata !== null,
+        storageAvailable: storedCredentialVault.provider !== 'unavailable',
         storageProviders: selectableStorageProviders,
-        configuredStorageProvider: getCredentialMetadata(database, DEFAULT_CREDENTIAL_PROFILE)?.provider,
+        configuredStorageProvider: metadata?.provider,
+        profiles: listCredentialMetadata(database),
+        activeProfileId: activeCredentialProfileId,
         tradingEnabled: tradingSession.liveTradingEnabled,
         language,
         errorMessage: credentialPageMessage(language, 'The configured credential store could not delete the credential.', '配置的 API 密钥存储无法删除该 API 密钥。'),
       }), 500);
     } finally {
       previousCredentials = null;
+      releaseCredentialMutation?.();
     }
   });
 

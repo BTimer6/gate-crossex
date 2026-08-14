@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   EnvFileCredentialVault,
+  DEFAULT_CREDENTIAL_PROFILE,
   MemoryCredentialVault,
   RoutedCredentialVault,
   type CredentialStorageProvider,
@@ -66,7 +67,7 @@ describe('credential vault contract', () => {
     try {
       await writeFile(path, 'EXISTING_SETTING="keep-me"\nGCT_GATE_UID="legacy-unused-value"\n', 'utf8');
       const vault = new EnvFileCredentialVault(path);
-      await vault.set('profile', { apiKey: 'example-key', apiSecret: 'secret-with-#-value' });
+      await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'example-key', apiSecret: 'secret-with-#-value' });
 
       expect(await vault.get()).toEqual({ apiKey: 'example-key', apiSecret: 'secret-with-#-value' });
       const contents = await readFile(path, 'utf8');
@@ -84,6 +85,22 @@ describe('credential vault contract', () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it('keeps multiple named profiles isolated in the .env fallback', async () => {
+    await withEnvPath(async (path) => {
+      const vault = new EnvFileCredentialVault(path);
+      await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'first-key', apiSecret: 'first-secret' });
+      await vault.set('gate-crossex-account-11111111-1111-4111-8111-111111111111', {
+        apiKey: 'second-key', apiSecret: 'second-secret',
+      });
+
+      expect(await vault.get(DEFAULT_CREDENTIAL_PROFILE)).toMatchObject({ apiKey: 'first-key' });
+      expect(await vault.get('gate-crossex-account-11111111-1111-4111-8111-111111111111'))
+        .toMatchObject({ apiKey: 'second-key' });
+      await vault.delete('gate-crossex-account-11111111-1111-4111-8111-111111111111');
+      expect(await vault.get(DEFAULT_CREDENTIAL_PROFILE)).toMatchObject({ apiKey: 'first-key' });
+    });
   });
 });
 
@@ -139,8 +156,8 @@ describe('routed credential vault read precedence', () => {
       await writeFile(path, 'GCT_GATE_API_KEY="manual-key"\nGCT_GATE_API_SECRET="manual-secret"\n', 'utf8');
       const routed = new RoutedCredentialVault(new EnvFileCredentialVault(path), new FakeKeychainVault());
 
-      expect(await routed.get('profile')).toMatchObject({ apiKey: 'manual-key' });
-      expect(await routed.getProvider('profile')).toBe('env_file');
+      expect(await routed.get(DEFAULT_CREDENTIAL_PROFILE)).toMatchObject({ apiKey: 'manual-key' });
+      expect(await routed.getProvider(DEFAULT_CREDENTIAL_PROFILE)).toBe('env_file');
     });
   });
 });

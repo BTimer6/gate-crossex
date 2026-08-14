@@ -121,6 +121,7 @@ export interface ExecutionOrder {
 
 export interface StrategyRecord {
   id: string; kind: 'position' | 'auto' | 'premium'; status: string; config: CreateStrategyInput;
+  accountProfileId: string | null; accountLabel: string | null;
   progress: number; filledQuantity: string; filledLeft: string; filledRight: string; openPosition: string;
   /** Sum of realized PnL reported by strategy-linked trade fills. */
   realizedPnl: string;
@@ -146,6 +147,7 @@ interface OrderRow {
 
 interface StrategyRow {
   id: string; kind: 'position' | 'auto' | 'premium'; environment: 'live'; status: string; config_json: string;
+  credential_profile_id: string | null; credential_profile_label: string | null;
   progress: number; filled_quantity: string; filled_left: string; filled_right: string; open_position: string;
   created_at: string; updated_at: string; stopped_at: string | null;
 }
@@ -162,6 +164,7 @@ function orderFromRow(row: OrderRow): ExecutionOrder {
 
 function strategyFromRow(row: StrategyRow): StrategyRecord {
   return { id: row.id, kind: row.kind, status: row.status,
+    accountProfileId: row.credential_profile_id, accountLabel: row.credential_profile_label,
     config: CreateStrategyInputSchema.parse(JSON.parse(row.config_json)), progress: row.progress,
     filledQuantity: row.filled_quantity, filledLeft: row.filled_left, filledRight: row.filled_right,
     openPosition: row.open_position, realizedPnl: '0',
@@ -217,6 +220,8 @@ export interface TradingRuntimeOptions {
   /** Delay between attempts to settle a PENDING_SUBMIT row whose submission outcome is unknown. */
   submitResolvePollMs?: number;
   submitResolveMaxAttempts?: number;
+  /** Account-wide barrier shared with credential replacement/switch/deletion. */
+  runAuthenticatedWrite?: <T>(work: () => Promise<T>) => Promise<T>;
 }
 
 export interface StrategyMarginLeg {
@@ -245,6 +250,7 @@ export class TradingRuntime {
   private readonly remoteRefreshes = new Map<string, Promise<ExecutionOrder | null>>();
   private readonly cancelRequests = new Map<string, Promise<ExecutionOrder>>();
   private readonly preparedStatements = new Map<string, Database.Statement>();
+  private readonly runAuthenticatedWrite: <T>(work: () => Promise<T>) => Promise<T>;
 
   constructor(
     private readonly database: Database.Database,
@@ -255,6 +261,7 @@ export class TradingRuntime {
   ) {
     this.submitResolvePollMs = options.submitResolvePollMs ?? 2_500;
     this.submitResolveMaxAttempts = options.submitResolveMaxAttempts ?? 24;
+    this.runAuthenticatedWrite = options.runAuthenticatedWrite ?? (async (work) => work());
   }
 
   subscribe(listener: RuntimeListener): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
@@ -524,6 +531,10 @@ export class TradingRuntime {
 
   reconcileLiveBalances(balances: Array<{ venue: string; coin: string; balance: string; availableBalance: string; equity: string; unrealizedPnl: string }>, updatedAt: string): void {
     this.database.transaction(() => {
+      // A REST account snapshot is authoritative. Rows absent from it belong to a venue/coin the
+      // current account no longer has (most importantly after credentials are changed), so an
+      // upsert-only reconciliation would leak balances from the previous account indefinitely.
+      this.database.prepare('DELETE FROM live_balances').run();
       const upsert = this.database.prepare(`INSERT INTO live_balances (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(venue, coin) DO UPDATE SET balance = excluded.balance,
         available_balance = excluded.available_balance, equity = excluded.equity,
@@ -725,6 +736,14 @@ export class TradingRuntime {
   }
 
   async createOrder(
+    raw: unknown,
+    metadata?: PlaceOrderMetadata,
+    referencePrice?: string,
+  ): Promise<ExecutionOrder> {
+    return this.runAuthenticatedWrite(() => this.createOrderWithStableCredentials(raw, metadata, referencePrice));
+  }
+
+  private async createOrderWithStableCredentials(
     raw: unknown,
     metadata?: PlaceOrderMetadata,
     referencePrice?: string,

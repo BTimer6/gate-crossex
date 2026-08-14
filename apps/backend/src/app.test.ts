@@ -11,7 +11,7 @@ import type { CrossExTransferRequest, FundingOverviewResponse, PublicMarketSnaps
 import type { Candle, CandleInterval } from '@gate-crossex/shared-types';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
-import { DEFAULT_CREDENTIAL_PROFILE, MemoryCredentialVault, type GateCredentials } from './credential-vault.js';
+import { DEFAULT_CREDENTIAL_PROFILE, EnvFileCredentialVault, MemoryCredentialVault, type CredentialVault, type GateCredentials } from './credential-vault.js';
 import { GateApiError, type CrossExOrderRequest, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExPortfolio, type GateCrossExRiskLimit, type GateCrossExSymbol, type GateFeeRate, type GateOrderActionResponse, type GateSpotAccount, type GateTransferCoin, type GateTransferRecord, type GateAccountBookRecord, type GateTransferResponse, type TradingCrossExGateway } from './crossex-client.js';
 import { openDatabase } from './database.js';
 import { CrossExMarketHub } from './market-hub.js';
@@ -43,6 +43,10 @@ const portfolioFixture: GateCrossExPortfolio = {
     max_leverage: '20', risk_limit: '1', fee: '0.5', funding_fee: '1.2', funding_time: '1783728000000',
     create_time: '1783600000000', update_time: '1783689000000', closed_pnl: '4',
   }],
+  adlRanks: [{
+    user_id: 'account-user', symbol: 'BINANCE_FUTURE_BTC_USDT',
+    crossex_adl_rank: '4', exchange_adl_rank: '3',
+  }],
   marginPositions: [{
     position_id: 'margin-1', symbol: 'GATE_MARGIN_ETH_USDT', position_side: 'LONG', initial_margin: '100',
     maintenance_margin: '20', asset_qty: '1', asset_coin: 'ETH', position_value: '3200', liability: '1000',
@@ -69,6 +73,7 @@ const portfolioFixture: GateCrossExPortfolio = {
 class FakeCrossExGateway implements TradingCrossExGateway {
   readonly receivedCredentials: GateCredentials[] = [];
   readonly createdOrders: CrossExOrderRequest[] = [];
+  readonly createdOrderCredentials: GateCredentials[] = [];
   readonly cancelledOrders: string[] = [];
   readonly leverageUpdates: Array<{ symbol: string; leverage: string }> = [];
   readonly createdTransfers: CrossExTransferRequest[] = [];
@@ -76,12 +81,15 @@ class FakeCrossExGateway implements TradingCrossExGateway {
   symbolQueryCount = 0;
   riskQueryCount = 0;
   feeQueryCount = 0;
+  positionsQueryCount = 0;
   portfolioQueryCount = 0;
   transferCoinQueryCount = 0;
   failSymbols = false;
   failPortfolio = false;
   private readonly remoteOrders = new Map<string, { request: CrossExOrderRequest; state: string }>();
   private portfolioBlock: Promise<void> | null = null;
+  private positionsBlock: Promise<void> | null = null;
+  private feeBlock: Promise<void> | null = null;
 
   async queryAccount(credentials: GateCredentials): Promise<GateCrossExAccount> {
     this.receivedCredentials.push({ ...credentials });
@@ -116,8 +124,20 @@ class FakeCrossExGateway implements TradingCrossExGateway {
 
   async queryPositions(credentials: GateCredentials): Promise<GateCrossExPortfolio['positions']> {
     this.receivedCredentials.push({ ...credentials });
+    this.positionsQueryCount += 1;
+    if (this.positionsBlock) {
+      const block = this.positionsBlock;
+      this.positionsBlock = null;
+      await block;
+    }
     if (this.failPortfolio) throw new GateApiError(0, 'NETWORK_ERROR');
     return portfolioFixture.positions;
+  }
+
+  blockNextPositions(): () => void {
+    let release!: () => void;
+    this.positionsBlock = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+    return release;
   }
 
 
@@ -148,6 +168,7 @@ class FakeCrossExGateway implements TradingCrossExGateway {
 
   async createOrder(credentials: GateCredentials, order: CrossExOrderRequest): Promise<GateOrderActionResponse> {
     this.receivedCredentials.push({ ...credentials });
+    this.createdOrderCredentials.push({ ...credentials });
     this.createdOrders.push({ ...order });
     const orderId = `live-${this.createdOrders.length}`;
     this.remoteOrders.set(orderId, { request: { ...order }, state: 'OPEN' });
@@ -196,10 +217,22 @@ class FakeCrossExGateway implements TradingCrossExGateway {
   async queryFeeRates(credentials: GateCredentials): Promise<GateFeeRate[]> {
     this.receivedCredentials.push({ ...credentials });
     this.feeQueryCount += 1;
+    if (this.feeBlock) {
+      const block = this.feeBlock;
+      this.feeBlock = null;
+      await block;
+    }
+    const accountRate = credentials.apiKey.includes('secondary') ? '0.00099' : '0.00006';
     return [
-      { exchange_type: 'BINANCE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00006', future_taker_fee: '0.00022', special_fee_list: [{ symbol: 'BINANCE_FUTURE_BTC_USDT', maker_fee_rate: '0.00001', taker_fee_rate: '0.00002' }] },
+      { exchange_type: 'BINANCE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: accountRate, future_taker_fee: '0.00022', special_fee_list: [{ symbol: 'BINANCE_FUTURE_BTC_USDT', maker_fee_rate: '0.00001', taker_fee_rate: '0.00002' }] },
       { exchange_type: 'GATE', spot_maker_fee: '0.0001', spot_taker_fee: '0.00025', future_maker_fee: '0.00005', future_taker_fee: '0.0002' },
     ];
+  }
+
+  blockNextFeeRates(): () => void {
+    let release!: () => void;
+    this.feeBlock = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+    return release;
   }
 
   async queryTransferCoins(): Promise<GateTransferCoin[]> {
@@ -328,7 +361,7 @@ class FakePublicMarketGateway implements PublicMarketDataGateway {
 interface TestContext {
   app: FastifyInstance;
   database: Database.Database;
-  vault: MemoryCredentialVault;
+  vault: CredentialVault;
   gateway: FakeCrossExGateway;
   publicMarketGateway: FakePublicMarketGateway;
   tradingSession: TradingSession;
@@ -383,6 +416,18 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     if (Date.now() > deadline) throw new Error('condition not reached in time');
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
   }
+}
+
+const SECONDARY_PROFILE_ID = 'gate-crossex-account-11111111-1111-4111-8111-111111111111';
+
+async function addSecondaryProfile(context: Pick<TestContext, 'database' | 'vault'>): Promise<void> {
+  await context.vault.set(SECONDARY_PROFILE_ID, {
+    apiKey: 'secondary-api-key',
+    apiSecret: 'secondary-api-secret',
+  });
+  context.database.prepare(`INSERT INTO credential_metadata
+    (id, label, provider, created_at, last_verified_at)
+    VALUES (?, 'Secondary account', 'memory_test_only', '2026-08-14T08:00:00.000Z', '2026-08-14T08:00:00.000Z')`).run(SECONDARY_PROFILE_ID);
 }
 
 function catalogSymbol(symbol: string, venue: string): GateCrossExSymbol {
@@ -477,7 +522,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 17, currentMigration: '0017_hyperliquid_perp_metadata.sql' },
+      database: { migrationCount: 20, currentMigration: '0020_strategy_account_backfill.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',
@@ -748,7 +793,8 @@ describe('local backend', () => {
       open24h: '63000', high24h: '65000', low24h: '62000', volume24h: '100',
       quoteVolume24h: '6400000', fundingRate: '0.0001',
       nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
-      openInterestValue: '6400000', updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+      openInterestValue: '6400000', receivedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
     });
     const { app, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
     gateway.extraSymbols.push({
@@ -766,7 +812,11 @@ describe('local backend', () => {
     } });
     expect(start.statusCode).toBe(200);
     const started = start.json();
-    expect(started).toMatchObject({ kind: 'position', status: 'RUNNING', progress: 0, filledQuantity: '0', config: { entryBps: '-5' } });
+    expect(started).toMatchObject({
+      kind: 'position', status: 'RUNNING', progress: 0, filledQuantity: '0',
+      accountProfileId: DEFAULT_CREDENTIAL_PROFILE, accountLabel: 'Gate CrossEx',
+      config: { entryBps: '-5' },
+    });
     expect(started.id).toMatch(/^PAIR-[A-Z0-9]{8}$/);
 
     const strategies = await app.inject({ method: 'GET', url: '/api/strategies', headers: { host: '127.0.0.1:17840' } });
@@ -782,6 +832,59 @@ describe('local backend', () => {
     expect(stop.json()).toMatchObject({ status: 'STOPPED' });
   });
 
+  it('resumes a paused strategy only with explicit live-trading intent', async () => {
+    const marketHub = new CrossExMarketHub('ws://127.0.0.1:1');
+    marketHub.market = (symbol: string) => ({
+      symbol, venue: symbol.split('_')[0] as 'BINANCE' | 'OKX', asset: 'BTC',
+      lastPrice: '64000', bidPrice: '63999', bidSize: '10', askPrice: '64001', askSize: '10',
+      open24h: '63000', high24h: '65000', low24h: '62000', volume24h: '100',
+      quoteVolume24h: '6400000', fundingRate: '0.0001',
+      nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
+      openInterestValue: '6400000', receivedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+    });
+    const { app, database, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
+    gateway.extraSymbols.push(catalogSymbol('OKX_FUTURE_BTC_USDT', 'OKX'));
+    const host = { host: '127.0.0.1:17840' };
+    expect((await app.inject({ method: 'GET', url: '/api/crossex/instruments', headers: host })).statusCode).toBe(200);
+
+    const id = 'PAIR-RESUME01';
+    const now = new Date().toISOString();
+    const config = {
+      kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'SELL', rightSide: 'BUY', entryBps: '10', totalAmount: '0.01',
+      perOrderQuantity: '0.01', leftLeverage: '5', rightLeverage: '5', reduceOnly: false,
+      executionMethod: 'TAKER_TAKER',
+    };
+    database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
+      filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
+      credential_profile_label, created_at, updated_at, stopped_at)
+      VALUES (?, 'position', 'live', 'PAUSED', ?, 0, '0', '0', '0', '0', ?, 'Gate CrossEx', ?, ?, NULL)`)
+      .run(id, JSON.stringify(config), DEFAULT_CREDENTIAL_PROFILE, now, now);
+
+    const missingIntent = await app.inject({ method: 'POST', url: `/api/strategies/${id}/resume`, headers: host });
+    expect(missingIntent.statusCode).toBe(403);
+    expect(missingIntent.json()).toEqual({ error: 'missing_trading_intent' });
+
+    const resumed = await app.inject({
+      method: 'POST', url: `/api/strategies/${id}/resume`,
+      headers: { ...host, 'x-gct-trading-intent': 'resume-strategy' },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json()).toMatchObject({ id, status: 'RUNNING' });
+    const logs = await app.inject({ method: 'GET', url: `/api/strategies/${id}/logs`, headers: host });
+    expect(logs.json().logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy resumed', condition: 'Manual resume' }),
+    ]));
+
+    const duplicate = await app.inject({
+      method: 'POST', url: `/api/strategies/${id}/resume`,
+      headers: { ...host, 'x-gct-trading-intent': 'resume-strategy' },
+    });
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toEqual({ error: 'strategy_not_paused' });
+  });
+
   it('updates a running ADR premium bot take profit through the API', async () => {
     const marketHub = new CrossExMarketHub('ws://127.0.0.1:1');
     const originalMarket = marketHub.market.bind(marketHub);
@@ -794,7 +897,8 @@ describe('local backend', () => {
         askPrice: price, askSize: '10', open24h: price, high24h: price, low24h: price,
         volume24h: '100', quoteVolume24h: '10000', fundingRate: '0',
         nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(), openInterest: '100',
-        openInterestValue: '10000', updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+        openInterestValue: '10000', receivedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
       };
     };
     const { app, gateway } = await createTestApp({ liveTradingEnabled: true, marketHub });
@@ -1047,8 +1151,15 @@ describe('local backend', () => {
       clientB.send(JSON.stringify({ type: 'watch.quotes', symbols: ['GATE_FUTURE_ETH_USDT'] }));
       clientA.send(JSON.stringify({ type: 'watch.market', symbol: 'GATE_FUTURE_BTC_USDT', interval: '1m' }));
       clientB.send(JSON.stringify({ type: 'watch.market', symbol: 'GATE_FUTURE_ETH_USDT', interval: '1m' }));
+      clientC.send(JSON.stringify({ type: 'watch.klines', watches: [
+        { symbol: 'GATE_FUTURE_BTC_USDT', interval: '1m' },
+        { symbol: 'GATE_FUTURE_ETH_USDT', interval: '1m' },
+      ] }));
       await waitFor(() => ['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_ETH_USDT'].every((symbol) =>
         upstreamRequests.some((request) => request.event === 'subscribe' && request.channel === 'order_book_update' && request.payload?.includes(symbol))));
+      await waitFor(() => new Set(messagesC
+        .filter((message) => message.type === 'kline.snapshot')
+        .map((message) => message.payload.symbol)).size === 2);
       // Quote-only registration expands client A's market scope without replacing its detailed BTC watch.
       clientA.send(JSON.stringify({ type: 'watch.quotes', symbols: ['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_SOL_USDT'] }));
 
@@ -1088,11 +1199,14 @@ describe('local backend', () => {
         .flatMap((message) => message.payload.markets ?? [])
         .map((market) => market.symbol);
       await waitFor(() => scopedSymbols(messagesA).length >= 3 && scopedSymbols(messagesB).length >= 3
+        && scopedSymbols(messagesC).length >= 2
         && batchSymbols(messagesA).length >= 2 && batchSymbols(messagesB).length >= 1);
       expect(new Set(scopedSymbols(messagesA))).toEqual(new Set(['GATE_FUTURE_BTC_USDT']));
       expect(new Set(scopedSymbols(messagesB))).toEqual(new Set(['GATE_FUTURE_ETH_USDT']));
       expect(new Set(batchSymbols(messagesA))).toEqual(new Set(['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_SOL_USDT']));
       expect(new Set(batchSymbols(messagesB))).toEqual(new Set(['GATE_FUTURE_ETH_USDT']));
+      expect(new Set(scopedSymbols(messagesC))).toEqual(new Set(['GATE_FUTURE_BTC_USDT', 'GATE_FUTURE_ETH_USDT']));
+      expect(messagesC.some((message) => message.type === 'orderbook.update' || message.type === 'trade.batch')).toBe(false);
       expect(batchSymbols(messagesC)).toEqual([]);
       expect(messagesA.find((message) => message.type === 'trade.batch')?.payload.trades).toHaveLength(2);
       expect(messagesB.find((message) => message.type === 'trade.batch')?.payload.trades).toHaveLength(2);
@@ -1800,7 +1914,10 @@ describe('local backend', () => {
       snapshot: {
         account: { marginBalance: '1500', accountMode: 'CROSS_EXCHANGE' },
         balances: expect.arrayContaining([expect.objectContaining({ venue: 'BINANCE', coin: 'USDT', equity: '1020' })]),
-        futuresPositions: [{ positionId: 'position-1', symbol: 'BINANCE_FUTURE_BTC_USDT' }],
+        futuresPositions: [{
+          positionId: 'position-1', symbol: 'BINANCE_FUTURE_BTC_USDT',
+          crossExAdlRank: '4', exchangeAdlRank: '3',
+        }],
         marginPositions: [{ positionId: 'margin-1', symbol: 'GATE_MARGIN_ETH_USDT' }],
         openOrders: [{ orderId: 'order-1', clientOrderId: 'client-1' }],
         recentFills: [{ transactionId: 'fill-1', orderId: 'order-0' }],
@@ -1826,6 +1943,298 @@ describe('local backend', () => {
     expect(reports.statusCode).toBe(200);
     expect(reports.json().reports).toHaveLength(2);
     expect(reports.json().reports[0]).toMatchObject({ status: 'stale' });
+  });
+
+  it('waits for an accepted order workflow before switching credentials', async () => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    const { app, gateway } = context;
+    await addSecondaryProfile(context);
+    const releasePositions = gateway.blockNextPositions();
+
+    const orderRequest = app.inject({
+      method: 'POST',
+      url: '/api/trading/orders',
+      headers: { host: '127.0.0.1:17840', 'x-gct-trading-intent': 'place-order' },
+      payload: {
+        symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', type: 'LIMIT', timeInForce: 'GTC',
+        quantity: '0.01', price: '64000', reduceOnly: false,
+      },
+    });
+    await waitFor(() => gateway.positionsQueryCount === 1);
+
+    let switchSettled = false;
+    const switchRequest = app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${SECONDARY_PROFILE_ID}/activate`,
+      headers: { host: '127.0.0.1:5173', 'x-gct-credential-intent': 'switch-account' },
+    }).finally(() => { switchSettled = true; });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+    expect(switchSettled).toBe(false);
+
+    releasePositions();
+    const [order, switched] = await Promise.all([orderRequest, switchRequest]);
+    expect(order.statusCode).toBe(200);
+    expect(switched.statusCode).toBe(200);
+    expect(switched.json()).toMatchObject({ activeProfileId: SECONDARY_PROFILE_ID, readOnly: true });
+    expect(gateway.createdOrderCredentials).toEqual([{ apiKey: 'test-key', apiSecret: 'test-secret' }]);
+    expect(gateway.cancelledOrders).toEqual(['live-1']);
+  });
+
+  it('drops an old-account positions response that finishes after an account switch', async () => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    const { app, gateway } = context;
+    await addSecondaryProfile(context);
+    const releasePositions = gateway.blockNextPositions();
+
+    const oldPositions = app.inject({
+      method: 'GET',
+      url: '/api/crossex/positions-snapshot',
+      headers: { host: '127.0.0.1:17840', 'x-gct-read-intent': 'positions-snapshot' },
+    });
+    await waitFor(() => gateway.positionsQueryCount === 1);
+    const switched = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${SECONDARY_PROFILE_ID}/activate`,
+      headers: { host: '127.0.0.1:5173', 'x-gct-credential-intent': 'switch-account' },
+    });
+    expect(switched.statusCode).toBe(200);
+
+    releasePositions();
+    const staleResponse = await oldPositions;
+    expect(staleResponse.statusCode).toBe(409);
+    expect(staleResponse.json()).toEqual({ error: 'credential_context_changed' });
+    const snapshot = await app.inject({
+      method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' },
+    });
+    expect(snapshot.json().positions).toEqual([]);
+  });
+
+  it('keeps an old-account fee request from repopulating the new account cache', async () => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    const { app, gateway } = context;
+    await addSecondaryProfile(context);
+    const releaseFees = gateway.blockNextFeeRates();
+    const feeHeaders = { host: '127.0.0.1:17840', 'x-gct-read-intent': 'fee-rates' };
+
+    const oldFees = app.inject({ method: 'GET', url: '/api/crossex/fees', headers: feeHeaders });
+    await waitFor(() => gateway.feeQueryCount === 1);
+    const switched = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${SECONDARY_PROFILE_ID}/activate`,
+      headers: { host: '127.0.0.1:5173', 'x-gct-credential-intent': 'switch-account' },
+    });
+    expect(switched.statusCode).toBe(200);
+
+    const newFees = await app.inject({ method: 'GET', url: '/api/crossex/fees', headers: feeHeaders });
+    expect(newFees.statusCode).toBe(200);
+    expect(newFees.json().fees[0]).toMatchObject({ venue: 'BINANCE', futureMakerFee: '0.00099' });
+
+    releaseFees();
+    const staleResponse = await oldFees;
+    expect(staleResponse.statusCode).toBe(409);
+    expect(staleResponse.json()).toEqual({ error: 'credential_context_changed' });
+    const cached = await app.inject({ method: 'GET', url: '/api/crossex/fees', headers: feeHeaders });
+    expect(cached.json().fees[0]).toMatchObject({ futureMakerFee: '0.00099' });
+    expect(gateway.feeQueryCount).toBe(2);
+  });
+
+  it('adds and switches saved accounts while clearing the previous account state', async () => {
+    const { app, database, vault } = await createTestApp();
+    const browserHeaders = { host: '127.0.0.1:5173' };
+    const postHeaders = {
+      ...browserHeaders,
+      origin: 'http://127.0.0.1:5173',
+      'content-type': 'application/x-www-form-urlencoded',
+    };
+    const firstForm = await app.inject({ method: 'GET', url: '/secure/credentials', headers: browserHeaders });
+    await app.inject({
+      method: 'POST', url: '/secure/credentials', headers: postHeaders,
+      payload: new URLSearchParams({
+        csrfToken: csrfTokenFrom(firstForm.body), label: 'Primary account',
+        apiKey: 'primary-api-key', apiSecret: 'primary-api-secret',
+      }).toString(),
+    });
+
+    const addForm = await app.inject({ method: 'GET', url: '/secure/credentials?action=add', headers: browserHeaders });
+    expect(addForm.body).toContain('Sign in to another Gate account');
+    const added = await app.inject({
+      method: 'POST', url: '/secure/credentials', headers: postHeaders,
+      payload: new URLSearchParams({
+        csrfToken: csrfTokenFrom(addForm.body), action: 'add', label: 'Secondary account',
+        apiKey: 'secondary-api-key', apiSecret: 'secondary-api-secret',
+      }).toString(),
+    });
+    expect(added.statusCode).toBe(200);
+
+    const profiles = database.prepare('SELECT id, label FROM credential_metadata ORDER BY created_at').all() as Array<{ id: string; label: string }>;
+    expect(profiles.map((profile) => profile.label)).toEqual(['Primary account', 'Secondary account']);
+    const secondary = profiles.find((profile) => profile.label === 'Secondary account');
+    expect(secondary).toBeDefined();
+    expect(await vault.get(secondary!.id)).toMatchObject({ apiKey: 'secondary-api-key' });
+
+    database.prepare(`INSERT INTO live_balances
+      (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES ('KRAKEN', 'USD', '6.59', '6.59', '7.35', '0.76', '2026-08-12T15:00:00.000Z')`).run();
+    const manager = await app.inject({ method: 'GET', url: '/secure/credentials', headers: browserHeaders });
+    expect(manager.body).toContain('Primary account');
+    expect(manager.body).toContain('Secondary account');
+    expect(manager.body).toContain('Saved accounts');
+
+    const switched = await app.inject({
+      method: 'POST', url: '/secure/credentials/switch', headers: postHeaders,
+      payload: new URLSearchParams({
+        csrfToken: csrfTokenFrom(manager.body), profileId: DEFAULT_CREDENTIAL_PROFILE,
+      }).toString(),
+    });
+    expect(switched.statusCode).toBe(200);
+    expect(switched.body).toContain('Account switched');
+    expect(database.prepare('SELECT COUNT(*) AS count FROM live_balances').get()).toEqual({ count: 0 });
+
+    const connection = await app.inject({ method: 'GET', url: '/api/onboarding/connection', headers: browserHeaders });
+    expect(connection.json()).toMatchObject({
+      label: 'Primary account',
+      activeProfileId: DEFAULT_CREDENTIAL_PROFILE,
+      profiles: [
+        expect.objectContaining({ label: 'Primary account', active: true }),
+        expect.objectContaining({ label: 'Secondary account', active: false }),
+      ],
+    });
+
+    const strategyId = 'PAIR-ACCOUNT1';
+    database.prepare(`INSERT INTO execution_strategies
+      (id, kind, environment, status, config_json, progress, filled_quantity, filled_left,
+       filled_right, open_position, credential_profile_id, credential_profile_label,
+       created_at, updated_at, stopped_at)
+      VALUES (?, 'position', 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
+      .run(strategyId, JSON.stringify({
+        kind: 'position', asset: 'BTC', hedgeMode: 'SHARE_RATIO', leftLeverage: '1', rightLeverage: '1',
+        leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY', entryBps: '5',
+        totalAmount: '0.1', perOrderQuantity: '0.1', reduceOnly: false,
+        executionMethod: 'MAKER_TAKER', makerLeg: 'left', grid: false,
+      }), DEFAULT_CREDENTIAL_PROFILE, 'Primary account',
+      '2026-08-12T16:20:00.000Z', '2026-08-12T16:20:00.000Z');
+
+    const switchNeedsConfirmation = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${secondary!.id}/activate`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'switch-account' },
+    });
+    expect(switchNeedsConfirmation.statusCode).toBe(409);
+    expect(switchNeedsConfirmation.json()).toEqual({
+      error: 'running_strategies_require_confirmation', strategyCount: 1, strategyIds: [strategyId],
+    });
+    expect(database.prepare('SELECT status FROM execution_strategies WHERE id = ?').get(strategyId))
+      .toEqual({ status: 'RUNNING' });
+
+    const switchedInWebApp = await app.inject({
+      method: 'POST',
+      url: `/api/onboarding/accounts/${secondary!.id}/activate`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'switch-account' },
+      payload: { confirmPauseRunningStrategies: true },
+    });
+    expect(switchedInWebApp.statusCode).toBe(200);
+    expect(switchedInWebApp.json()).toMatchObject({
+      label: 'Secondary account',
+      activeProfileId: secondary!.id,
+      profiles: [
+        expect.objectContaining({ label: 'Primary account', active: false }),
+        expect.objectContaining({ label: 'Secondary account', active: true }),
+      ],
+    });
+    expect(database.prepare('SELECT status, credential_profile_id FROM execution_strategies WHERE id = ?').get(strategyId))
+      .toEqual({ status: 'PAUSED', credential_profile_id: DEFAULT_CREDENTIAL_PROFILE });
+
+    database.prepare(`
+      UPDATE execution_strategies
+      SET credential_profile_id = ?, credential_profile_label = ?
+      WHERE id = ?
+    `).run(secondary!.id, 'Secondary account', strategyId);
+    const renameWithoutIntent = await app.inject({
+      method: 'PATCH',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: browserHeaders,
+      payload: { label: 'Secondary desk' },
+    });
+    expect(renameWithoutIntent.statusCode).toBe(403);
+    const invalidRename = await app.inject({
+      method: 'PATCH',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'rename-account' },
+      payload: { label: '   ' },
+    });
+    expect(invalidRename.statusCode).toBe(400);
+    const renamed = await app.inject({
+      method: 'PATCH',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'rename-account' },
+      payload: { label: '  Secondary desk  ' },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(renamed.json()).toMatchObject({
+      label: 'Secondary desk',
+      profiles: expect.arrayContaining([
+        expect.objectContaining({ id: secondary!.id, label: 'Secondary desk', active: true }),
+      ]),
+    });
+    expect(database.prepare('SELECT label FROM credential_metadata WHERE id = ?').get(secondary!.id))
+      .toEqual({ label: 'Secondary desk' });
+    expect(database.prepare('SELECT credential_profile_label FROM execution_strategies WHERE id = ?').get(strategyId))
+      .toEqual({ credential_profile_label: 'Secondary desk' });
+
+    const deletedInactive = await app.inject({
+      method: 'DELETE',
+      url: `/api/onboarding/accounts/${DEFAULT_CREDENTIAL_PROFILE}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'delete-account' },
+    });
+    expect(deletedInactive.statusCode).toBe(200);
+    expect(deletedInactive.json()).toMatchObject({
+      label: 'Secondary desk',
+      profiles: [expect.objectContaining({ label: 'Secondary desk', active: true })],
+    });
+    expect(await vault.get(DEFAULT_CREDENTIAL_PROFILE)).toBeNull();
+
+    const deletedActive = await app.inject({
+      method: 'DELETE',
+      url: `/api/onboarding/accounts/${secondary!.id}`,
+      headers: { ...browserHeaders, 'x-gct-credential-intent': 'delete-account' },
+    });
+    expect(deletedActive.statusCode).toBe(200);
+    expect(deletedActive.json()).toMatchObject({ configured: false, activeProfileId: null, profiles: [] });
+    expect(await vault.get(secondary!.id)).toBeNull();
+  });
+
+  it('discards authenticated cache at boot when the active .env credentials may have changed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gate-crossex-env-restart-'));
+    const config = loadConfig({
+      GCT_DATA_DIR: directory,
+      GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
+      GCT_CREDENTIAL_ENV_PATH: join(directory, '.env'),
+    });
+    const database = openDatabase(config.databasePath, config.migrationsDir);
+    const vault = new EnvFileCredentialVault(config.credentialEnvPath);
+    await vault.set(DEFAULT_CREDENTIAL_PROFILE, {
+      apiKey: 'new-account-api-key', apiSecret: 'new-account-api-secret',
+    });
+    database.prepare(`INSERT INTO credential_metadata
+      (id, label, provider, created_at, last_verified_at)
+      VALUES (?, 'Previous account', 'env_file', '2026-08-11T10:00:00.000Z', '2026-08-11T10:00:00.000Z')`)
+      .run(DEFAULT_CREDENTIAL_PROFILE);
+    database.prepare(`INSERT INTO live_balances
+      (venue, coin, balance, available_balance, equity, unrealized_pnl, updated_at)
+      VALUES ('KRAKEN', 'USD', '6.59', '6.59', '7.35', '0.76', '2026-08-11T10:00:00.000Z')`).run();
+    const gateway = new FakeCrossExGateway();
+    const publicMarketGateway = new FakePublicMarketGateway();
+    const tradingSession = new TradingSession();
+    const app = await buildApp({
+      config, database, credentialVault: vault, crossExGateway: gateway,
+      publicMarketGateway, tradingSession, startMarketStream: false, logger: false,
+    });
+    resources.push({ app, database, vault, gateway, publicMarketGateway, tradingSession, directory });
+
+    expect(database.prepare('SELECT COUNT(*) AS count FROM live_balances').get()).toEqual({ count: 0 });
+    expect((await app.inject({
+      method: 'GET', url: '/api/trading/snapshot', headers: { host: '127.0.0.1:17840' },
+    })).json().balances).toEqual([]);
   });
 
   it('preserves Chinese through credential setup, verification, and deletion', async () => {

@@ -12,6 +12,7 @@ const ACCOUNT_ENDPOINT = '/crossex/accounts';
 const SYMBOLS_ENDPOINT = '/crossex/rule/symbols';
 const RISK_LIMITS_ENDPOINT = '/crossex/rule/risk_limits';
 const POSITIONS_ENDPOINT = '/crossex/positions';
+const ADL_RANK_ENDPOINT = '/crossex/adl_rank';
 const MARGIN_POSITIONS_ENDPOINT = '/crossex/margin_positions';
 const OPEN_ORDERS_ENDPOINT = '/crossex/open_orders';
 const HISTORY_TRADES_ENDPOINT = '/crossex/history_trades';
@@ -22,6 +23,9 @@ const TRANSFER_COINS_ENDPOINT = '/crossex/transfers/coin';
 const TRANSFERS_ENDPOINT = '/crossex/transfers';
 const ACCOUNT_BOOK_ENDPOINT = '/crossex/account_book';
 const SPOT_ACCOUNTS_ENDPOINT = '/spot/accounts';
+const ADL_ENRICHMENT_BUDGET_MS = 1_500;
+const ADL_ENRICHMENT_REQUEST_TIMEOUT_MS = 1_000;
+const MAX_ADL_ENRICHMENT_SYMBOLS = 20;
 const IsolatedExchangeTypeSchema = z.enum([
   'BINANCE', 'OKX', 'GATE', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT',
 ]);
@@ -109,6 +113,21 @@ const GatePositionSchema = z.object({
 });
 export type GateCrossExPosition = z.infer<typeof GatePositionSchema>;
 
+const GateAdlRankSchema = z.object({
+  user_id: z.string().optional(),
+  symbol: z.string(),
+  crossex_adl_rank: z.string(),
+  exchange_adl_rank: z.string(),
+});
+export type GateCrossExAdlRank = z.infer<typeof GateAdlRankSchema>;
+
+// Gate's live endpoint returns one object for the required symbol, while older/documented
+// responses have also appeared as an array. Normalize both shapes at the API boundary.
+const GateAdlRankResponseSchema = z.union([
+  GateAdlRankSchema,
+  z.array(GateAdlRankSchema),
+]).transform((response) => Array.isArray(response) ? response : [response]);
+
 const GateMarginPositionSchema = z.object({
   position_id: z.string(), symbol: z.string(), position_side: z.string(), initial_margin: z.string(),
   maintenance_margin: z.string(), asset_qty: z.string(), asset_coin: z.string(), position_value: z.string(),
@@ -140,6 +159,7 @@ export type GateCrossExTrade = z.infer<typeof GateTradeSchema>;
 export interface GateCrossExPortfolio {
   account: GateCrossExAccount;
   positions: GateCrossExPosition[];
+  adlRanks?: GateCrossExAdlRank[];
   marginPositions: GateCrossExMarginPosition[];
   openOrders: GateCrossExOrder[];
   recentTrades: GateCrossExTrade[];
@@ -373,6 +393,32 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     return this.signedRequest('GET', POSITIONS_ENDPOINT, '', '', credentials, z.array(GatePositionSchema), 'INVALID_POSITIONS_RESPONSE');
   }
 
+  async queryAdlRanks(credentials: GateCredentials, symbols: string[]): Promise<GateCrossExAdlRank[]> {
+    const uniqueSymbols = [...new Set(symbols.filter((symbol) => /^[A-Z0-9_]{3,120}$/.test(symbol)))]
+      .slice(0, MAX_ADL_ENRICHMENT_SYMBOLS);
+    const deadline = Date.now() + ADL_ENRICHMENT_BUDGET_MS;
+    const responses: GateCrossExAdlRank[][] = [];
+    for (const symbol of uniqueSymbols) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      const queryString = new URLSearchParams({ symbol }).toString();
+      try {
+        responses.push(await this.signedRequest(
+          'GET', ADL_RANK_ENDPOINT, queryString, '', credentials,
+          GateAdlRankResponseSchema, 'INVALID_ADL_RANK_RESPONSE', false, 'low',
+          Math.max(1, Math.min(ADL_ENRICHMENT_REQUEST_TIMEOUT_MS, remainingMs)),
+        ));
+      } catch (error) {
+        // ADL is supplemental risk metadata. A venue that does not publish a rank must not make
+        // the full account snapshot unavailable; the UI renders an explicit unavailable state.
+        // Stop immediately on rate limiting so one optional endpoint cannot apply its cooldown once
+        // per remaining open symbol and delay all authenticated account work for minutes.
+        if (error instanceof GateApiError && error.statusCode === 429) break;
+      }
+    }
+    return responses.flat();
+  }
+
   async queryPortfolio(credentials: GateCredentials): Promise<GateCrossExPortfolio> {
     const historyQuery = new URLSearchParams({ page: '1', limit: '100' }).toString();
     const [account, positions, marginPositions, openOrders, recentTrades] = await Promise.all([
@@ -382,7 +428,11 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
       this.signedRequest('GET', OPEN_ORDERS_ENDPOINT, '', '', credentials, z.array(GateOrderSchema), 'INVALID_OPEN_ORDERS_RESPONSE', false, 'low'),
       this.signedRequest('GET', HISTORY_TRADES_ENDPOINT, historyQuery, '', credentials, z.array(GateTradeSchema), 'INVALID_TRADES_RESPONSE', false, 'low'),
     ]);
-    return { account, positions, marginPositions, openOrders, recentTrades };
+    const adlRanks = await this.queryAdlRanks(
+      credentials,
+      positions.filter((position) => Number(position.position_qty) !== 0).map((position) => position.symbol),
+    );
+    return { account, positions, adlRanks, marginPositions, openOrders, recentTrades };
   }
 
   async createOrder(credentials: GateCredentials, order: CrossExOrderRequest): Promise<GateOrderActionResponse> {
@@ -481,6 +531,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     invalidSchemaLabel: string,
     attributeBrokerOrder = false,
     priority: AuthenticatedRequestPriority = 'normal',
+    timeoutMs = 10_000,
   ): Promise<T> {
     const requestPath = `/api/v4${endpoint}`;
 
@@ -510,7 +561,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
           },
           ...(body ? { body } : {}),
           redirect: 'error',
-          signal: AbortSignal.timeout(10_000),
+          signal: AbortSignal.timeout(timeoutMs),
         });
         if (received.status === 429) {
           this.authenticatedCooldownUntil = Math.max(

@@ -3,11 +3,19 @@ import { randomBytes } from 'node:crypto';
 const styles = `
 :root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#070c14;color:#e9f0fb}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:28px;background:radial-gradient(circle at top,#102530,#070c14 48%)}
-main{width:min(100%,620px);padding:32px;border:1px solid #29384d;border-radius:16px;background:#0c1421;box-shadow:0 28px 80px #0008}
+main{width:min(100%,680px);padding:32px;border:1px solid #29384d;border-radius:20px;background:#0c1421;box-shadow:0 28px 80px #0008}
 .eyebrow{margin:0 0 10px;color:#5eead4;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.13em}h1{margin:0 0 12px;font-size:32px;letter-spacing:-.04em}p{color:#95a3b8;line-height:1.6}.notice{padding:14px;border:1px solid #3f4d27;border-radius:9px;background:#171b10;color:#d9df9b}.error{border-color:#713f2b;background:#24150f;color:#fdba74}
 form{display:grid;gap:16px;margin-top:24px}label{display:grid;gap:7px;color:#cbd6e6;font-size:13px}input{width:100%;padding:12px;border:1px solid #34445a;border-radius:8px;background:#08111e;color:#edf5ff;font:inherit}input:focus{outline:2px solid #2dd4bf;outline-offset:2px}.actions{display:flex;gap:10px;align-items:center;margin-top:8px}.button,button{display:inline-flex;justify-content:center;padding:11px 16px;border:1px solid #2a756b;border-radius:8px;background:#123b37;color:#d5fffa;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}.secondary{border-color:#3a475a;background:#131d2b;color:#cbd6e6}.danger{width:100%;border-color:#8a4527;background:#321a11;color:#fed7aa}.action-detail{display:block;margin-top:-7px;color:#7f8ca2;line-height:1.45}.danger-zone{margin-top:28px;padding:18px;border:1px solid #713f2b;border-radius:10px;background:#180f0c}.danger-zone h2{margin:0;color:#fed7aa;font-size:16px}.danger-zone p{margin:7px 0 0;color:#c99f8d;font-size:12px;line-height:1.5}.danger-zone form{margin-top:14px}.small{font-size:12px}.footer{margin-top:24px;padding-top:18px;border-top:1px solid #202d3f}
 fieldset{margin:0;padding:0;border:0}legend{margin-bottom:8px;color:#cbd6e6;font-size:13px}.storage-options{display:grid;grid-template-columns:1fr 1fr;gap:10px}.storage-option{display:flex;align-items:flex-start;gap:10px;padding:13px;border:1px solid #34445a;border-radius:9px;background:#08111e}.storage-option input{width:auto;margin-top:3px}.storage-option span{display:grid;gap:3px}.storage-option small{color:#7f8ca2;line-height:1.35}@media(max-width:560px){body{padding:14px}main{padding:22px}.storage-options{grid-template-columns:1fr}.actions{flex-direction:column;align-items:stretch}.actions .button,.actions button{width:100%}}
+.account-manager{margin:24px 0;padding:18px;border:1px solid #26364b;border-radius:14px;background:#09111d}.account-manager-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:12px}.account-manager-header h2{margin:0;font-size:16px}.account-manager-header a{color:#5eead4;font-size:13px;text-decoration:none}.account-list{display:grid;gap:9px}.account-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px;border:1px solid #29384d;border-radius:11px;background:#0d1827}.account-row.active{border-color:#247c70;background:#0c211f}.account-identity{min-width:0;display:grid;gap:3px}.account-identity strong{overflow:hidden;text-overflow:ellipsis}.account-identity small{color:#7f8ca2}.account-row form{display:block;margin:0}.account-row button{padding:8px 12px;font-size:12px}.active-pill{color:#5eead4;font-size:12px;font-weight:800}.login-divider{display:flex;align-items:center;gap:12px;margin:24px 0;color:#65748a;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em}.login-divider:before,.login-divider:after{content:"";height:1px;flex:1;background:#26364b}@media(max-width:560px){body{padding:14px}main{padding:22px}.storage-options{grid-template-columns:1fr}.actions{flex-direction:column;align-items:stretch}.actions .button,.actions button{width:100%}.account-row{align-items:flex-start}.account-row form{width:auto}.account-row button{width:auto}}
 `;
+
+export interface SecureCredentialProfile {
+  id: string;
+  label: string;
+  provider: string;
+  lastVerifiedAt: string | null;
+}
 
 export type SecureCredentialLanguage = 'en' | 'zh';
 
@@ -17,6 +25,7 @@ const credentialCopy = {
     entryEyebrow: 'Script-free secure setup',
     entryHeading: 'Gate CrossEx credentials',
     replacementHeading: 'Replace saved Gate credentials',
+    addHeading: 'Sign in to another Gate account',
     entryIntro: 'This isolated page runs with JavaScript disabled. On submission, the local backend verifies the credential with <code>GET /crossex/accounts</code>. Credentials are stored only after that request succeeds.',
     noStorage: 'No credential storage provider is available.',
     replace: 'Verify & save replacement',
@@ -50,6 +59,16 @@ const credentialCopy = {
     noneReturned: 'None returned',
     finishLive: 'Return to the trading-mode dialog and select <strong>I\'ve saved credentials — enable live trading</strong> to finish.',
     returnDashboard: 'Return to dashboard',
+    accounts: 'Saved accounts',
+    addAccount: 'Add account',
+    activeAccount: 'Active account',
+    switchAccount: 'Switch',
+    signInDivider: 'API credentials',
+    switchedTitle: 'Account switched',
+    switchedEyebrow: 'Secure account session',
+    switchedHeading: 'You are signed in',
+    switchedBody: 'is now the active account. Cached balances, positions, and portfolio data from the previous account were cleared before reconnecting.',
+    manageAccounts: 'Manage accounts',
     deletedTitle: 'Gate credentials removed',
     deletedEyebrow: 'Credential removal complete',
     deletedHeading: 'Saved credentials deleted',
@@ -60,6 +79,7 @@ const credentialCopy = {
     entryEyebrow: '无脚本安全设置',
     entryHeading: '添加 Gate API 密钥',
     replacementHeading: '替换已保存的 Gate API 密钥',
+    addHeading: '登录另一个 Gate 账户',
     entryIntro: '此隔离页面已禁用 JavaScript。提交后，本地后端将通过 <code>GET /crossex/accounts</code> 验证 API 密钥。仅在该请求成功后才会存储 API 密钥。',
     noStorage: '没有可用的 API 密钥存储方式。',
     replace: '验证并保存新密钥',
@@ -93,6 +113,16 @@ const credentialCopy = {
     noneReturned: '未返回任何交易所',
     finishLive: '请返回交易模式对话框并选择<strong>我已保存API密钥 — 启用实盘交易</strong>以完成设置。',
     returnDashboard: '返回控制台',
+    accounts: '已保存的账户',
+    addAccount: '添加账户',
+    activeAccount: '当前账户',
+    switchAccount: '切换',
+    signInDivider: 'API 密钥',
+    switchedTitle: '账户已切换',
+    switchedEyebrow: '安全账户会话',
+    switchedHeading: '您已登录',
+    switchedBody: '现已成为当前账户。重新连接前，系统已清除上一个账户缓存的余额、仓位和投资组合数据。',
+    manageAccounts: '管理账户',
     deletedTitle: 'Gate API 密钥已移除',
     deletedEyebrow: 'API 密钥移除完成',
     deletedHeading: '已删除保存的 API 密钥',
@@ -114,6 +144,9 @@ export function renderCredentialEntryPage(options: {
   storageAvailable: boolean;
   storageProviders?: readonly string[];
   configuredStorageProvider?: string;
+  profiles?: readonly SecureCredentialProfile[];
+  activeProfileId?: string | null;
+  adding?: boolean;
   tradingEnabled?: boolean;
   liveTradingIntent?: boolean;
   language?: SecureCredentialLanguage;
@@ -128,13 +161,13 @@ export function renderCredentialEntryPage(options: {
   const storageWarning = options.storageAvailable
     ? ''
     : `<p class="notice error">${copy.noStorage}</p>`;
-  const heading = options.configured ? copy.replacementHeading : copy.entryHeading;
-  const replaceText = options.configured ? copy.replace : copy.store;
+  const heading = options.adding ? copy.addHeading : options.configured ? copy.replacementHeading : copy.entryHeading;
+  const replaceText = options.configured && !options.adding ? copy.replace : copy.store;
   const languageField = `<input type="hidden" name="lang" value="${language}">`;
-  const replacementDetail = options.configured
+  const replacementDetail = options.configured && !options.adding
     ? `<small class="action-detail">${copy.replacementDetail}</small>`
     : '';
-  const deleteSection = options.configured
+  const deleteSection = options.configured && !options.adding
     ? `<section class="danger-zone" aria-labelledby="danger-zone-title">
         <h2 id="danger-zone-title">${copy.dangerTitle}</h2>
         <p>${copy.dangerDetail}</p>
@@ -149,6 +182,7 @@ export function renderCredentialEntryPage(options: {
   const intentField = options.liveTradingIntent
     ? '<input type="hidden" name="intent" value="live-trading">'
     : '';
+  const actionField = options.adding ? '<input type="hidden" name="action" value="add">' : '';
   const providers = options.storageProviders ?? [];
   const defaultProvider = options.configuredStorageProvider && providers.includes(options.configuredStorageProvider)
     ? options.configuredStorageProvider
@@ -157,17 +191,30 @@ export function renderCredentialEntryPage(options: {
     ${providers.includes('os_keychain') ? `<label class="storage-option"><input type="radio" name="storageProvider" value="os_keychain"${defaultProvider === 'os_keychain' ? ' checked' : ''}><span><strong>${copy.keychain}</strong><small>${copy.keychainDetail}</small></span></label>` : ''}
     ${providers.includes('env_file') ? `<label class="storage-option"><input type="radio" name="storageProvider" value="env_file"${defaultProvider === 'env_file' ? ' checked' : ''}><span><strong>${copy.envFile}</strong><small>${copy.envFileDetail}</small></span></label>` : ''}
   </div></fieldset>` : '';
+  const profiles = options.profiles ?? [];
+  const accountManager = profiles.length ? `<section class="account-manager" aria-labelledby="saved-accounts-title">
+    <div class="account-manager-header"><h2 id="saved-accounts-title">${copy.accounts}</h2><a href="/secure/credentials?action=add&amp;lang=${language}${options.liveTradingIntent ? '&amp;intent=live-trading' : ''}">+ ${copy.addAccount}</a></div>
+    <div class="account-list">${profiles.map((profile) => {
+      const active = profile.id === options.activeProfileId;
+      return `<div class="account-row${active ? ' active' : ''}"><span class="account-identity"><strong>${escapeHtml(profile.label)}</strong><small>${escapeHtml(profile.provider === 'os_keychain' ? copy.keychain : profile.provider === 'env_file' ? copy.envFile : profile.provider)}${profile.lastVerifiedAt ? ` · ${escapeHtml(profile.lastVerifiedAt)}` : ''}</small></span>${active
+        ? `<span class="active-pill">● ${copy.activeAccount}</span>`
+        : `<form method="post" action="/secure/credentials/switch"><input type="hidden" name="csrfToken" value="${options.csrfToken}">${languageField}${intentField}<input type="hidden" name="profileId" value="${escapeHtml(profile.id)}"><button type="submit">${copy.switchAccount}</button></form>`}</div>`;
+    }).join('')}</div>
+  </section>` : '';
 
   return page(copy.entryTitle, `
     <p class="eyebrow">${copy.entryEyebrow}</p>
     <h1>${heading}</h1>
     <p>${copy.entryIntro}</p>
+    ${accountManager}
+    ${profiles.length ? `<div class="login-divider">${copy.signInDivider}</div>` : ''}
     <p class="notice">${permissionCopy} ${copy.testnet}</p>
     ${storageWarning}${error}
     <form method="post" action="/secure/credentials" autocomplete="off">
       <input type="hidden" name="csrfToken" value="${options.csrfToken}">
       ${languageField}
       ${intentField}
+      ${actionField}
       <label>${copy.connectionLabel}<input name="label" required minlength="1" maxlength="80" value="Gate CrossEx"></label>
       <label>${copy.apiKey}<input name="apiKey" type="password" required minlength="8" maxlength="256" autocomplete="off" spellcheck="false"></label>
       <label>${copy.apiSecret}<input name="apiSecret" type="password" required minlength="8" maxlength="512" autocomplete="off" spellcheck="false"></label>
@@ -197,6 +244,20 @@ export function renderCredentialSuccessPage(options: {
     <p>${copy.accountMode}: <strong>${escapeHtml(options.accountMode)}</strong><br>${copy.visibleVenues}: <strong>${escapeHtml(options.venues.join(', ') || copy.noneReturned)}</strong></p>
     ${options.liveTradingIntent ? `<p>${copy.finishLive}</p>` : ''}
     <div class="actions"><a class="button" href="/">${copy.returnDashboard}</a></div>
+  `, language);
+}
+
+export function renderCredentialSwitchSuccessPage(options: {
+  label: string;
+  language?: SecureCredentialLanguage;
+}): { html: string; csp: string } {
+  const language = options.language ?? 'en';
+  const copy = credentialCopy[language];
+  return page(copy.switchedTitle, `
+    <p class="eyebrow">${copy.switchedEyebrow}</p>
+    <h1>${copy.switchedHeading}</h1>
+    <p class="notice"><strong>${escapeHtml(options.label)}</strong> ${copy.switchedBody}</p>
+    <div class="actions"><a class="button" href="/">${copy.returnDashboard}</a><a class="button secondary" href="/secure/credentials?lang=${language}">${copy.manageAccounts}</a></div>
   `, language);
 }
 

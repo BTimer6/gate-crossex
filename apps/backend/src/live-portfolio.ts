@@ -355,6 +355,8 @@ export class LivePortfolioStore {
       createdAt: timestamp(value.create_time, existing?.createdAt ?? now),
       updatedAt: timestamp(value.update_time, now),
       realizedPnl: value.closed_pnl ?? existing?.realizedPnl ?? '0',
+      crossExAdlRank: existing?.crossExAdlRank ?? null,
+      exchangeAdlRank: existing?.exchangeAdlRank ?? null,
     };
     this.current = {
       ...this.current,

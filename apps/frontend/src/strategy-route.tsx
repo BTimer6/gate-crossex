@@ -1,14 +1,16 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CrossExRiskLimitTier } from '@gate-crossex/shared-types';
 import {
   api,
   ApiError,
   type AuthenticatedPortfolioSnapshot,
   type Candle,
+  type CandleInterval,
   type CrossExInstrument,
   type FundingHistorySeriesEntry,
   type FundingOverviewResponse,
   type LiveBalance,
+  type KlineWatch,
   type MarketCatalogAsset,
   type MarketSnapshot,
   type StrategyConfig,
@@ -18,7 +20,8 @@ import {
   type VenueFeeRate,
 } from './api.js';
 import type { FundingChartSeries } from './charts.js';
-import { cumulativeFundingHistory, cumulativeFundingPnl } from './cumulative-funding-history.js';
+import { cumulativeFundingHistory, cumulativeFundingPnl, realizedFundingEdgeWindows } from './cumulative-funding-history.js';
+import { VenueSelect } from './venue-select.js';
 import { fundingPercentScaledTo8h } from './funding-rates.js';
 import { marketSymbol } from './market-symbol.js';
 import { usePairCandleHistory } from './pair-candle-history.js';
@@ -31,8 +34,6 @@ import {
   DEFAULT_ADR_RATIO,
   FUNDING_VENUE_COLORS,
   PAIR_HISTORY_RANGES,
-  VenueCell,
-  VenueIcon,
   assessMarginCapacity,
   balanceFor,
   balanceUnitFor,
@@ -45,7 +46,6 @@ import {
   priceText,
   projectedPositionValue,
   quoteFor,
-  signedAmount,
   signedPortfolioQuantity,
   streamedAssets,
   symbolParts,
@@ -59,7 +59,9 @@ import { strategyAssetOptions, strategyVenueSymbol } from './strategy-asset-opti
 import { StrategyAssetSearch } from './strategy-asset-search.js';
 import { localizeStrategyLogCondition, localizeStrategyLogResult, prepareStrategyLogs, type DisplayStrategyLog } from './strategy-logs.js';
 import { PositionCloseDialog, type ClosePositionTarget } from './position-close-dialog.js';
-import { groupStrategyPositions, prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
+import { prepareStrategyPositions, type StrategyPositionRow } from './strategy-positions.js';
+import { PositionsTable } from './positions-table.js';
+import { StrategyLaunchConfirmation } from './strategy-launch-confirmation.js';
 import { useLanguage, type Language } from './i18n.js';
 import { numericFutureFeeRate } from './fee-rates.js';
 
@@ -73,6 +75,13 @@ const POSITION_FUNDING_RANGES = [
   { days: 30, label: '30D' },
 ] as const;
 type PositionFundingDuration = typeof POSITION_FUNDING_RANGES[number]['days'];
+/** The summary always reports realized funding from the full 30-day fetch, independent of the chart range. */
+const POSITION_FUNDING_FETCH_DAYS = 30;
+const REALIZED_FUNDING_TILES = [
+  { days: 1, labelKey: 'Cumulative 24-hour', digits: 4 },
+  { days: 7, labelKey: 'Cumulative 7-day', digits: 3 },
+  { days: 30, labelKey: 'Cumulative 30-day', digits: 3 },
+] as const;
 
 function useInstrumentCatalog(): CrossExInstrument[] | null {
   const [instruments, setInstruments] = useState<CrossExInstrument[] | null>(null);
@@ -138,12 +147,10 @@ function strategyStartTime(createdAt: string, language: Language): { date: strin
 }
 
 function strategyCloseTarget(position: StrategyPositionRow): ClosePositionTarget {
-  const symbol = `${position.venue}_FUTURE_${position.asset}_${position.quote}`;
-  const positionId = position.id.includes(':') ? position.id.slice(position.id.indexOf(':') + 1) : position.id;
   return {
-    id: `${symbol}:${positionId}`,
-    positionId,
-    symbol,
+    id: `${position.symbol}:${position.positionId}`,
+    positionId: position.positionId,
+    symbol: position.symbol,
     quantity: String(position.quantity),
     markPrice: String(position.markPrice),
   };
@@ -162,6 +169,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const { language, t } = useLanguage();
   const [activeStrategyTab, setActiveStrategyTab] = useState<'running' | 'positions' | 'historical'>('running');
   const [stoppingIds, setStoppingIds] = useState<string[]>([]);
+  const [resumingIds, setResumingIds] = useState<string[]>([]);
   const [selectedLogStrategyId, setSelectedLogStrategyId] = useState<string | null>(null);
   const [selectedStrategyLogs, setSelectedStrategyLogs] = useState<DisplayStrategyLog[]>([]);
   const [logLoadState, setLogLoadState] = useState<{ status: 'idle' | 'loading' | 'loaded' | 'error'; message?: string }>({ status: 'idle' });
@@ -171,7 +179,6 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   const [takeProfitDraft, setTakeProfitDraft] = useState('');
   const [updatingTakeProfitId, setUpdatingTakeProfitId] = useState<string | null>(null);
   const [historyPage, setHistoryPage] = useState(1);
-  const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const [closeTargets, setCloseTargets] = useState<ClosePositionTarget[] | null>(null);
   const [closeNotice, setCloseNotice] = useState<{ kind: 'ok' | 'error'; title: string; text: string } | null>(null);
   const runningStrategies = strategies.filter((strategy) => ['RUNNING', 'PAUSED'].includes(strategy.status));
@@ -189,7 +196,6 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     () => prepareStrategyPositions(authenticatedPortfolio, tradingSnapshot),
     [authenticatedPortfolio, tradingSnapshot],
   );
-  const positionGroups = useMemo(() => groupStrategyPositions(positionsView.rows), [positionsView.rows]);
   const selectedLogStrategy = strategies.find((strategy) => strategy.id === selectedLogStrategyId) ?? null;
   const logDialogRef = useDialogFocus(Boolean(selectedLogStrategy), () => setSelectedLogStrategyId(null));
 
@@ -227,7 +233,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   // A failed stop must never be silent: the strategy would keep trading while the user
   // believes it is halted.
   async function stopStrategy(id: string) {
-    if (stoppingIds.includes(id)) return;
+    if (stoppingIds.includes(id) || resumingIds.includes(id)) return;
     setStoppingIds((current) => [...current, id]);
     try {
       await api.stopStrategy(id);
@@ -237,6 +243,24 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       setStopNotice(`${t('Stop failed')} (${id}): ${error instanceof ApiError ? error.message : t('Backend unavailable')}`);
     } finally {
       setStoppingIds((current) => current.filter((item) => item !== id));
+    }
+  }
+
+  async function resumeStrategy(id: string) {
+    if (tradingMode !== 'live') {
+      onOpenModeDialog();
+      return;
+    }
+    if (resumingIds.includes(id) || stoppingIds.includes(id)) return;
+    setResumingIds((current) => [...current, id]);
+    setStopNotice(null);
+    try {
+      await api.resumeStrategy(id);
+      await onStrategiesChanged();
+    } catch (error) {
+      setStopNotice(`${t('Resume failed')} (${id}): ${error instanceof ApiError ? error.message : t('Backend unavailable')}`);
+    } finally {
+      setResumingIds((current) => current.filter((item) => item !== id));
     }
   }
 
@@ -299,25 +323,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <button role="tab" aria-selected={showingHistory} className={showingHistory ? 'active' : ''} onClick={() => { setActiveStrategyTab('historical'); setHistoryPage(1); setEditingTakeProfitId(null); }}>{t('Historical')} <span>({historicalStrategies.length})</span></button>
       </div>
       {showingPositions ? <>
-        {positionsView.status === 'fresh' && positionGroups.length > 0 && <div className="strategy-positions-table positions-table table-wrap">
-          <table><thead><tr><th>{t('Contract')}</th><th>{t('Exchange')}</th><th>{t('Size')}</th><th>{t('Position notional')}</th><th>{t('Entry price')}</th><th>{t('Mark price')}</th><th>{t('Leverage')}</th><th>{t('Unrealized PnL')}</th><th>{t('Close position')}</th></tr></thead><tbody>
-            {positionGroups.map((group) => {
-              if (group.legs.length === 1) {
-                const position = group.legs[0];
-                const venue = exchanges.find((item) => item.id === position.venue.toLowerCase());
-                return <tr key={group.key}><td><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small className={position.side === 'Long' ? 'long-tag' : 'short-tag'}>{t(position.side)}</small></td><td><VenueCell id={position.venue.toLowerCase()} name={venue?.name ?? position.venue} short={venue?.short ?? position.venue.slice(0, 2)} /></td><td>{formatAmount(position.quantity, 4)} {position.asset}</td><td>${formatAmount(position.value)}</td><td>{priceText(position.entryPrice)}</td><td>{priceText(position.markPrice)}</td><td>{position.leverage ? `${position.leverage}×` : '—'}</td><td className={position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{signedAmount(position.unrealizedPnl)}</td><td><button className="row-action close-position-action" onClick={() => requestPositionClose([position])}>{t('Close position')}</button></td></tr>;
-              }
-              const expanded = expandedPosition === group.key;
-              return <Fragment key={group.key}>
-                <tr className="aggregate-row"><td><button type="button" className={expanded ? 'expand-position expanded' : 'expand-position'} aria-expanded={expanded} aria-label={`${t('Positions')} · ${group.label}`} onClick={() => setExpandedPosition(expanded ? null : group.key)}>›</button><strong>{group.label} PERP</strong><small className={group.fullyHedged ? 'hedged-tag' : group.quantity >= 0 ? 'long-tag' : 'short-tag'}>{t(group.fullyHedged ? 'Hedged' : group.quantity >= 0 ? 'Long' : 'Short')}</small></td><td><span className="venue-group"><strong>{group.venueCount} {t(group.venueCount === 1 ? 'exchange' : 'exchanges')}</strong></span></td><td>{group.mixedAssets ? '—' : `${formatAmount(group.quantity, 4)} ${group.asset}`}</td><td>${formatAmount(group.grossNotional)}</td><td>{group.mixedAssets ? '—' : priceText(group.weightedEntryPrice)}</td><td>{group.mixedAssets ? '—' : priceText(group.weightedMarkPrice)}</td><td>{group.leverage ? `${group.leverage}×` : '—'}</td><td className={group.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{signedAmount(group.unrealizedPnl)}</td><td><button className="row-action close-position-action" onClick={() => requestPositionClose(group.legs)}>{t('Close all')}</button></td></tr>
-                {expanded && group.legs.map((position) => {
-                  const venue = exchanges.find((item) => item.id === position.venue.toLowerCase());
-                  return <tr className="position-leg" key={position.id}><td><span className="leg-branch">↳</span><strong>{marketSymbol(position.asset, position.quote, 'perpetual')}</strong><small>{t('Venue leg')}</small></td><td><VenueCell id={position.venue.toLowerCase()} name={venue?.name ?? position.venue} short={venue?.short ?? position.venue.slice(0, 2)} /></td><td>{formatAmount(position.quantity, 4)} {position.asset}</td><td>{formatAmount(position.value)} {position.quote}</td><td>{priceText(position.entryPrice)}</td><td>{priceText(position.markPrice)}</td><td>{position.leverage ? `${position.leverage}×` : '—'}</td><td className={position.unrealizedPnl >= 0 ? 'positive' : 'negative'}>{signedAmount(position.unrealizedPnl)} {position.quote}</td><td><button className="row-action close-position-action" onClick={() => requestPositionClose([position])}>{t('Close position')}</button></td></tr>;
-                })}
-              </Fragment>;
-            })}
-          </tbody></table>
-        </div>}
+        {positionsView.status === 'fresh' && positionsView.rows.length > 0 && <PositionsTable rows={positionsView.rows} onClose={requestPositionClose} />}
         {positionsView.status === 'fresh' && positionsView.rows.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t('No open positions')}</strong><small>{t('The live account has no open futures positions.')}</small></div>}
         {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
         {positionsView.status === 'unavailable' && <div className="no-strategies"><span>◎</span><strong>{t('Position data unavailable')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
@@ -332,7 +338,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
       const startedAt = strategyStartTime(strategy.createdAt, language);
       return <div className="running-row" key={strategy.id}>
         {showingHistory && <span className="strategy-start-time"><strong>{startedAt.date}</strong><small>{startedAt.time}</small></span>}
-        <span><strong>{strategy.id}</strong><small>{kindLabel(strategy)}</small></span>
+        <span><strong>{strategy.id}</strong><small>{kindLabel(strategy)}{strategy.accountLabel ? ` · ${strategy.accountLabel}` : ''}</small></span>
         <span><strong>{strategyMarketLabel(config)}</strong><small>{t(premium ? 'ADR premium' : 'Perpetual')}</small></span>
         <span>{timedClose ? [...new Set(config.closePlan?.targets.map((target) => symbolParts(target.symbol).venue) ?? [])].join(' ⇄ ') : config.leftVenue === config.rightVenue ? leftVenue?.name ?? config.leftVenue : `${leftVenue?.name ?? config.leftVenue} ⇄ ${rightVenue?.name ?? config.rightVenue}`}</span>
         <span>{timedClose
@@ -355,9 +361,9 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         <span><button className="logs-button" onClick={() => void openLogs(strategy.id)}>{t('View logs')}</button></span>
         <span>{strategyRuntime(strategy, showingHistory)}</span>
         <span className={`strategy-status ${strategy.status.toLowerCase()}`}><i />{strategy.status}<small>{strategy.progress.toFixed(0)}%</small></span>
-        {!showingHistory && <span><button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
+        {!showingHistory && <span className="strategy-actions">{strategy.status === 'PAUSED' && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : t('Resume')}</button>}<button className="stop-button" onClick={() => void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
       </div>;
-    })}</div>{showingHistory && historicalStrategies.length > 0 && <div className="funding-pagination strategy-pagination"><span className="page-range">{historyStart + 1}–{Math.min(historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE, historicalStrategies.length)} / {historicalStrategies.length}</span><div className="page-controls"><button onClick={() => setHistoryPage((current) => Math.max(1, current - 1))} disabled={historyPage === 1}>{t('Prev')}</button><span className="page-indicator">{t('Page')} {historyPage} / {historyPages}</span><button onClick={() => setHistoryPage((current) => Math.min(historyPages, current + 1))} disabled={historyPage === historyPages}>{t('Next')}</button></div><span className="page-size">10 {t('per page')}</span></div>}{stopNotice && <div className="launch-notice error panel-notice">{stopNotice}</div>}{visibleStrategies.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t(showingHistory ? 'No historical strategies' : 'No strategies running')}</strong><small>{t(showingHistory ? 'Stopped and completed strategies will appear here.' : 'Configure a strategy above and start it when ready.')}</small></div>}
+    })}</div>{showingHistory && historicalStrategies.length >= HISTORICAL_STRATEGIES_PAGE_SIZE && <div className="funding-pagination strategy-pagination"><span className="page-range">{historyStart + 1}–{Math.min(historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE, historicalStrategies.length)} / {historicalStrategies.length}</span><div className="page-controls"><button onClick={() => setHistoryPage((current) => Math.max(1, current - 1))} disabled={historyPage === 1}>{t('Prev')}</button><span className="page-indicator">{t('Page')} {historyPage} / {historyPages}</span><button onClick={() => setHistoryPage((current) => Math.min(historyPages, current + 1))} disabled={historyPage === historyPages}>{t('Next')}</button></div><span className="page-size">10 {t('per page')}</span></div>}{stopNotice && <div className="launch-notice error panel-notice">{stopNotice}</div>}{visibleStrategies.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t(showingHistory ? 'No historical strategies' : 'No strategies running')}</strong><small>{t(showingHistory ? 'Stopped and completed strategies will appear here.' : 'Configure a strategy above and start it when ready.')}</small></div>}
       </>}
     </section>
 
@@ -441,6 +447,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [leftRiskPositionValue, setLeftRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [rightRiskPositionValue, setRightRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [priceDifferenceRange, setPriceDifferenceRange] = useState<PairHistoryRange>('24H');
   const [positionFundingDuration, setPositionFundingDuration] = useState<PositionFundingDuration>(30);
@@ -465,7 +472,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const leftInstrument = instruments?.find((instrument) => instrument.symbol === leftHistorySymbol);
   const rightInstrument = instruments?.find((instrument) => instrument.symbol === rightHistorySymbol);
   const positionFundingRangeLabel = POSITION_FUNDING_RANGES.find((range) => range.days === positionFundingDuration)?.label ?? '30D';
-  const positionFundingHistoryKey = `${leftHistorySymbol}:${rightHistorySymbol}:${positionFundingRangeLabel}`;
+  const positionFundingHistoryKey = `${leftHistorySymbol}:${rightHistorySymbol}`;
   const priceDifferenceHistoryInterval = PAIR_HISTORY_RANGES[priceDifferenceRange].interval;
   const priceDifferenceHistoryKey = `${leftHistorySymbol}:${rightHistorySymbol}:${priceDifferenceHistoryInterval}`;
   const priceDifferenceHistory = usePairCandleHistory(
@@ -551,41 +558,64 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
     rightOverview?.fundingRate8h,
   );
   const fundingEdge = leftFunding !== null && rightFunding !== null
-    ? Math.abs(leftFunding - rightFunding)
+    ? (directionFlipped ? rightFunding - leftFunding : leftFunding - rightFunding)
     : null;
   const positionFundingHistoryIsCurrent = positionFundingHistory.key === positionFundingHistoryKey;
   const positionFundingSeries = useMemo<FundingChartSeries[]>(() => {
     if (!positionFundingHistoryIsCurrent) return [];
+    const chartRangeFrom = positionFundingHistory.rangeFrom === null
+      ? null
+      : positionFundingHistory.rangeFrom + Math.max(0, POSITION_FUNDING_FETCH_DAYS - positionFundingDuration) * 86_400_000;
     const venueSeries = [
       { symbol: leftHistorySymbol, venue: leftExchange },
       { symbol: rightHistorySymbol, venue: rightExchange },
     ].flatMap(({ symbol, venue }) => {
       const entry = positionFundingHistory.entries[symbol];
       if (!entry || entry.status !== 'ok') return [];
-      const points = cumulativeFundingHistory(entry.points, positionFundingHistory.rangeFrom);
+      const settlements = chartRangeFrom === null ? entry.points : entry.points.filter((point) => point.timestamp > chartRangeFrom);
+      const points = cumulativeFundingHistory(settlements, chartRangeFrom);
       if (points.length === 0) return [];
       return [{
-        id: symbol,
-        label: venue.name,
-        color: FUNDING_VENUE_COLORS[venue.id.toUpperCase()] ?? '#8aa9ff',
-        points,
+        symbol,
+        series: {
+          id: `${symbol}:${positionFundingRangeLabel}`,
+          label: venue.name,
+          color: FUNDING_VENUE_COLORS[venue.id.toUpperCase()] ?? '#8aa9ff',
+          points,
+        },
       }];
     });
-    const leftSeries = venueSeries.find((series) => series.id === leftHistorySymbol);
-    const rightSeries = venueSeries.find((series) => series.id === rightHistorySymbol);
-    if (!leftSeries || !rightSeries) return venueSeries;
+    const leftSeries = venueSeries.find((entry) => entry.symbol === leftHistorySymbol)?.series;
+    const rightSeries = venueSeries.find((entry) => entry.symbol === rightHistorySymbol)?.series;
+    const chartSeries = venueSeries.map((entry) => entry.series);
+    if (!leftSeries || !rightSeries) return chartSeries;
     const longSeries = directionFlipped ? leftSeries : rightSeries;
     const shortSeries = directionFlipped ? rightSeries : leftSeries;
     const pnlPoints = cumulativeFundingPnl(longSeries.points, shortSeries.points);
-    if (pnlPoints.length === 0) return venueSeries;
-    return [...venueSeries, {
-      id: `${positionFundingHistoryKey}:pnl:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`,
+    if (pnlPoints.length === 0) return chartSeries;
+    return [...chartSeries, {
+      id: `${positionFundingHistoryKey}:${positionFundingRangeLabel}:pnl:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`,
       label: `${t('Cumulative funding PnL')} · ${t(directionFlipped ? 'Buy' : 'Sell')} A / ${t(directionFlipped ? 'Sell' : 'Buy')} B`,
       color: theme === 'light' ? '#009b7d' : '#18d6ad',
       points: pnlPoints,
       style: 'area',
     }];
-  }, [directionFlipped, leftExchange, leftHistorySymbol, positionFundingHistory.entries, positionFundingHistory.rangeFrom, positionFundingHistoryIsCurrent, positionFundingHistoryKey, rightExchange, rightHistorySymbol, t, theme]);
+  }, [directionFlipped, leftExchange, leftHistorySymbol, positionFundingDuration, positionFundingHistory.entries, positionFundingHistory.rangeFrom, positionFundingHistoryIsCurrent, positionFundingHistoryKey, positionFundingRangeLabel, rightExchange, rightHistorySymbol, t, theme]);
+  const realizedFundingWindows = useMemo(() => {
+    if (!positionFundingHistoryIsCurrent || positionFundingHistory.rangeFrom === null) return null;
+    const leftEntry = positionFundingHistory.entries[leftHistorySymbol];
+    const rightEntry = positionFundingHistory.entries[rightHistorySymbol];
+    if (leftEntry?.status !== 'ok' || rightEntry?.status !== 'ok') return null;
+    const longPoints = (directionFlipped ? leftEntry : rightEntry).points;
+    const shortPoints = (directionFlipped ? rightEntry : leftEntry).points;
+    return realizedFundingEdgeWindows(
+      longPoints,
+      shortPoints,
+      positionFundingHistory.rangeFrom,
+      POSITION_FUNDING_FETCH_DAYS,
+      REALIZED_FUNDING_TILES.map((tile) => tile.days),
+    );
+  }, [directionFlipped, leftHistorySymbol, positionFundingHistory.entries, positionFundingHistory.rangeFrom, positionFundingHistoryIsCurrent, rightHistorySymbol]);
   const positionFundingHistoryStatus = positionFundingHistoryIsCurrent ? positionFundingHistory.status : 'loading';
   const tradingEnabled = tradingMode === 'live';
   const configuredPerOrder = mode === 'position' ? positionOrderQuantity : orderQuantity;
@@ -694,7 +724,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       entries: {},
       rangeFrom: null,
     });
-    void api.fundingHistorySeries([leftHistorySymbol, rightHistorySymbol], positionFundingDuration)
+    void api.fundingHistorySeries([leftHistorySymbol, rightHistorySymbol], POSITION_FUNDING_FETCH_DAYS)
       .then((response) => {
         if (cancelled) return;
         setPositionFundingHistory({
@@ -714,7 +744,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
         });
       });
     return () => { cancelled = true; };
-  }, [leftHistorySymbol, mode, positionFundingDuration, positionFundingHistoryKey, rightHistorySymbol]);
+  }, [leftHistorySymbol, mode, positionFundingHistoryKey, rightHistorySymbol]);
 
   useEffect(() => {
     if (availableStrategyAssets.length > 0 && !availableStrategyAssets.some((option) => option.asset === asset)) {
@@ -727,6 +757,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   }, [priceDifferenceSeriesKey]);
 
   async function launchStrategy() {
+    if (launching) return;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -753,8 +784,18 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
       setLaunching(false);
+      setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
     }
+  }
+
+  function requestStrategyLaunch() {
+    if (!tradingEnabled) {
+      onOpenModeDialog();
+      return;
+    }
+    if (launching || !strategyInputsValid) return;
+    setConfirmingLaunch(true);
   }
 
   const leftSide = directionFlipped ? 'Buy' : 'Sell';
@@ -801,8 +842,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           <div className="strategy-legs">
             <div className="strategy-leg sell-leg">
               <div className="leg-top">
-                <VenueIcon id={leftExchange.id} short={leftExchange.short} />
-                <label><small>{t('Exchange A')}</small><select value={leftExchangeId} onChange={(event) => setLeftExchangeId(event.target.value)}>{exchanges.map((venue) => <option key={venue.id} value={venue.id} disabled={venue.id === rightExchangeId}>{venue.name}</option>)}</select></label>
+                <VenueSelect
+                  label={t('Exchange A')}
+                  menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
+                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === rightExchangeId, detail: marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
+                  value={leftExchangeId}
+                  onSelect={setLeftExchangeId}
+                />
                 <em>{t(leftSide)} <span>{leftTicker}</span></em>
               </div>
               <dl>
@@ -819,8 +865,13 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             </div>
             <div className="strategy-leg buy-leg">
               <div className="leg-top">
-                <VenueIcon id={rightExchange.id} short={rightExchange.short} />
-                <label><small>{t('Exchange B')}</small><select value={rightExchangeId} onChange={(event) => setRightExchangeId(event.target.value)}>{exchanges.map((venue) => <option key={venue.id} value={venue.id} disabled={venue.id === leftExchangeId}>{venue.name}</option>)}</select></label>
+                <VenueSelect
+                  label={t('Exchange B')}
+                  menuSubtitle={`${asset} ${t('Perpetual').toLowerCase()}`}
+                  options={exchanges.map((venue) => ({ ...venue, disabled: venue.id === leftExchangeId, detail: marketSymbol(asset, quoteFor(venue.id), 'perpetual') }))}
+                  value={rightExchangeId}
+                  onSelect={setRightExchangeId}
+                />
                 <em>{t(rightSide)} <span>{rightTicker}</span></em>
               </div>
               <dl>
@@ -835,11 +886,19 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             : t('Live trading is locked. Use the trading-mode switch in the top bar to enable it.')}</p></div>}
         </article>
         {mode === 'position' && <div className="funding-edge expanded position-funding-summary terminal-panel">
-          <div><span>{t('Funding-rate edge')}</span><strong>{fundingEdge === null ? '—' : `${fundingEdge.toFixed(4)}%`}</strong><small>{t('Per 8h')}</small></div>
-          <div><span>APR</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 1095).toFixed(2)}%`}</strong><small>{t('Annualized')}</small></div>
-          <div><span>{t('Projected 24h')}</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 3).toFixed(4)}%`}</strong><small>3 {t('intervals')}</small></div>
-          <div><span>{t('Projected 7d')}</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 21).toFixed(3)}%`}</strong><small>21 {t('intervals')}</small></div>
-          <div><span>{t('Projected 30d')}</span><strong>{fundingEdge === null ? '—' : `${(fundingEdge * 90).toFixed(3)}%`}</strong><small>90 {t('intervals')}</small></div>
+          <div><span>{t('Funding-rate edge')}</span><strong className={fundingEdge !== null && fundingEdge < 0 ? 'negative' : undefined}>{fundingEdge === null ? '—' : `${fundingEdge >= 0 ? '+' : ''}${fundingEdge.toFixed(4)}%`}</strong><small>{t('Per 8h')}</small></div>
+          <div><span>{t('Current edge APR')}</span><strong className={fundingEdge !== null && fundingEdge < 0 ? 'negative' : undefined}>{fundingEdge === null ? '—' : `${fundingEdge >= 0 ? '+' : ''}${(fundingEdge * 1095).toFixed(2)}%`}</strong><small>{t('Annualized')}</small></div>
+          {REALIZED_FUNDING_TILES.map((tile, index) => {
+            const realizedWindow = realizedFundingWindows?.[index] ?? null;
+            const value = realizedWindow?.value ?? null;
+            return <div key={tile.days}>
+              <span>{t(tile.labelKey)}</span>
+              <strong className={value !== null && value < 0 ? 'negative' : undefined}>{value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(tile.digits)}%`}</strong>
+              <small>{value === null
+                ? (positionFundingHistoryStatus === 'loading' ? t('Loading…') : t('No data'))
+                : `${realizedWindow?.settlements ?? 0} ${t('settlements')}`}</small>
+            </div>;
+          })}
         </div>}
         {mode === 'position' && <article className="premium-history-panel strategy-funding-history terminal-panel">
           <header className="premium-history-head">
@@ -864,7 +923,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
             <Suspense fallback={<div className="funding-history-chart chart-module-loading" role="status">{t('Loading venue histories…')}</div>}>
               <FundingHistoryChart
                 series={positionFundingSeries}
-                seriesKey={`${positionFundingHistoryKey}:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`}
+                seriesKey={`${positionFundingHistoryKey}:${positionFundingRangeLabel}:${directionFlipped ? 'buy-a-sell-b' : 'sell-a-buy-b'}`}
                 theme={theme}
                 locale={language === 'zh' ? 'zh-CN' : 'en-US'}
                 placeholder={positionFundingHistoryStatus === 'loading' ? t('Loading venue histories…') : t('Funding history unavailable.')}
@@ -940,7 +999,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           })}</dl>
           {marginInsufficient && <div className="launch-warning"><span>!</span><p>{t('Configured maximum exposure exceeds the available margin.')}</p></div>}
           {positionRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
-          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={() => tradingEnabled ? void launchStrategy() : onOpenModeDialog()} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
+          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !strategyInputsValid)}>{launching ? t('Launching…') : tradingEnabled ? marginInsufficient ? t('Insufficient margin') : positionRiskLimitExceeded ? t('Position exceeds leverage limit') : positionRiskReviewUnavailable ? t('Loading position limits…') : !strategyInputsValid ? t('Enter valid strategy amounts') : t(mode === 'position' ? 'Execute strategy' : 'Launch strategy') : t('Live trading locked')}</button>
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
           {mode === 'position' && <p className="background-strategy-note">{t('Runs in background; manage active strategies below.')}</p>}
           {mode === 'position' && <div className="launch-warning"><span>ⓘ</span><p>{tradingEnabled
@@ -950,6 +1009,24 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       </aside>
     </section>
 
+    {confirmingLaunch && <StrategyLaunchConfirmation
+      market={`${asset} · ${leftExchange.name} ⇄ ${rightExchange.name}`}
+      rows={[
+        { label: t('Direction'), value: `${t(leftSide)} ${leftExchange.name} ⇄ ${t(rightSide)} ${rightExchange.name}` },
+        { label: t('Entry'), value: `≥ ${threshold || '0'} bps` },
+        ...(mode === 'auto' ? [{ label: t('Take profit'), value: `≤ ${takeProfitThreshold || '0'} bps` }] : []),
+        { label: t(mode === 'position' ? 'Total execution' : 'Max position'), value: `${mode === 'position' ? amount : maxPosition} ${asset}` },
+        { label: t('Per order'), value: `${mode === 'position' ? positionOrderQuantity : orderQuantity} ${asset}` },
+        ...(mode === 'position' ? [
+          { label: t('Leverage'), value: `${leftLeverage}× / ${rightLeverage}×` },
+          { label: t('Reduce only'), value: t(reduceOnly ? 'Yes' : 'No') },
+        ] : []),
+        { label: t('Execution'), value: configuredExecutionMethod.replaceAll('–', '-') },
+      ]}
+      busy={launching}
+      onCancel={() => setConfirmingLaunch(false)}
+      onConfirm={() => { void launchStrategy(); }}
+    />}
     <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
   </div>;
 }
@@ -965,7 +1042,16 @@ interface PremiumStrategyViewProps {
   onOpenModeDialog: () => void;
   onStrategiesChanged: () => Promise<void>;
   onPositionsRefresh: () => Promise<void>;
+  candleSeries: Record<string, Candle[]>;
   watchQuotes: (symbols: string[]) => void;
+  watchKlines: (watches: KlineWatch[]) => void;
+}
+
+function loadFreshPairCandles(adrSymbol: string, hedgeSymbol: string, interval: CandleInterval) {
+  return Promise.allSettled([
+    api.candles(adrSymbol, interval, { limit: 300, fresh: true }),
+    api.candles(hedgeSymbol, interval, { limit: 300, fresh: true }),
+  ] as const);
 }
 
 interface StrategyLeverageControlProps {
@@ -1137,7 +1223,7 @@ function StrategyLeverageControl({
   </div>;
 }
 
-export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, watchQuotes }: PremiumStrategyViewProps) {
+export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balances, authenticatedPortfolio, tradingSnapshot, tradingMode, onOpenModeDialog, onStrategiesChanged, onPositionsRefresh, candleSeries, watchQuotes, watchKlines }: PremiumStrategyViewProps) {
   const { language, theme, t } = useLanguage();
   const [adrVenueId, setAdrVenueId] = useState('gate');
   const [hedgeVenueId, setHedgeVenueId] = useState('gate');
@@ -1154,6 +1240,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const [adrRiskPositionValue, setAdrRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [hedgeRiskPositionValue, setHedgeRiskPositionValue] = useState<number | null | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  const [confirmingLaunch, setConfirmingLaunch] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [premiumRange, setPremiumRange] = useState<PairHistoryRange>('24H');
   const [premiumCandles, setPremiumCandles] = useState<{
@@ -1168,6 +1255,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const [freshnessNow, setFreshnessNow] = useState(Date.now());
   const premiumHistoryLoadingRef = useRef<Set<string>>(new Set());
   const premiumHistoryRequestedRef = useRef<Set<string>>(new Set());
+  const premiumHistoryInitialRequestsRef = useRef(new Map<string, ReturnType<typeof loadFreshPairCandles>>());
   const instruments = useInstrumentCatalog();
 
   // Venue pickers offer only venues that actually list each ticker; before the catalog knows
@@ -1192,33 +1280,40 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     return () => window.clearInterval(timer);
   }, []);
 
-  // Register both stock-perp tickers without opening unused book, trade, and kline subscriptions.
+  // Stream both tickers without opening unused order-book or public-trade subscriptions.
   useEffect(() => {
     watchQuotes([adrSymbol, hedgeSymbol]);
   }, [adrSymbol, hedgeSymbol, watchQuotes]);
 
   useEffect(() => {
+    watchKlines([
+      { symbol: adrSymbol, interval: premiumHistoryInterval },
+      { symbol: hedgeSymbol, interval: premiumHistoryInterval },
+    ]);
+    return () => watchKlines([]);
+  }, [adrSymbol, hedgeSymbol, premiumHistoryInterval, watchKlines]);
+
+  useEffect(() => {
     let cancelled = false;
-    let inFlight = false;
     const interval = premiumHistoryInterval;
     const key = premiumHistoryKey;
     setPremiumCandles((current) => current.key === key
       ? current
       : { key, adr: [], hedge: [], adrHasMore: true, hedgeHasMore: true, status: 'loading' });
 
-    const load = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      const [adrResult, hedgeResult] = await Promise.allSettled([
-        api.candles(adrSymbol, interval, { limit: 300, fresh: true }),
-        api.candles(hedgeSymbol, interval, { limit: 300, fresh: true }),
-      ]);
+    let request = premiumHistoryInitialRequestsRef.current.get(key);
+    if (!request) {
+      request = loadFreshPairCandles(adrSymbol, hedgeSymbol, interval);
+      premiumHistoryInitialRequestsRef.current.set(key, request);
+    }
+    void request.then(([adrResult, hedgeResult]) => {
       if (!cancelled) setPremiumCandles((current) => {
         if (current.key !== key) return current;
         const adrResponse = adrResult.status === 'fulfilled' ? adrResult.value : null;
         const hedgeResponse = hedgeResult.status === 'fulfilled' ? hedgeResult.value : null;
-        const adr = adrResponse ? mergeCandleHistory(current.adr, adrResponse.candles) : current.adr;
-        const hedge = hedgeResponse ? mergeCandleHistory(current.hedge, hedgeResponse.candles) : current.hedge;
+        // Any WebSocket candle received while REST was in flight remains authoritative.
+        const adr = adrResponse ? mergeCandleHistory(adrResponse.candles, current.adr) : current.adr;
+        const hedge = hedgeResponse ? mergeCandleHistory(hedgeResponse.candles, current.hedge) : current.hedge;
         const hasPair = adr.length > 0 && hedge.length > 0;
         return {
           key,
@@ -1231,16 +1326,36 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
             : adrResult.status === 'rejected' || hedgeResult.status === 'rejected' ? 'failed' : 'empty',
         };
       });
-      inFlight = false;
-    };
-
-    void load();
-    const timer = window.setInterval(() => void load(), interval === '1m' ? 30_000 : 60_000);
+    }).finally(() => {
+      if (premiumHistoryInitialRequestsRef.current.get(key) === request) {
+        premiumHistoryInitialRequestsRef.current.delete(key);
+      }
+    });
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
   }, [adrSymbol, hedgeSymbol, premiumHistoryInterval, premiumHistoryKey]);
+
+  const streamedAdrCandles = candleSeries[`${adrSymbol}:${premiumHistoryInterval}`];
+  const streamedHedgeCandles = candleSeries[`${hedgeSymbol}:${premiumHistoryInterval}`];
+  useEffect(() => {
+    if ((!streamedAdrCandles || streamedAdrCandles.length === 0)
+      && (!streamedHedgeCandles || streamedHedgeCandles.length === 0)) return;
+    const key = premiumHistoryKey;
+    setPremiumCandles((current) => {
+      if (current.key !== key) return current;
+      const adr = streamedAdrCandles ? mergeCandleHistory(current.adr, streamedAdrCandles) : current.adr;
+      const hedge = streamedHedgeCandles ? mergeCandleHistory(current.hedge, streamedHedgeCandles) : current.hedge;
+      return {
+        ...current,
+        adr,
+        hedge,
+        status: adr.length > 0 && hedge.length > 0
+          ? candleTailIsFresh(adr, premiumHistoryInterval) && candleTailIsFresh(hedge, premiumHistoryInterval) ? 'live' : 'stale'
+          : current.status,
+      };
+    });
+  }, [premiumHistoryInterval, premiumHistoryKey, streamedAdrCandles, streamedHedgeCandles]);
 
   const loadOlderPremiumHistory = useCallback(() => {
     const { interval } = PAIR_HISTORY_RANGES[premiumRange];
@@ -1289,7 +1404,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         ? 'Waiting for live WebSocket quotes from both markets.'
         : livePairFreshness.reason === 'stale'
           ? 'A selected quote is stale; waiting for its next update.'
-          : 'Fresh quotes arrived too far apart; synchronizing the pair…');
+          : 'A selected quote was delayed by more than 3 seconds; waiting for a timely update.');
   const adrLive = displayPair?.left ?? null;
   const hedgeLive = displayPair?.right ?? null;
   const adrPrice = Number(adrLive?.lastPrice ?? 0);
@@ -1443,10 +1558,12 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const exitComparator = shortPremium ? '≤' : '≥';
   const entryReady = livePair !== null && premiumNow !== null
     && (shortPremium ? premiumNow >= Number(entryPremium) : premiumNow <= Number(entryPremium));
+  const premiumLaunchReady = livePair !== null && !marginInsufficient && !leverageInvalid && premiumReviewValid;
 
   useEffect(() => setHoveredPremium(null), [historySeriesKey]);
 
   async function launchStrategy() {
+    if (launching) return;
     setLaunching(true);
     setLaunchNotice(null);
     const config: StrategyConfig = {
@@ -1478,8 +1595,18 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       setLaunchNotice({ kind: 'error', text: `${t('Strategy rejected')}: ${error instanceof ApiError ? error.message : t('Backend unavailable')}` });
     } finally {
       setLaunching(false);
+      setConfirmingLaunch(false);
       window.setTimeout(() => setLaunchNotice((current) => current?.kind === 'ok' ? null : current), 5000);
     }
+  }
+
+  function requestStrategyLaunch() {
+    if (!tradingEnabled) {
+      onOpenModeDialog();
+      return;
+    }
+    if (launching || !premiumLaunchReady) return;
+    setConfirmingLaunch(true);
   }
 
   return <div className="alternate-view strategy-view">
@@ -1487,10 +1614,10 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
 
     <section className={`strategy-layout revised ${directionFlipped ? 'direction-flipped' : ''}`}>
       <div className="strategy-main">
-        <article className="strategy-panel terminal-panel">
+        <article className="strategy-panel strategy-market-panel terminal-panel">
           <header className="strategy-panel-head"><div><p className="eyebrow">{t('Market & venues')}</p></div><div className="premium-pair-badge"><strong>{ADR_ASSET} / {ADR_HEDGE_ASSET}</strong><small>1 {ADR_HEDGE_ASSET} = {adrRatio || '—'} {ADR_ASSET}</small></div></header>
           <div className="strategy-legs">
-            <div className="strategy-leg sell-leg"><div className="leg-top"><VenueIcon id={adrExchange.id} short={adrExchange.short} /><label><select aria-label={`${ADR_ASSET} ${t('Exchange')}`} value={adrVenueId} onChange={(event) => setAdrVenueId(event.target.value)}>{adrVenues.map((venueEntry) => <option key={venueEntry.id} value={venueEntry.id}>{venueEntry.name}</option>)}</select></label><em>{t(adrSide)} {ADR_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(adrPrice)}</dd></div><div><dt>{t('Fair ADR value')}</dt><dd>{priceText(fairValue)}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{adrBalance ? `${Number(adrBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${adrBalanceUnit}` : '—'}</dd></div></dl></div>
+            <div className="strategy-leg sell-leg"><div className="leg-top"><VenueSelect label={t('ADR leg')} menuSubtitle={`${ADR_ASSET} ${t('Perpetual').toLowerCase()}`} options={adrVenues.map((venueEntry) => ({ ...venueEntry, detail: marketSymbol(ADR_ASSET, quoteFor(venueEntry.id), 'perpetual') }))} value={adrVenueId} onSelect={setAdrVenueId} /><em>{t(adrSide)} {ADR_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(adrPrice)}</dd></div><div><dt>{t('Fair ADR value')}</dt><dd>{priceText(fairValue)}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{adrBalance ? `${Number(adrBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${adrBalanceUnit}` : '—'}</dd></div></dl></div>
             <div className="leg-spread">
               <span>{t('ADR premium')}</span>
               <strong className={premiumNow !== null && premiumNow >= 0 ? 'positive' : 'negative'}>{premiumNow !== null ? `${premiumNow >= 0 ? '+' : ''}${premiumNow.toFixed(2)}%` : '—'}</strong>
@@ -1502,7 +1629,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
               <button className="switch-direction" onClick={() => setDirectionFlipped((current) => !current)} aria-label={t('Switch direction')}>⇄</button>
               <small>{t('Switch direction')}</small>
             </div>
-            <div className="strategy-leg buy-leg"><div className="leg-top"><VenueIcon id={hedgeExchange.id} short={hedgeExchange.short} /><label><select aria-label={`${ADR_HEDGE_ASSET} ${t('Exchange')}`} value={hedgeVenueId} onChange={(event) => setHedgeVenueId(event.target.value)}>{hedgeVenues.map((venueEntry) => <option key={venueEntry.id} value={venueEntry.id}>{venueEntry.name}</option>)}</select></label><em>{t(hedgeSide)} {ADR_HEDGE_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(hedgePrice)}</dd></div><div><dt>{t('Hedge per order')}</dt><dd>{hedgePerOrderText ?? '—'}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{hedgeBalance ? `${Number(hedgeBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${hedgeBalanceUnit}` : '—'}</dd></div></dl></div>
+            <div className="strategy-leg buy-leg"><div className="leg-top"><VenueSelect label={t('Hedge leg')} menuSubtitle={`${ADR_HEDGE_ASSET} ${t('Perpetual').toLowerCase()}`} options={hedgeVenues.map((venueEntry) => ({ ...venueEntry, detail: marketSymbol(ADR_HEDGE_ASSET, quoteFor(venueEntry.id), 'perpetual') }))} value={hedgeVenueId} onSelect={setHedgeVenueId} /><em>{t(hedgeSide)} {ADR_HEDGE_ASSET}</em></div><dl><div><dt>{t('Best price')}</dt><dd>{priceText(hedgePrice)}</dd></div><div><dt>{t('Hedge per order')}</dt><dd>{hedgePerOrderText ?? '—'}</dd></div><div><dt>{t(sharedMarginMode ? 'Shared margin' : 'Available')}</dt><dd>{hedgeBalance ? `${Number(hedgeBalance).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${hedgeBalanceUnit}` : '—'}</dd></div></dl></div>
           </div>
           {!livePair && <div className="premium-data-hint"><span>ⓘ</span><p>{livePairWaitMessage}</p></div>}
         </article>
@@ -1610,12 +1737,29 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
           </dl>
           {!reduceOnly && foreignOppositePositions.length > 0 && <div className="launch-warning"><span>ⓘ</span><p>{t('Positions on another venue do not reduce this strategy’s margin requirement. Only positions on the selected exchange are offset.')}</p></div>}
           {premiumRiskLimitExceeded && <div className="launch-warning"><span>!</span><p>{t('Configured position exceeds the maximum at selected leverage')}</p></div>}
-          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={() => tradingEnabled ? void launchStrategy() : onOpenModeDialog()} disabled={launching || (tradingEnabled && (!livePair || marginInsufficient || leverageInvalid || !premiumReviewValid))}>{launching ? t('Launching…') : !tradingEnabled ? t('Live trading locked') : !livePair ? t('Loading live data…') : premiumRiskLimitExceeded ? t('Position exceeds leverage limit') : premiumRiskReviewUnavailable ? t('Loading position limits…') : !premiumInputsValid ? t('Enter valid strategy amounts') : leverageInvalid ? t('Invalid leverage') : marginInsufficient ? t('Insufficient margin') : t(reduceOnly ? 'Launch reduce-only strategy' : 'Launch strategy')}</button>
+          <button className={tradingEnabled ? 'start-strategy' : 'start-strategy locked'} onClick={requestStrategyLaunch} disabled={launching || (tradingEnabled && !premiumLaunchReady)}>{launching ? t('Launching…') : !tradingEnabled ? t('Live trading locked') : !livePair ? t('Loading live data…') : premiumRiskLimitExceeded ? t('Position exceeds leverage limit') : premiumRiskReviewUnavailable ? t('Loading position limits…') : !premiumInputsValid ? t('Enter valid strategy amounts') : leverageInvalid ? t('Invalid leverage') : marginInsufficient ? t('Insufficient margin') : t(reduceOnly ? 'Launch reduce-only strategy' : 'Launch strategy')}</button>
           {launchNotice && <div className={`launch-notice ${launchNotice.kind}`}>{launchNotice.text}</div>}
         </article>
       </aside>
     </section>
 
+    {confirmingLaunch && <StrategyLaunchConfirmation
+      market={`${ADR_ASSET} / ${ADR_HEDGE_ASSET} · ${adrExchange.name} ⇄ ${hedgeExchange.name}`}
+      rows={[
+        { label: t('Direction'), value: `${t(adrSide)} ${ADR_ASSET} ⇄ ${t(hedgeSide)} ${ADR_HEDGE_ASSET}` },
+        { label: t(reduceOnly ? 'Trigger' : 'Entry'), value: `${entryComparator} ${entryPremium || '0'}%` },
+        ...(!reduceOnly ? [{ label: t('Take profit'), value: `${exitComparator} ${takeProfitPremium || '0'}%` }] : []),
+        { label: t(reduceOnly ? 'Max close amount' : 'Max position'), value: `${maxPosition} ${ADR_ASSET}` },
+        { label: t('Per order'), value: `${perOrderQuantity} ${ADR_ASSET}` },
+        { label: t('Hedge per order'), value: hedgePerOrderText ?? '—' },
+        ...(!reduceOnly ? [{ label: t('Leverage'), value: `${adrLeverage}× / ${hedgeLeverage}×` }] : []),
+        { label: t('Hedge sizing'), value: t(hedgeMode === 'EQUAL_NOTIONAL' ? 'Equal notional' : 'Share ratio') },
+        { label: t('Execution'), value: t('Taker–Taker') },
+      ]}
+      busy={launching}
+      onCancel={() => setConfirmingLaunch(false)}
+      onConfirm={() => { void launchStrategy(); }}
+    />}
     <RunningStrategiesPanel strategies={strategies} authenticatedPortfolio={authenticatedPortfolio} tradingSnapshot={tradingSnapshot} instruments={instruments} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onStrategiesChanged={onStrategiesChanged} onPositionsRefresh={onPositionsRefresh} />
   </div>;
 }

@@ -39,6 +39,7 @@ export interface LiveMarket {
   nextFundingAt: string;
   openInterest: string;
   openInterestValue: string;
+  receivedAt: string;
   updatedAt: string;
   source: 'gate_crossex_websocket' | 'demo_seed';
 }
@@ -130,7 +131,7 @@ function pendingMarket(definition: MarketDefinition): LiveMarket {
     lastPrice: '0', bidPrice: '0', bidSize: '0', askPrice: '0', askSize: '0',
     open24h: '0', high24h: '0', low24h: '0', volume24h: '0', quoteVolume24h: '0',
     fundingRate: '0', nextFundingAt: new Date(Date.now() + 8 * 60 * 60_000).toISOString(),
-    openInterest: '0', openInterestValue: '0', updatedAt: now, source: 'demo_seed',
+    openInterest: '0', openInterestValue: '0', receivedAt: now, updatedAt: now, source: 'demo_seed',
   };
 }
 
@@ -147,7 +148,7 @@ function seedMarket(venue: MarketVenue, asset: string, venueIndex: number, asset
     bidSize: '0', askPrice: String(last + spread), askSize: '0', open24h: String(last * 0.98),
     high24h: String(last * 1.02), low24h: String(last * 0.96), volume24h: '0', quoteVolume24h: String(oiValue * 0.72),
     fundingRate: String(funding), nextFundingAt: new Date(Date.now() + 8 * 60 * 60_000).toISOString(),
-    openInterest: '0', openInterestValue: String(oiValue), updatedAt: now, source: 'demo_seed',
+    openInterest: '0', openInterestValue: String(oiValue), receivedAt: now, updatedAt: now, source: 'demo_seed',
   };
 }
 
@@ -196,10 +197,15 @@ export class CrossExMarketHub {
   private dynamicMarketSweep: ReturnType<typeof setInterval> | null = null;
 
   private readonly heartbeatIntervalMs: number;
+  private readonly marketIdlePingAfterMs: number;
   private readonly staleAfterMs: number;
 
-  constructor(private readonly url: string, options: { heartbeatIntervalMs?: number; staleAfterMs?: number } = {}) {
+  constructor(
+    private readonly url: string,
+    options: { heartbeatIntervalMs?: number; marketIdlePingAfterMs?: number; staleAfterMs?: number } = {},
+  ) {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 25_000;
+    this.marketIdlePingAfterMs = options.marketIdlePingAfterMs ?? 2_000;
     this.staleAfterMs = options.staleAfterMs ?? 60_000;
     MARKET_ASSETS.forEach((asset, assetIndex) => MARKET_VENUES.forEach((venue, venueIndex) => {
       const market = seedMarket(venue, asset, venueIndex, assetIndex);
@@ -240,6 +246,11 @@ export class CrossExMarketHub {
 
   connectionState(): MarketSnapshot['connectionState'] {
     return this.state;
+  }
+
+  /** Registered market count without building the sorted snapshot. */
+  marketCount(): number {
+    return this.markets.size;
   }
 
   market(symbol: string): LiveMarket | null {
@@ -417,14 +428,16 @@ export class CrossExMarketHub {
     this.state = this.reconnectAttempt === 0 ? 'connecting' : 'reconnecting';
     const socket = new WebSocket(this.url);
     this.socket = socket;
-    let alive = true;
+    let awaitingPong = false;
     let lastMessageAt = Date.now();
-    socket.on('pong', () => { alive = true; });
+    let lastMarketMessageAt = Date.now();
+    socket.on('pong', () => { awaitingPong = false; });
     socket.on('open', () => {
       this.state = 'healthy';
       this.reconnectAttempt = 0;
-      alive = true;
+      awaitingPong = false;
       lastMessageAt = Date.now();
+      lastMarketMessageAt = Date.now();
       const symbols = [...this.markets.keys()];
       for (const channel of ['ticker', 'funding_rate', 'open_interest']) {
         const invalid = this.invalidSymbols.get(channel);
@@ -436,32 +449,36 @@ export class CrossExMarketHub {
       if (this.heartbeat) clearInterval(this.heartbeat);
       this.heartbeat = setInterval(() => {
         if (socket.readyState !== WebSocket.OPEN) return;
-        // A half-dead TCP link keeps readyState OPEN for minutes while every push silently
-        // vanishes; no pong since the last ping means the link is gone — terminate so the close
-        // handler reconnects instead of serving frozen prices as healthy.
-        if (!alive) {
-          socket.terminate();
-          return;
+        const now = Date.now();
+        // Market pushes can naturally be bursty. Once all market channels have been quiet for two
+        // seconds, actively probe the socket; a second check without a pong or any incoming frame
+        // terminates the half-dead connection so the close handler reconnects it.
+        if (now - lastMarketMessageAt > this.marketIdlePingAfterMs) {
+          if (awaitingPong) {
+            socket.terminate();
+            return;
+          }
+          awaitingPong = true;
+          socket.ping();
         }
-        alive = false;
-        socket.ping();
-        const nextState = Date.now() - lastMessageAt > this.staleAfterMs ? 'stale' : 'healthy';
+        const nextState = now - lastMessageAt > this.staleAfterMs ? 'stale' : 'healthy';
         if (nextState !== this.state) {
           this.state = nextState;
           this.notify({ type: 'market.snapshot', payload: this.snapshot() });
         }
-      }, this.heartbeatIntervalMs);
+      }, Math.min(this.heartbeatIntervalMs, this.marketIdlePingAfterMs));
       this.heartbeat.unref?.();
       this.notify({ type: 'market.snapshot', payload: this.snapshot() });
     });
     socket.on('message', (data) => {
-      alive = true;
-      lastMessageAt = Date.now();
+      const receivedAt = Date.now();
+      awaitingPong = false;
+      lastMessageAt = receivedAt;
       if (this.state === 'stale') {
         this.state = 'healthy';
         this.notify({ type: 'market.snapshot', payload: this.snapshot() });
       }
-      this.handleMessage(data.toString());
+      if (this.handleMessage(data.toString(), receivedAt)) lastMarketMessageAt = receivedAt;
     });
     socket.on('error', () => undefined);
     socket.on('close', () => {
@@ -523,15 +540,23 @@ export class CrossExMarketHub {
       .some((key) => key.endsWith(`:${symbol}`));
   }
 
-  private handleMessage(raw: string): void {
+  /**
+   * Handle one upstream frame and report whether it was a recognized market-data update.
+   * Frames arrive continuously for every subscribed symbol, so the channel/event fields are
+   * inspected first and exactly one schema runs per frame instead of trying each in sequence.
+   */
+  private handleMessage(raw: string, receivedAt: number): boolean {
     let payload: unknown;
-    try { payload = JSON.parse(raw); } catch { return; }
-    const subscriptionFailure = SubscriptionFailureSchema.safeParse(payload);
-    if (subscriptionFailure.success) {
+    try { payload = JSON.parse(raw); } catch { return false; }
+    if (typeof payload !== 'object' || payload === null) return false;
+    const frame = payload as { channel?: unknown; event?: unknown };
+    if (frame.event === 'subscribe') {
+      const subscriptionFailure = SubscriptionFailureSchema.safeParse(payload);
+      if (!subscriptionFailure.success) return false;
       const channel = subscriptionFailure.data.channel;
       const symbols = this.subscriptions.get(channel);
       const invalidFound = invalidSymbolsFromMessage(subscriptionFailure.data.error.message);
-      if (!symbols || invalidFound.length === 0) return;
+      if (!symbols || invalidFound.length === 0) return false;
       const invalid = this.invalidSymbols.get(channel) ?? new Set<string>();
       for (const symbol of invalidFound) {
         symbols.delete(symbol);
@@ -542,55 +567,65 @@ export class CrossExMarketHub {
       if (socket?.readyState === WebSocket.OPEN && symbols.size > 0 && ['ticker', 'funding_rate', 'open_interest'].includes(channel)) {
         this.sendSubscribe(socket, channel, [...symbols]);
       }
-      return;
+      return false;
     }
-    const ticker = TickerPushSchema.safeParse(payload);
-    if (ticker.success) {
+    if (frame.event !== 'update' || typeof frame.channel !== 'string') return false;
+    if (frame.channel === 'ticker') {
+      const ticker = TickerPushSchema.safeParse(payload);
+      if (!ticker.success) return false;
       const current = this.markets.get(ticker.data.result.s);
-      if (!current) return;
+      if (!current) return true;
       const value = ticker.data.result;
       const currentTimestamp = current.source === 'gate_crossex_websocket'
         ? Date.parse(current.updatedAt)
         : Number.NEGATIVE_INFINITY;
       // A reconnect can flush delayed frames after a newer ticker has already arrived. Never
       // roll a symbol's executable bid/ask backward to an older source timestamp.
-      if (Number.isFinite(currentTimestamp) && value.ts < currentTimestamp) return;
+      if (Number.isFinite(currentTimestamp) && value.ts < currentTimestamp) return true;
       this.publish({ ...current, lastPrice: value.lp, bidPrice: value.bp, bidSize: value.bs, askPrice: value.ap,
         askSize: value.as, open24h: value.o ?? current.open24h, high24h: value.h ?? current.high24h,
         low24h: value.l ?? current.low24h, volume24h: value.v ?? current.volume24h,
-        quoteVolume24h: value.q ?? current.quoteVolume24h, updatedAt: new Date(value.ts).toISOString(), source: 'gate_crossex_websocket' });
-      return;
+        quoteVolume24h: value.q ?? current.quoteVolume24h, receivedAt: new Date(receivedAt).toISOString(),
+        updatedAt: new Date(value.ts).toISOString(), source: 'gate_crossex_websocket' });
+      return true;
     }
-    // `updatedAt` and `source` are the strategy engine's only evidence that bid/ask came from the
-    // exchange recently; funding and open-interest pushes must never refresh them, or seed/stale
-    // prices would pass the engine's freshness gate.
-    const funding = FundingPushSchema.safeParse(payload);
-    if (funding.success) {
+    // The ticker's `updatedAt`, `receivedAt`, and `source` are the strategy engine's evidence that
+    // bid/ask came from the exchange recently and arrived promptly. Funding and open-interest
+    // pushes must never refresh them, or seed, stale, or delayed prices could pass that gate.
+    if (frame.channel === 'funding_rate') {
+      const funding = FundingPushSchema.safeParse(payload);
+      if (!funding.success) return false;
       const current = this.markets.get(funding.data.result.s);
       if (current) this.publish({ ...current, fundingRate: funding.data.result.r, nextFundingAt: new Date(funding.data.result.T).toISOString() });
-      return;
+      return true;
     }
-    const interest = OpenInterestPushSchema.safeParse(payload);
-    if (interest.success) {
+    if (frame.channel === 'open_interest') {
+      const interest = OpenInterestPushSchema.safeParse(payload);
+      if (!interest.success) return false;
       const current = this.markets.get(interest.data.result.s);
       if (current) this.publish({ ...current, openInterest: interest.data.result.oi, openInterestValue: interest.data.result.oiV ?? current.openInterestValue });
-      return;
+      return true;
     }
-    const bookUpdate = OrderBookUpdatePushSchema.safeParse(payload);
-    if (bookUpdate.success) {
+    if (frame.channel === 'order_book_update') {
+      const bookUpdate = OrderBookUpdatePushSchema.safeParse(payload);
+      if (!bookUpdate.success) return false;
       this.applyBookUpdate(bookUpdate.data.result);
-      return;
+      return true;
     }
-    const trade = TradePushSchema.safeParse(payload);
-    if (trade.success) {
+    if (frame.channel === 'trade') {
+      const trade = TradePushSchema.safeParse(payload);
+      if (!trade.success) return false;
       this.applyTrade(trade.data.result);
-      return;
+      return true;
     }
-    const kline = KlinePushSchema.safeParse(payload);
-    if (kline.success) {
+    if (frame.channel.startsWith('kline_')) {
+      const kline = KlinePushSchema.safeParse(payload);
+      if (!kline.success) return false;
       const interval = kline.data.channel.slice('kline_'.length) as CandleInterval;
       this.applyKline(interval, kline.data.result);
+      return true;
     }
+    return false;
   }
 
   private applyBookUpdate(result: z.infer<typeof OrderBookUpdatePushSchema>['result']): void {

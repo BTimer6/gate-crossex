@@ -2,13 +2,19 @@ import { describe, expect, it } from 'vitest';
 import type { Candle, LiveMarket, MarketSnapshot } from './api.js';
 import { assessMarketPairFreshness, candleTailIsFresh, freshMarketPair, lastKnownLiveMarketPair } from './market-freshness.js';
 
-function market(symbol: string, updatedAt: number, source: LiveMarket['source'] = 'gate_crossex_websocket'): LiveMarket {
+function market(
+  symbol: string,
+  updatedAt: number,
+  source: LiveMarket['source'] = 'gate_crossex_websocket',
+  receivedAt = updatedAt,
+): LiveMarket {
   const [venue = 'GATE', , asset = 'SKHY'] = symbol.split('_');
   return {
     symbol, venue, asset, lastPrice: '1', bidPrice: '1', bidSize: '1', askPrice: '1', askSize: '1',
     open24h: '1', high24h: '1', low24h: '1', volume24h: '1', quoteVolume24h: '1',
     fundingRate: '0', nextFundingAt: new Date(updatedAt).toISOString(), openInterest: '1',
-    openInterestValue: '1', updatedAt: new Date(updatedAt).toISOString(), source,
+    openInterestValue: '1', receivedAt: new Date(receivedAt).toISOString(),
+    updatedAt: new Date(updatedAt).toISOString(), source,
   };
 }
 
@@ -29,11 +35,15 @@ describe('premium market freshness', () => {
     };
   }
 
-  it('accepts only a healthy, fresh, synchronized live pair', () => {
+  it('accepts only a healthy, fresh, promptly delivered live pair', () => {
     expect(freshMarketPair(snapshot(), leftSymbol, rightSymbol, now)).not.toBeNull();
     expect(freshMarketPair(snapshot(now - 16_000, now), leftSymbol, rightSymbol, now)).toBeNull();
     expect(freshMarketPair(snapshot(now - 5_000, now), leftSymbol, rightSymbol, now)).not.toBeNull();
-    expect(freshMarketPair(snapshot(now - 6_000, now), leftSymbol, rightSymbol, now)).toBeNull();
+    // Independently published tickers may have different source times without being unhealthy.
+    expect(freshMarketPair(snapshot(now - 6_000, now), leftSymbol, rightSymbol, now)).not.toBeNull();
+    const delayed = snapshot();
+    delayed.markets[0] = market(leftSymbol, now - 4_000, 'gate_crossex_websocket', now);
+    expect(freshMarketPair(delayed, leftSymbol, rightSymbol, now)).toBeNull();
     expect(freshMarketPair({ ...snapshot(), connectionState: 'stale' }, leftSymbol, rightSymbol, now)).toBeNull();
     const seeded = snapshot();
     seeded.markets[0] = market(leftSymbol, now, 'demo_seed');
@@ -47,7 +57,9 @@ describe('premium market freshness', () => {
     seeded.markets[0] = market(leftSymbol, now, 'demo_seed');
     expect(assessMarketPairFreshness(seeded, leftSymbol, rightSymbol, now).reason).toBe('non_live');
     expect(assessMarketPairFreshness(snapshot(now - 16_000, now), leftSymbol, rightSymbol, now).reason).toBe('stale');
-    expect(assessMarketPairFreshness(snapshot(now - 6_000, now), leftSymbol, rightSymbol, now).reason).toBe('skew');
+    const delayed = snapshot();
+    delayed.markets[0] = market(leftSymbol, now - 4_000, 'gate_crossex_websocket', now);
+    expect(assessMarketPairFreshness(delayed, leftSymbol, rightSymbol, now).reason).toBe('delayed');
   });
 
   it('keeps last-known streamed prices displayable without making them executable', () => {

@@ -336,6 +336,22 @@ describe('private event ingestion guards', () => {
     expect(emitted[1]).toMatchObject({ balance: '1000', availableBalance: '900', equity: '1010', unrealizedPnl: '5' });
   });
 
+  it('replaces the complete balance set during REST reconciliation', async () => {
+    const { runtime } = await createHarness();
+    runtime.reconcileLiveBalances([
+      { venue: 'KRAKEN', coin: 'USD', balance: '6.59', availableBalance: '6.59', equity: '7.35', unrealizedPnl: '0.76' },
+      { venue: 'GATE', coin: 'USDT', balance: '100', availableBalance: '100', equity: '100', unrealizedPnl: '0' },
+    ], '2026-08-12T15:00:00.000Z');
+
+    runtime.reconcileLiveBalances([
+      { venue: 'GATE', coin: 'USDT', balance: '20999.98', availableBalance: '20999.98', equity: '20999.98', unrealizedPnl: '0' },
+    ], '2026-08-12T15:01:00.000Z');
+
+    expect(runtime.listBalances()).toEqual([expect.objectContaining({
+      venue: 'GATE', coin: 'USDT', balance: '20999.98',
+    })]);
+  });
+
   it('idempotently recovers local execution fills from REST portfolio history', async () => {
     const { runtime, database } = await createHarness();
     const order = await runtime.createOrder(marketOrderInput);

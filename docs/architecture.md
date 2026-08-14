@@ -30,7 +30,7 @@ The frontend never connects directly to an exchange and never receives stored cr
 - SQLite uses foreign keys, WAL journaling, integrity checks, and an owner-only process lock.
 - Applied migration filenames and SHA-256 checksums are immutable.
 - Financial values remain decimal strings at API boundaries and use decimal-safe arithmetic.
-- Credentials live in the OS keychain by default or in an explicitly selected, gitignored, owner-only `.env` file. SQLite stores only non-secret credential metadata.
+- Credentials live in isolated account profiles in the OS keychain by default or in an explicitly selected, gitignored, owner-only `.env` file. SQLite stores only non-secret profile metadata and the active-profile pointer. Switching profiles locks trading, verifies the target key, clears authenticated account caches, and reconnects the private stream.
 - Logs and audit records are bounded and redact credential material and sensitive headers.
 
 ## Market and account state

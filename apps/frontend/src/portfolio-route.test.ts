@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { maximumTransferAmount } from './transfer-amount.js';
 import { transferAccountsFor, transferFeeForRoute } from './transfer-rules.js';
+import { marginRatePercent } from './portfolio-metrics.js';
+
+describe('portfolio margin rates', () => {
+  it('converts Gate account ratios to displayed percentages', () => {
+    expect(marginRatePercent('2.4')).toBe(240);
+    expect(marginRatePercent('1')).toBe(100);
+    expect(marginRatePercent('')).toBeNull();
+    expect(marginRatePercent('-1')).toBeNull();
+  });
+});
 
 describe('maximumTransferAmount', () => {
   it('preserves whole amounts and truncates fractional excess without rounding above the balance', () => {

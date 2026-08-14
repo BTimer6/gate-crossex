@@ -35,8 +35,8 @@ export interface StrategyEngineOptions {
   requoteIntervalMs?: number;
   /** Market data older than this is considered unusable for triggering. */
   marketFreshnessMs?: number;
-  /** Maximum source-timestamp difference between the two prices in one trigger calculation. */
-  marketPairMaxSkewMs?: number;
+  /** Maximum delay from the exchange source timestamp to local WebSocket receipt. */
+  marketMaxTransportLagMs?: number;
   /** Small allowance for clock skew; quotes further in the future are rejected. */
   futureQuoteToleranceMs?: number;
   /** Cooldown between hedge-repair attempts. */
@@ -258,7 +258,7 @@ export class StrategyEngine {
       orderTimeoutMs: options.orderTimeoutMs ?? 20_000,
       requoteIntervalMs: options.requoteIntervalMs ?? 2_000,
       marketFreshnessMs: options.marketFreshnessMs ?? 15_000,
-      marketPairMaxSkewMs: options.marketPairMaxSkewMs ?? 5_000,
+      marketMaxTransportLagMs: options.marketMaxTransportLagMs ?? 3_000,
       futureQuoteToleranceMs: options.futureQuoteToleranceMs ?? 2_000,
       repairCooldownMs: options.repairCooldownMs ?? 3_000,
       now: options.now ?? Date.now,
@@ -328,10 +328,14 @@ export class StrategyEngine {
     }
   }
 
-  activatePersistedStrategies(): void {
+  activatePersistedStrategies(credentialProfileId?: string | null): void {
     if (!this.session.liveTradingEnabled) return;
     for (const record of this.runtime.listStrategies()) {
       if (record.status !== 'RUNNING') continue;
+      if (credentialProfileId !== undefined
+        && record.accountProfileId !== credentialProfileId
+        // Legacy rows without an owner are considered part of the active account until reviewed.
+        && record.accountProfileId !== null) continue;
       if (this.actors.has(record.id)) continue;
       this.attach(record);
       this.runtime.addStrategyLog(record.id, 'info', 'Strategy resumed', 'Live mode enabled after order reconciliation', '—', 'Monitoring live spreads');
@@ -347,6 +351,41 @@ export class StrategyEngine {
       this.actors.clear();
     }
     return result.unresolved;
+  }
+
+  /**
+   * A saved strategy belongs to the account on which it was created. Credential replacement can
+   * point at a different Gate account even when the user reuses the same connection label, so a
+   * successful credential mutation must make persisted RUNNING strategies non-resumable before
+   * the new profile can become active.
+   */
+  runningStrategiesForCredentialProfile(credentialProfileId?: string | null): StrategyRecord[] {
+    return this.runtime.listStrategies().filter((record) => record.status === 'RUNNING'
+      && (credentialProfileId === undefined
+        || record.accountProfileId === credentialProfileId
+        // Legacy strategies are treated as belonging to the account active during migration.
+        || record.accountProfileId === null));
+  }
+
+  pauseRunningStrategiesForCredentialChange(credentialProfileId?: string | null): number {
+    const running = this.runningStrategiesForCredentialProfile(credentialProfileId);
+    if (running.length === 0) return 0;
+    const updatedAt = new Date().toISOString();
+    const update = this.database.prepare(`UPDATE execution_strategies
+      SET status = 'PAUSED', updated_at = ?
+      WHERE id = ? AND status = 'RUNNING'`);
+    this.database.transaction(() => {
+      for (const record of running) update.run(updatedAt, record.id);
+    })();
+    for (const actor of this.actors.values()) actor.suspended = true;
+    this.actors.clear();
+    this.ledgerCache.clear();
+    for (const record of running) {
+      this.runtime.addStrategyLog(record.id, 'warning', 'Strategy paused',
+        'Account credentials changed', '—', 'Manual review required before trading this strategy again');
+      this.runtime.emitStrategyUpdate(this.runtime.getStrategy(record.id));
+    }
+    return running.length;
   }
 
   async stop(): Promise<void> {
@@ -371,7 +410,10 @@ export class StrategyEngine {
     return [...this.actors.keys()];
   }
 
-  async startStrategy(raw: unknown): Promise<StrategyRecord> {
+  async startStrategy(
+    raw: unknown,
+    account: { profileId: string; label: string } | null = null,
+  ): Promise<StrategyRecord> {
     const input = CreateStrategyInputSchema.parse(raw);
     // Grid strategies remain readable/resumable for historical compatibility, but the product no
     // longer allows creating new premium grids.
@@ -423,8 +465,10 @@ export class StrategyEngine {
     const id = `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
     const now = new Date().toISOString();
     this.database.prepare(`INSERT INTO execution_strategies (id, kind, environment, status, config_json, progress,
-      filled_quantity, filled_left, filled_right, open_position, created_at, updated_at, stopped_at)
-      VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, NULL)`).run(id, input.kind, JSON.stringify(input), now, now);
+      filled_quantity, filled_left, filled_right, open_position, credential_profile_id,
+      credential_profile_label, created_at, updated_at, stopped_at)
+      VALUES (?, ?, 'live', 'RUNNING', ?, 0, '0', '0', '0', '0', ?, ?, ?, ?, NULL)`)
+      .run(id, input.kind, JSON.stringify(input), account?.profileId ?? null, account?.label ?? null, now, now);
     const shortPremium = input.leftSide === 'SELL';
     const hedgeModeLabel = input.hedgeMode === 'EQUAL_NOTIONAL' ? 'equal-notional hedge' : 'share-ratio hedge';
     const startCondition = input.closePlan
@@ -471,6 +515,83 @@ export class StrategyEngine {
     const stopped = this.runtime.getStrategy(id);
     this.runtime.emitStrategyUpdate(stopped);
     return stopped;
+  }
+
+  async resumeStrategy(id: string, credentialProfileId: string): Promise<StrategyRecord> {
+    if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
+    const record = this.runtime.getStrategy(id);
+    if (record.status !== 'PAUSED') throw new StrategyEngineError('strategy_not_paused', 409);
+    if (record.accountProfileId !== null && record.accountProfileId !== credentialProfileId) {
+      throw new StrategyEngineError('strategy_account_not_active', 409);
+    }
+    if (this.actors.has(id)) throw new StrategyEngineError('strategy_already_active', 409);
+    if (this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING').length >= 10) {
+      throw new StrategyEngineError('too_many_running_strategies', 409);
+    }
+
+    // PAUSED normally means every order was already confirmed terminal. Re-prove that invariant
+    // here so a stale or externally modified database row can never re-arm live execution while
+    // an older remote order is still working.
+    const quiesced = await this.runtime.quiesceOpenOrders({
+      strategyId: id,
+      timeoutMs: this.options.orderTimeoutMs,
+    });
+    if (quiesced.unresolved.length > 0) {
+      throw new StrategyEngineError('strategy_resume_unresolved_orders', 409,
+        quiesced.unresolved.map(({ order }) => order.id).join(','));
+    }
+
+    const config = record.config;
+    if (config.closePlan) {
+      for (const target of config.closePlan.targets) {
+        if (!this.markets.market(target.symbol) && !this.markets.ensureMarket?.(target.symbol)) {
+          throw new StrategyEngineError('unknown_strategy_market', 400);
+        }
+      }
+      this.validateClosePlanOrderSizes(config);
+      await this.runtime.prepareReduceOnlyStrategy(config.closePlan.targets.map((target) => ({
+        symbol: target.symbol,
+        venue: target.symbol.split('_', 1)[0] ?? '',
+        side: target.side,
+        leverage: '1',
+        estimatedQuantity: target.quantity,
+        estimatedPrice: '0',
+        positionSide: target.positionSide,
+      })));
+    } else {
+      const legs = legsOf(config);
+      for (const leg of [legs.left, legs.right]) {
+        if (!this.markets.market(leg.symbol) && !this.markets.ensureMarket?.(leg.symbol)) {
+          throw new StrategyEngineError('unknown_strategy_market', 400);
+        }
+      }
+      this.validateStrategyOrderSizes(config, legs);
+      await this.prepareStrategy(config, legs);
+    }
+
+    // Re-check after the asynchronous account and order preflights. Another request may have
+    // locked trading, resumed this strategy, or consumed the final running-strategy slot in the
+    // meantime.
+    if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
+    const current = this.runtime.getStrategy(id);
+    if (current.status !== 'PAUSED') throw new StrategyEngineError('strategy_not_paused', 409);
+    if (current.accountProfileId !== null && current.accountProfileId !== credentialProfileId) {
+      throw new StrategyEngineError('strategy_account_not_active', 409);
+    }
+    if (this.runtime.listStrategies().filter((strategy) => strategy.status === 'RUNNING').length >= 10) {
+      throw new StrategyEngineError('too_many_running_strategies', 409);
+    }
+
+    const now = new Date().toISOString();
+    const updated = this.database.prepare(`UPDATE execution_strategies
+      SET status = 'RUNNING', stopped_at = NULL, updated_at = ?
+      WHERE id = ? AND status = 'PAUSED'`).run(now, id);
+    if (updated.changes !== 1) throw new StrategyEngineError('strategy_not_paused', 409);
+    this.runtime.addStrategyLog(id, 'info', 'Strategy resumed', 'Manual resume', '—', 'Preflight passed · monitoring live spreads');
+    const resumed = this.runtime.getStrategy(id);
+    this.attach(resumed);
+    this.runtime.emitStrategyUpdate(resumed);
+    return resumed;
   }
 
   async updatePremiumTakeProfit(id: string, raw: unknown): Promise<StrategyRecord> {
@@ -636,25 +757,26 @@ export class StrategyEngine {
     if (this.markets.connectionState && this.markets.connectionState() !== 'healthy') return null;
     const market = this.markets.market(symbol);
     if (!market || market.source !== 'gate_crossex_websocket') return null;
-    const age = this.options.now() - Date.parse(market.updatedAt);
+    const sourceTimestamp = Date.parse(market.updatedAt);
+    const receivedTimestamp = Date.parse(market.receivedAt);
+    const age = this.options.now() - sourceTimestamp;
+    const transportLag = receivedTimestamp - sourceTimestamp;
     if (!Number.isFinite(age)
+      || !Number.isFinite(transportLag)
       || age > this.options.marketFreshnessMs
-      || age < -this.options.futureQuoteToleranceMs) return null;
+      || age < -this.options.futureQuoteToleranceMs
+      || transportLag > this.options.marketMaxTransportLagMs) return null;
     return market;
   }
 
   private freshMarketPair(
     leftSymbol: string,
     rightSymbol: string,
-  ): { left: LiveMarket; right: LiveMarket; leftUpdatedAt: number; rightUpdatedAt: number } | null {
+  ): { left: LiveMarket; right: LiveMarket } | null {
     const left = this.freshMarket(leftSymbol);
     const right = this.freshMarket(rightSymbol);
     if (!left || !right) return null;
-    const leftUpdatedAt = Date.parse(left.updatedAt);
-    const rightUpdatedAt = Date.parse(right.updatedAt);
-    if (!Number.isFinite(leftUpdatedAt) || !Number.isFinite(rightUpdatedAt)
-      || Math.abs(leftUpdatedAt - rightUpdatedAt) > this.options.marketPairMaxSkewMs) return null;
-    return { left, right, leftUpdatedAt, rightUpdatedAt };
+    return { left, right };
   }
 
   private strategyLedger(strategyId: string): StrategyLedgerCache {
@@ -1256,8 +1378,6 @@ export class StrategyEngine {
     premium: Decimal;
     adrPrice: Decimal;
     hedgePrice: Decimal;
-    leftUpdatedAt: number;
-    rightUpdatedAt: number;
   } | null {
     const legs = legsOf(config);
     const adrSide = intent === 'entry' ? legs.left.side : oppositeSide(legs.left.side);
@@ -1273,8 +1393,6 @@ export class StrategyEngine {
       premium: adrPrice.div(fairValue).minus(1).mul(100),
       adrPrice,
       hedgePrice,
-      leftUpdatedAt: pair.leftUpdatedAt,
-      rightUpdatedAt: pair.rightUpdatedAt,
     };
   }
 

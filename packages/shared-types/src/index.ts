@@ -47,6 +47,14 @@ export const CredentialConnectionStatusSchema = z.object({
   lastVerifiedAt: z.string().nullable(),
   secureEntryPath: z.literal('/secure/credentials'),
   readOnly: z.boolean(),
+  activeProfileId: z.string().nullable(),
+  profiles: z.array(z.object({
+    id: z.string(),
+    label: z.string(),
+    storage: z.enum(['os_keychain', 'env_file', 'memory_test_only', 'unavailable']),
+    lastVerifiedAt: z.string().nullable(),
+    active: z.boolean(),
+  })),
 });
 export type CredentialConnectionStatus = z.infer<typeof CredentialConnectionStatusSchema>;
 
@@ -85,6 +93,53 @@ export const CrossExInstrumentSchema = z.object({
   delistTime: z.string(),
 });
 export type CrossExInstrument = z.infer<typeof CrossExInstrumentSchema>;
+
+export interface MarketAssetAlias {
+  venue: string;
+  businessType: string;
+  nativeAsset: string;
+  canonicalAsset: string;
+}
+
+/**
+ * Version-controlled identity aliases for venue tickers that name the same underlying asset
+ * differently. Keep these scoped by venue and product so similarly named instruments elsewhere
+ * are never merged accidentally.
+ */
+export const MARKET_ASSET_ALIASES = [
+  {
+    venue: 'HYPERLIQUID',
+    businessType: 'FUTURE',
+    nativeAsset: 'SKHX',
+    canonicalAsset: 'SKHYNIX',
+  },
+] as const satisfies readonly MarketAssetAlias[];
+
+function marketAssetAliasKey(venue: string, businessType: string, asset: string): string {
+  return `${venue.toUpperCase()}:${businessType.toUpperCase()}:${asset.toUpperCase()}`;
+}
+
+const canonicalMarketAssetByNative = new Map<string, string>();
+const nativeMarketAssetByCanonical = new Map<string, string>();
+
+for (const alias of MARKET_ASSET_ALIASES) {
+  const nativeKey = marketAssetAliasKey(alias.venue, alias.businessType, alias.nativeAsset);
+  const canonicalKey = marketAssetAliasKey(alias.venue, alias.businessType, alias.canonicalAsset);
+  if (canonicalMarketAssetByNative.has(nativeKey)) throw new Error(`Duplicate market asset alias: ${nativeKey}`);
+  if (nativeMarketAssetByCanonical.has(canonicalKey)) throw new Error(`Ambiguous market asset routing alias: ${canonicalKey}`);
+  canonicalMarketAssetByNative.set(nativeKey, alias.canonicalAsset);
+  nativeMarketAssetByCanonical.set(canonicalKey, alias.nativeAsset);
+}
+
+/** Resolve an exchange-native asset code to the canonical identity used by the UI and API. */
+export function canonicalMarketAsset(venue: string, businessType: string, nativeAsset: string): string {
+  return canonicalMarketAssetByNative.get(marketAssetAliasKey(venue, businessType, nativeAsset)) ?? nativeAsset;
+}
+
+/** Resolve a canonical asset identity back to the native code required in an executable symbol. */
+export function nativeMarketAsset(venue: string, businessType: string, canonicalAsset: string): string {
+  return nativeMarketAssetByCanonical.get(marketAssetAliasKey(venue, businessType, canonicalAsset)) ?? canonicalAsset;
+}
 
 export const CrossExInstrumentCatalogSchema = z.object({
   items: z.array(CrossExInstrumentSchema),
@@ -334,6 +389,7 @@ export const PortfolioFuturesPositionSchema = z.object({
   unrealizedPnlRate: z.string(), entryPrice: z.string(), markPrice: z.string(), leverage: z.string(),
   maxLeverage: z.string(), riskLimit: z.string(), fee: z.string(), fundingFee: z.string(),
   fundingTime: z.string(), createdAt: z.string(), updatedAt: z.string(), realizedPnl: z.string(),
+  crossExAdlRank: z.string().nullable().optional(), exchangeAdlRank: z.string().nullable().optional(),
 });
 export type PortfolioFuturesPosition = z.infer<typeof PortfolioFuturesPositionSchema>;
 
@@ -658,6 +714,9 @@ export const LiveMarketSchema = z.object({
   nextFundingAt: z.string(),
   openInterest: z.string(),
   openInterestValue: z.string(),
+  /** Backend wall-clock time when the latest ticker frame was received. */
+  receivedAt: z.string(),
+  /** Exchange source timestamp carried by the latest ticker frame. */
   updatedAt: z.string(),
   source: z.enum(['gate_crossex_websocket', 'demo_seed']),
 });
@@ -882,6 +941,8 @@ export const StrategyRecordSchema = z.object({
   id: z.string(),
   kind: z.enum(['position', 'auto', 'premium']),
   status: z.string(),
+  accountProfileId: z.string().nullable(),
+  accountLabel: z.string().nullable(),
   config: StrategyConfigSchema,
   progress: z.number(),
   filledQuantity: z.string(),

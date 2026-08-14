@@ -246,6 +246,22 @@ async function request<T>(schema: RuntimeSchema<T>, path: string, init?: Request
   return pending;
 }
 
+/**
+ * Reuse a successful read for `ttlMs` so route mounts stop re-downloading and re-validating
+ * large, slow-moving payloads. Failures are never cached, and concurrent callers share the
+ * in-flight request via the read coalescing above.
+ */
+function cachedRead<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> {
+  let cached: { value: T; at: number } | null = null;
+  return () => {
+    if (cached && Date.now() - cached.at < ttlMs) return Promise.resolve(cached.value);
+    return load().then((value) => {
+      cached = { value, at: Date.now() };
+      return value;
+    });
+  };
+}
+
 export const api = {
   markets: () => request(MarketSnapshotSchema, '/api/markets'),
   borosStrategies: () => request(BorosStrategiesResponseSchema, '/api/boros/strategies'),
@@ -334,6 +350,10 @@ export const api = {
     method: 'POST',
     headers: { 'x-gct-trading-intent': 'stop-strategy' },
   }),
+  resumeStrategy: (id: string) => request(StrategyRecordSchema, `/api/strategies/${encodeURIComponent(id)}/resume`, {
+    method: 'POST',
+    headers: { 'x-gct-trading-intent': 'resume-strategy' },
+  }),
   strategyLogs: (id: string) => request(StrategyLogsResponseSchema, `/api/strategies/${encodeURIComponent(id)}/logs`),
   candles: (
     symbol: string,
@@ -351,6 +371,32 @@ export const api = {
     headers: { 'x-gct-read-intent': 'fee-rates' },
   }),
   connection: () => request(CredentialConnectionStatusSchema, '/api/onboarding/connection'),
+  switchAccount: (profileId: string, confirmPauseRunningStrategies = false) => request(
+    CredentialConnectionStatusSchema,
+    `/api/onboarding/accounts/${encodeURIComponent(profileId)}/activate`,
+    {
+      method: 'POST',
+      headers: { 'x-gct-credential-intent': 'switch-account' },
+      body: JSON.stringify({ confirmPauseRunningStrategies }),
+    },
+  ),
+  renameAccount: (profileId: string, label: string) => request(
+    CredentialConnectionStatusSchema,
+    `/api/onboarding/accounts/${encodeURIComponent(profileId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'x-gct-credential-intent': 'rename-account' },
+      body: JSON.stringify({ label }),
+    },
+  ),
+  deleteAccount: (profileId: string) => request(
+    CredentialConnectionStatusSchema,
+    `/api/onboarding/accounts/${encodeURIComponent(profileId)}`,
+    {
+      method: 'DELETE',
+      headers: { 'x-gct-credential-intent': 'delete-account' },
+    },
+  ),
   discovery: () => request(SystemDiscoverySchema, '/api/system/discovery'),
   tradingMode: () => request(TradingModeResponseSchema, '/api/trading-mode'),
   setTradingMode: (mode: 'readonly' | 'live', acceptDisclaimer: boolean) =>
@@ -359,7 +405,9 @@ export const api = {
       headers: { 'x-gct-trading-intent': 'set-trading-mode' },
       body: JSON.stringify({ mode, acceptDisclaimer }),
     }),
-  instruments: () => request(InstrumentsResponseSchema, '/api/crossex/instruments'),
+  // The instrument catalog is thousands of rows and changes on the backend's 5-minute cadence;
+  // reusing it across route mounts avoids a large download + schema validation per tab switch.
+  instruments: cachedRead(5 * 60_000, () => request(InstrumentsResponseSchema, '/api/crossex/instruments')),
   riskLimits: (symbol: string) =>
     request(CrossExRiskLimitResponseSchema, `/api/crossex/instruments/${encodeURIComponent(symbol)}/risk-limits`),
   preferences: () => request(UserPreferencesResponseSchema, '/api/preferences'),
@@ -372,8 +420,14 @@ export const api = {
 export interface TerminalStreamHandle {
   close(): void;
   watchQuotes(symbols: string[]): void;
+  watchKlines(watches: KlineWatch[]): void;
   watchMarket(symbol: string, interval: CandleInterval): void;
   clearWatch(): void;
+}
+
+export interface KlineWatch {
+  symbol: string;
+  interval: CandleInterval;
 }
 
 const STREAM_CONNECT_TIMEOUT_MS = 10_000;
@@ -390,6 +444,7 @@ export function connectTerminalStream(
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let staleTimer: ReturnType<typeof setTimeout> | null = null;
   let quoteSymbols: string[] = [];
+  let klineWatches: KlineWatch[] = [];
   let lastWatch: { symbol: string; interval: CandleInterval } | null = null;
 
   const clearSocketTimers = () => {
@@ -407,6 +462,11 @@ export function connectTerminalStream(
   const sendQuoteWatch = () => {
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'watch.quotes', symbols: quoteSymbols }));
+    }
+  };
+  const sendKlineWatch = () => {
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'watch.klines', watches: klineWatches }));
     }
   };
   const sendMarketWatch = () => {
@@ -440,6 +500,7 @@ export function connectTerminalStream(
       onState('connected');
       armStaleTimer();
       sendQuoteWatch();
+      if (klineWatches.length > 0) sendKlineWatch();
       sendMarketWatch();
     });
     nextSocket.addEventListener('message', (event) => {
@@ -481,6 +542,16 @@ export function connectTerminalStream(
       if (next.length === quoteSymbols.length && next.every((symbol, index) => symbol === quoteSymbols[index])) return;
       quoteSymbols = next;
       sendQuoteWatch();
+    },
+    watchKlines: (watches) => {
+      const unique = new Map(watches.map((watch) => [`${watch.symbol}:${watch.interval}`, watch]));
+      const next = [...unique.values()].sort((left, right) =>
+        left.symbol.localeCompare(right.symbol) || left.interval.localeCompare(right.interval));
+      if (next.length === klineWatches.length
+        && next.every((watch, index) => watch.symbol === klineWatches[index]?.symbol
+          && watch.interval === klineWatches[index]?.interval)) return;
+      klineWatches = next;
+      sendKlineWatch();
     },
     watchMarket: (symbol, interval) => {
       if (lastWatch?.symbol === symbol && lastWatch.interval === interval) return;

@@ -15,6 +15,8 @@ test.describe.serial('local trading terminal', () => {
 
     await expect(dialog).toBeHidden();
     await expect(page.getByRole('button', { name: 'Switch trading mode', exact: true })).toHaveText('Read-only');
+    await expect(page.locator('.nav-more > button')).toContainText('More');
+    await expect(page.locator('.nav-more > button')).not.toContainText('更多');
     await expect(page.getByText('Reference data', { exact: true })).toHaveCount(0);
     await expect(page.locator('.headline-price span')).toHaveCount(0);
 
@@ -46,8 +48,9 @@ test.describe.serial('local trading terminal', () => {
 
     await dialog.getByRole('button', { name: '中文', exact: true }).click();
     await expect(dialog.getByRole('heading', { name: '添加 Gate API 密钥' })).toBeVisible();
+    await expect(page.locator('.nav-more > button')).toContainText('更多');
     const popupPromise = page.waitForEvent('popup');
-    await dialog.getByRole('button', { name: /打开Gate API 密钥设置/ }).click();
+    await dialog.getByRole('button', { name: /打开 Gate API 密钥设置/ }).click();
     const credentialPage = await popupPromise;
     await expect(credentialPage).toHaveURL(/\/secure\/credentials\?intent=live-trading&lang=zh$/);
     await expect(credentialPage.locator('html')).toHaveAttribute('lang', 'zh-CN');
@@ -55,6 +58,7 @@ test.describe.serial('local trading terminal', () => {
     await expect(credentialPage.getByText(/您正在设置实盘交易/)).toBeVisible();
     await credentialPage.close();
     await dialog.getByRole('button', { name: 'EN', exact: true }).click();
+    await expect(page.locator('.nav-more > button')).toContainText('More');
 
     await page.route('**/api/onboarding/connection', async (route) => route.fulfill({ json: {
       configured: true,
@@ -63,6 +67,14 @@ test.describe.serial('local trading terminal', () => {
       lastVerifiedAt: '2030-01-01T00:00:00.000Z',
       secureEntryPath: '/secure/credentials',
       readOnly: true,
+      activeProfileId: 'gate-crossex-default',
+      profiles: [{
+        id: 'gate-crossex-default',
+        label: 'Gate CrossEx (.env)',
+        storage: 'env_file',
+        lastVerifiedAt: '2030-01-01T00:00:00.000Z',
+        active: true,
+      }],
     } }));
     await page.route('**/api/trading-mode', async (route) => {
       if (route.request().method() === 'POST') await route.fulfill({ json: { mode: 'live' } });
@@ -92,7 +104,8 @@ test.describe.serial('local trading terminal', () => {
     await search.press('Escape');
     await expect(marketTrigger).toBeFocused();
 
-    const strategyTrigger = page.getByRole('button', { name: '⇄ Strategy', exact: true });
+    // Topbar glyphs are aria-hidden decoration, so accessible names carry the label only.
+    const strategyTrigger = page.getByRole('button', { name: 'Strategy', exact: true });
     await strategyTrigger.press('ArrowDown');
     const firstStrategy = page.getByRole('menuitem', { name: /Cross-exchange hedge/ });
     await expect(firstStrategy).toBeFocused();
@@ -219,8 +232,8 @@ test.describe.serial('local trading terminal', () => {
     await exchangeFilter.getByRole('checkbox', { name: 'Hyperliquid' }).uncheck();
     await expect(opportunities.getByRole('radio')).toHaveCount(1);
     await expect(exchangeFilter.getByRole('button', { name: 'Select all' })).toBeEnabled();
-    await expect(page.getByRole('link', { name: /Open long market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/185?direction=long');
-    await expect(page.getByRole('link', { name: /Open short market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/187?direction=short');
+    await expect(page.getByRole('link', { name: /Open long market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/185?direction=long&utm_source=YQG01');
+    await expect(page.getByRole('link', { name: /Open short market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/187?direction=short&utm_source=YQG01');
     await exchangeFilter.getByRole('checkbox', { name: 'Hyperliquid' }).check();
     await expect(opportunities.getByRole('radio')).toHaveCount(2);
     await expect(opportunities.getByRole('radio', { name: /days to maturity.*Matures on/ })).toHaveCount(2);
@@ -235,8 +248,8 @@ test.describe.serial('local trading terminal', () => {
     expect(initialReturn).toMatch(/%$/);
     expect(initialOpportunityApr).toMatch(/%$/);
     await expect(opportunities.getByRole('radio', { name: /OKX ↔ Hyperliquid/ })).toContainText('OKX 50× · Hyperliquid 40×');
-    await expect(page.getByRole('link', { name: /Open long market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/185?direction=long');
-    await expect(page.getByRole('link', { name: /Open short market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/102?direction=short');
+    await expect(page.getByRole('link', { name: /Open long market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/185?direction=long&utm_source=YQG01');
+    await expect(page.getByRole('link', { name: /Open short market on Boros/ })).toHaveAttribute('href', 'https://boros.pendle.finance/markets/102?direction=short&utm_source=YQG01');
 
     const quantity = page.getByRole('textbox', { name: 'Position size' });
     const quantitySection = page.locator('.boros-size-setup');
@@ -388,6 +401,7 @@ test.describe.serial('local trading terminal', () => {
     try {
       await page.goto('/');
       const riskDialog = page.getByRole('dialog', { name: 'Risk disclaimer' });
+      await riskDialog.waitFor({ state: 'visible', timeout: 2_000 }).catch(() => undefined);
       if (await riskDialog.isVisible()) {
         await riskDialog.getByRole('checkbox', { name: 'I have read and understand the risks above.' }).check();
         await riskDialog.getByRole('button', { name: /Continue in read-only mode/ }).click();
@@ -402,6 +416,17 @@ test.describe.serial('local trading terminal', () => {
       await expect(legs).toHaveCount(2);
       await expect(legs.filter({ hasText: 'Hyperliquid' })).toContainText('+1.25 USDC');
       await expect(legs.filter({ hasText: 'Bybit' })).toContainText('-0.25 USDT');
+
+      const adlSignal = legs.filter({ hasText: 'Bybit' }).locator('.adl-signal');
+      await expect(adlSignal.locator('.adl-lights i')).toHaveCount(5);
+      await adlSignal.hover();
+      const tooltip = page.getByRole('tooltip');
+      await expect(tooltip).toContainText('It indicates the position in ADL ranking.');
+      await expect(tooltip).toContainText('BYBIT · Exchange ADL: unavailable · CrossEx ADL: unavailable');
+      const [signalBox, tooltipBox] = await Promise.all([adlSignal.boundingBox(), tooltip.boundingBox()]);
+      expect(signalBox).not.toBeNull();
+      expect(tooltipBox).not.toBeNull();
+      expect((tooltipBox?.y ?? 0) + (tooltipBox?.height ?? 0)).toBeLessThan(signalBox?.y ?? 0);
     } finally {
       await page.request.delete('/__e2e/grouped-positions');
     }
@@ -425,7 +450,7 @@ test.describe.serial('local trading terminal', () => {
     expect(chartBands!.ohlcBottom).toBeLessThanOrEqual(chartBands!.chartTop);
     await expect(page.locator('.ohlc')).toHaveCSS('border-bottom-width', '0px');
 
-    await page.getByRole('button', { name: '% Funding Rates', exact: true }).click();
+    await page.getByRole('button', { name: 'Funding Rates', exact: true }).click();
     await expect(page).toHaveURL(/\/funding-rates$/);
     await expect(page.getByRole('heading', { name: 'Funding rate matrix.' })).toBeVisible();
     await expect.poll(loadedScripts).toEqual(expect.arrayContaining([expect.stringContaining('funding-route-')]));
@@ -649,8 +674,8 @@ test.describe.serial('local trading terminal', () => {
 
     await expect(page).toHaveURL(/\/strategies\/paired-position$/);
     await expect(page.getByRole('combobox', { name: 'Search asset' })).toHaveAttribute('placeholder', 'HYPEUSDC ↔ HYPEUSDT');
-    await expect(page.getByRole('combobox', { name: 'Exchange A' })).toHaveValue('hyperliquid');
-    await expect(page.getByRole('combobox', { name: 'Exchange B' })).toHaveValue('bybit');
+    await expect(page.getByRole('button', { name: 'Exchange A: Hyperliquid' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Exchange B: Bybit' })).toBeVisible();
     await expect(page.getByLabel('Per-order quantity')).toHaveValue('');
     await expect(page.getByLabel('Per-order quantity')).toHaveAttribute('placeholder', 'e.g. 0.10');
     await expect(page.getByLabel('Total amount')).toHaveValue('');
@@ -675,10 +700,9 @@ test.describe.serial('local trading terminal', () => {
     const fundingDuration = fundingHistoryPanel.getByRole('group', { name: 'Duration' });
     await expect(fundingDuration.getByRole('button')).toHaveText(['24H', '7D', '30D']);
     await expect(fundingDuration.getByRole('button', { name: '30D' })).toHaveAttribute('aria-pressed', 'true');
-    const oneDayHistory = page.waitForRequest((request) => request.url().endsWith('/api/markets/funding-history/series')
-      && request.method() === 'POST' && request.postDataJSON().durationDays === 1);
+    // The strategy view prefetches the full 30-day series once; shorter ranges filter that data
+    // locally instead of issuing another history request.
     await fundingDuration.getByRole('button', { name: '24H' }).click();
-    await oneDayHistory;
     await expect(fundingDuration.getByRole('button', { name: '24H' })).toHaveAttribute('aria-pressed', 'true');
     await expect(fundingHistoryPanel.getByRole('heading', { name: /Cumulative funding/ })).toContainText('24H');
     const pnlLegend = page.locator('.funding-detail-legend > span').filter({ hasText: 'Cumulative funding PnL' });

@@ -9,8 +9,10 @@ import {
 import { useLanguage } from './i18n.js';
 import { marketSymbol } from './market-symbol.js';
 import { closeQuantityForPercentage } from './position-close.js';
-import { positionGroupLabel } from './position-grouping.js';
+import { canonicalPositionAsset, positionGroupLabel } from './position-grouping.js';
 import { formatAmount, symbolParts, useDialogFocus } from './route-shared.js';
+import { AdlIndicators } from './adl-indicator.js';
+import { adlRanksForPositions } from './adl-ranking.js';
 
 export interface ClosePositionTarget {
   id: string;
@@ -41,10 +43,21 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
 
   const selectable = targets.length > 2;
   const selectedTargets = selectable ? targets.filter((target) => selectedIds.includes(target.id)) : targets;
-  const closeAssets = [...new Set(targets.map((target) => symbolParts(target.symbol).asset))];
+  const closeAssets = [...new Set(targets.map((target) => {
+    const part = symbolParts(target.symbol);
+    return canonicalPositionAsset(part.asset, part.venue);
+  }))];
   const closeAssetLabel = positionGroupLabel(closeAssets);
   const venueCount = new Set(targets.map((target) => symbolParts(target.symbol).venue)).size;
-  const selectedAssets = [...new Set(selectedTargets.map((target) => symbolParts(target.symbol).asset))];
+  const targetAdlRanks = adlRanksForPositions(targets.map((target) => ({
+    positionId: target.positionId,
+    symbol: target.symbol,
+    venue: symbolParts(target.symbol).venue,
+  })), portfolio?.snapshot.futuresPositions ?? []);
+  const selectedAssets = [...new Set(selectedTargets.map((target) => {
+    const part = symbolParts(target.symbol);
+    return canonicalPositionAsset(part.asset, part.venue);
+  }))];
   const quantityByTarget = useMemo(() => new Map(selectedTargets.map((target) => {
     const lotSize = instruments?.find((instrument) => instrument.symbol === target.symbol)?.lotSize ?? null;
     return [target.id, closeQuantityForPercentage(target.quantity, closePercentage, lotSize)] as const;
@@ -157,6 +170,7 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
         <div><dt>{t('Positions to close')}</dt><dd>{selectedTargets.length}</dd></div>
         <div><dt>{t('Size')}</dt><dd>{closeSize}</dd></div>
         <div><dt>{t('Position notional')}</dt><dd>${formatAmount(selectedTargets.reduce((sum, target) => sum + Number(quantityByTarget.get(target.id) ?? 0) * Number(target.markPrice), 0))}</dd></div>
+        <div><dt>{t('ADL indicator')}</dt><dd><AdlIndicators ranks={targetAdlRanks.filter((_, index) => selectedTargets.some((target) => target.id === targets[index]?.id))} /></dd></div>
         <div><dt>{t('Execution')}</dt><dd>{t('Market reduce-only')}</dd></div>
       </dl>
       {selectable && <div className="close-position-selector">
@@ -187,7 +201,7 @@ export function PositionCloseDialog({ targets, portfolio, instruments, onDismiss
         <label><span>{t('Number of orders')}</span><input type="number" inputMode="numeric" min="2" max="100" step="1" value={closeOrderCount} onChange={(event) => setCloseOrderCount(event.target.value)} disabled={closing} /></label>
         <label><span>{t('Time gap between orders')}</span><div><input type="number" inputMode="numeric" min="1" max="86400" step="1" value={closeIntervalSeconds} onChange={(event) => setCloseIntervalSeconds(event.target.value)} disabled={closing} /><b>{t('seconds')}</b></div></label>
       </div>}
-      <p className="close-position-warning">{t(splitClose ? 'Split close warning' : 'Close position warning')}</p>
+      <p className="close-position-warning">{t(splitClose ? 'Confirming immediately executes the first market reduce-only order; the backend strategy submits the remaining orders at the configured interval. Actual fill prices may vary with market volatility and liquidity.' : 'Confirming immediately submits a market reduce-only order. The actual fill price may vary with market volatility and liquidity.')}</p>
       <div className="confirm-order-actions">
         <button className="confirm-back" data-dialog-autofocus onClick={onDismiss} disabled={closing}>{t('Go back')}</button>
         <button className="confirm-submit sell" onClick={() => void closePositions()} disabled={closing || !percentageValid || (splitClose && !splitValid)}><strong>{closing ? t(splitClose ? 'Starting close strategy…' : 'Closing position…') : t('Confirm close')}</strong><span>{splitClose ? `${closeOrderCount || '—'} ${t('orders')} · ${closeIntervalSeconds || '—'}s · ${closePercentage}%` : `${t('Market reduce-only')} · ${closePercentage}%`}</span></button>

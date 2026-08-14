@@ -247,6 +247,8 @@ app.post('/__e2e/fresh-quotes', async () => {
   for (const quote of quotes) {
     // TypeScript's `private` modifier is compile-time only. Exercising the compiled parser here
     // keeps this E2E fixture on the same publish path as a real CrossEx websocket ticker.
+    // The second argument mirrors the socket-layer receipt timestamp the hub stamps as
+    // `receivedAt` for ticker delivery-health checks.
     marketHub.handleMessage(JSON.stringify({
       channel: 'ticker',
       event: 'update',
@@ -264,7 +266,7 @@ app.post('/__e2e/fresh-quotes', async () => {
         q: '3862000',
         ts: timestamp,
       },
-    }));
+    }), timestamp);
   }
   return { ok: true };
 });

@@ -1,9 +1,12 @@
 import type { AuthenticatedPortfolioSnapshot, TradingSnapshot } from './api.js';
-import { positionGroupKey, positionGroupLabel } from './position-grouping.js';
+import { canonicalPositionAsset, positionGroupKey, positionGroupLabel } from './position-grouping.js';
+import { positionFundingFee } from './position-funding-fees.js';
 import { parseNumber, symbolParts } from './route-shared.js';
 
-export interface StrategyPositionRow {
+export interface PositionTableRow {
   id: string;
+  positionId: string;
+  symbol: string;
   venue: string;
   asset: string;
   quote: string;
@@ -14,14 +17,20 @@ export interface StrategyPositionRow {
   markPrice: number;
   leverage: string | null;
   unrealizedPnl: number;
+  realizedPnl: number | null;
+  fundingFee: number | null;
+  crossExAdlRank?: string | null;
+  exchangeAdlRank?: string | null;
 }
+
+export type StrategyPositionRow = PositionTableRow;
 
 export interface StrategyPositionsView {
   status: 'unavailable' | 'stale' | 'fresh';
   rows: StrategyPositionRow[];
 }
 
-export interface StrategyPositionGroup {
+export interface PositionTableGroup {
   key: string;
   asset: string;
   label: string;
@@ -38,6 +47,8 @@ export interface StrategyPositionGroup {
   leverage: string | null;
 }
 
+export type StrategyPositionGroup = PositionTableGroup;
+
 function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPositionRow[] {
   return portfolio.snapshot.futuresPositions
     .map((position): StrategyPositionRow | null => {
@@ -48,6 +59,8 @@ function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPosit
       const reportedValue = Math.abs(parseNumber(position.value) ?? 0);
       return {
         id: `${symbol.venue}:${position.positionId || position.symbol}`,
+        positionId: position.positionId,
+        symbol: position.symbol,
         venue: symbol.venue,
         asset: symbol.asset,
         quote: symbol.quote,
@@ -58,16 +71,21 @@ function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPosit
         markPrice,
         leverage: position.leverage || null,
         unrealizedPnl: parseNumber(position.unrealizedPnl) ?? 0,
+        realizedPnl: parseNumber(position.realizedPnl),
+        fundingFee: parseNumber(position.fundingFee),
+        crossExAdlRank: position.crossExAdlRank ?? null,
+        exchangeAdlRank: position.exchangeAdlRank ?? null,
       };
     })
     .filter((row): row is StrategyPositionRow => row !== null);
 }
 
-function executionRows(
+export function prepareExecutionPositionRows(
   snapshot: TradingSnapshot,
   portfolio: AuthenticatedPortfolioSnapshot | null,
+  options: { allowStalePortfolio?: boolean } = {},
 ): StrategyPositionRow[] {
-  const freshPortfolioPositions = portfolio?.dataStatus === 'fresh' && portfolio.remoteStatus === 'healthy'
+  const freshPortfolioPositions = portfolio && (options.allowStalePortfolio || (portfolio.dataStatus === 'fresh' && portfolio.remoteStatus === 'healthy'))
     ? portfolio.snapshot.futuresPositions
     : [];
 
@@ -83,6 +101,8 @@ function executionRows(
       const reportedPnl = portfolioPosition ? parseNumber(portfolioPosition.unrealizedPnl) : null;
       return {
         id: `${symbol.venue}:${position.position_id || position.symbol}`,
+        positionId: position.position_id,
+        symbol: position.symbol,
         venue: symbol.venue,
         asset: symbol.asset,
         quote: symbol.quote,
@@ -93,6 +113,10 @@ function executionRows(
         markPrice,
         leverage: portfolioPosition?.leverage || null,
         unrealizedPnl: reportedPnl ?? ((markPrice - entryPrice) * quantity),
+        realizedPnl: parseNumber(position.realized_pnl),
+        fundingFee: positionFundingFee(position, freshPortfolioPositions),
+        crossExAdlRank: portfolioPosition?.crossExAdlRank ?? null,
+        exchangeAdlRank: portfolioPosition?.exchangeAdlRank ?? null,
       };
     })
     .filter((row): row is StrategyPositionRow => row !== null);
@@ -119,7 +143,7 @@ export function prepareStrategyPositions(
     for (const row of portfolioRows(portfolio)) rowsByMarket.set(marketKey(row), row);
   }
   if (tradingSnapshot) {
-    for (const row of executionRows(tradingSnapshot, portfolio)) rowsByMarket.set(marketKey(row), row);
+    for (const row of prepareExecutionPositionRows(tradingSnapshot, portfolio)) rowsByMarket.set(marketKey(row), row);
   }
   const rows = [...rowsByMarket.values()].sort((left, right) => right.value - left.value);
 
@@ -127,17 +151,17 @@ export function prepareStrategyPositions(
 }
 
 /** Match the trading terminal's position grouping: one expandable row per asset. */
-export function groupStrategyPositions(rows: readonly StrategyPositionRow[]): StrategyPositionGroup[] {
+export function groupPositionRows(rows: readonly PositionTableRow[]): PositionTableGroup[] {
   const groups = new Map<string, StrategyPositionRow[]>();
   for (const row of rows) {
-    const key = positionGroupKey(row.asset);
+    const key = positionGroupKey(row.asset, row.venue);
     const legs = groups.get(key) ?? [];
     legs.push(row);
     groups.set(key, legs);
   }
 
   return [...groups.entries()].map(([groupKey, legs]) => {
-    const assets = [...new Set(legs.map((leg) => leg.asset))];
+    const assets = [...new Set(legs.map((leg) => canonicalPositionAsset(leg.asset, leg.venue)))];
     const asset = assets[0];
     const mixedAssets = assets.length > 1;
     const quantity = legs.reduce((sum, leg) => sum + leg.quantity, 0);
@@ -168,3 +192,5 @@ export function groupStrategyPositions(rows: readonly StrategyPositionRow[]): St
     };
   });
 }
+
+export const groupStrategyPositions = groupPositionRows;

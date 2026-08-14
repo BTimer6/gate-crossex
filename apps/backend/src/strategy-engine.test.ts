@@ -166,13 +166,19 @@ class StubMarkets implements MarketSource {
 
   constructor(private readonly database: Database.Database) {}
 
-  set(symbol: string, bid: string, ask: string, updatedAt = new Date().toISOString()): void {
+  set(
+    symbol: string,
+    bid: string,
+    ask: string,
+    updatedAt = new Date().toISOString(),
+    receivedAt = updatedAt,
+  ): void {
     const [venue = 'GATE', , asset = 'BTC'] = symbol.split('_');
     this.markets.set(symbol, {
       symbol, venue: venue as LiveMarket['venue'], asset, lastPrice: bid, bidPrice: bid, bidSize: '10',
       askPrice: ask, askSize: '10', open24h: bid, high24h: ask, low24h: bid, volume24h: '100',
       quoteVolume24h: '100000', fundingRate: '0.0001', nextFundingAt: new Date(Date.now() + 3_600_000).toISOString(),
-      openInterest: '1000', openInterestValue: '1000000', updatedAt,
+      openInterest: '1000', openInterestValue: '1000000', receivedAt, updatedAt,
       source: 'gate_crossex_websocket',
     });
     this.database.prepare(`INSERT OR IGNORE INTO crossex_instruments (
@@ -675,6 +681,34 @@ describe('strategy engine', () => {
     expect(gateway.createdOrders).toHaveLength(1);
   });
 
+  it('manually resumes a paused strategy only on its active account', async () => {
+    const { engine, runtime, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig, {
+      profileId: DEFAULT_CREDENTIAL_PROFILE,
+      label: 'Primary Trading',
+    });
+    expect(engine.pauseRunningStrategiesForCredentialChange(DEFAULT_CREDENTIAL_PROFILE)).toBe(1);
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+
+    await expect(engine.resumeStrategy(record.id, 'another-account')).rejects.toMatchObject({
+      code: 'strategy_account_not_active', statusCode: 409,
+    });
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+
+    await expect(engine.resumeStrategy(record.id, DEFAULT_CREDENTIAL_PROFILE)).resolves.toMatchObject({
+      id: record.id, status: 'RUNNING',
+    });
+    expect(engine.listActiveStrategyIds()).toEqual([record.id]);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy resumed', condition: 'Manual resume' }),
+    ]));
+    await expect(engine.resumeStrategy(record.id, DEFAULT_CREDENTIAL_PROFILE)).rejects.toMatchObject({
+      code: 'strategy_not_paused', statusCode: 409,
+    });
+  });
+
   it('rests a post-only maker quote and hedges each maker fill on the taker venue', async () => {
     const { engine, runtime, gateway, markets } = await createHarness();
     markets.set('BINANCE_FUTURE_BTC_USDT', '100000', '100001');
@@ -1141,7 +1175,7 @@ describe('strategy engine', () => {
     expect(gateway.createdOrders).toHaveLength(0);
   });
 
-  it('rejects stale or time-skewed premium legs but acts on the first coherent fresh signal', async () => {
+  it('rejects stale or transport-delayed premium legs but accepts independently timed fresh quotes', async () => {
     let now = Date.now();
     const { engine, runtime, gateway, markets } = await createHarness({ now: () => now });
     const currentTimestamp = new Date(now).toISOString();
@@ -1169,9 +1203,10 @@ describe('strategy engine', () => {
 
     now += 5_000;
     markets.set('GATE_FUTURE_SKHY_USDT', '143.78', '143.8', new Date(now).toISOString());
-    // Both legs are individually within the 15-second freshness window, but their timestamps are
-    // incompatible. The pair must not manufacture a take-profit signal.
-    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1083.7', '1083.8', new Date(now - 6_000).toISOString());
+    // A fresh-looking source timestamp is unusable when that frame took over three seconds to
+    // reach us. The pair must not manufacture a take-profit signal from delayed transport.
+    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1083.7', '1083.8',
+      new Date(now - 4_000).toISOString(), new Date(now).toISOString());
     await engine.tick();
     expect(gateway.createdOrders).toHaveLength(2);
 
@@ -1182,11 +1217,11 @@ describe('strategy engine', () => {
     await engine.tick();
     expect(gateway.createdOrders).toHaveLength(2);
 
-    // Once both exchange timestamps are current and coherent, the very first qualifying signal
-    // executes immediately; no persistence window or second observation is required.
-    const freshTimestamp = new Date(now).toISOString();
-    markets.set('GATE_FUTURE_SKHY_USDT', '143.78', '143.8', freshTimestamp);
-    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1083.7', '1083.8', freshTimestamp);
+    // Independently timed quotes are valid when each one is fresh and arrived promptly. The first
+    // qualifying signal executes immediately even though their Gate source times differ by 6s.
+    markets.set('GATE_FUTURE_SKHY_USDT', '143.78', '143.8', new Date(now).toISOString());
+    const independentlyTimed = new Date(now - 6_000).toISOString();
+    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1083.7', '1083.8', independentlyTimed, independentlyTimed);
     const exitTick = engine.tick();
     await waitFor(() => gateway.createdOrders.length === 4);
     expect(gateway.createdOrders.slice(2)).toEqual(expect.arrayContaining([
@@ -1720,5 +1755,35 @@ describe('strategy engine', () => {
     ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
     await resumeTick;
     await resumed.stop();
+  });
+
+  it('prevents persisted strategies from resuming after an account credential change', async () => {
+    const { engine, runtime, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy(takerTakerConfig, {
+      profileId: 'account-primary',
+      label: 'Primary Trading',
+    });
+
+    expect(record).toMatchObject({
+      accountProfileId: 'account-primary',
+      accountLabel: 'Primary Trading',
+    });
+    expect(engine.runningStrategiesForCredentialProfile('account-secondary')).toEqual([]);
+    expect(engine.runningStrategiesForCredentialProfile('account-primary')).toEqual([
+      expect.objectContaining({ id: record.id }),
+    ]);
+    expect(engine.pauseRunningStrategiesForCredentialChange('account-secondary')).toBe(0);
+    expect(runtime.getStrategy(record.id).status).toBe('RUNNING');
+
+    expect(engine.pauseRunningStrategiesForCredentialChange('account-primary')).toBe(1);
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+    expect(engine.listActiveStrategyIds()).toEqual([]);
+    engine.activatePersistedStrategies('account-primary');
+    expect(engine.listActiveStrategyIds()).toEqual([]);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'Strategy paused', condition: 'Account credentials changed' }),
+    ]));
   });
 });
