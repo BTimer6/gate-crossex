@@ -13,6 +13,7 @@ Primary assets are Gate API credentials, order intent, reconciled exchange state
 | Database corruption | Checksummed migrations, integrity-checked backup/restore, WAL checkpoints, and preservation before restore/update |
 | Log or diagnostic leakage | Structured redaction, bounded logs, and explicit user guidance before sharing diagnostics |
 | Compromised release download | SHA-256 and manifest verification, immutable version directories, activation health check, and rollback |
-| Docker exposure | Loopback-only publication, non-root user, read-only root filesystem, dropped capabilities, and persistent data volume |
+| Remote access | Optional server-side password gate over UI, REST, credential routes, and WebSocket; timing-safe comparison; bounded short-lived in-memory sessions; login rate limiting; HttpOnly SameSite cookies; Host/Origin validation; HTTPS deployment guidance |
+| Docker exposure | Password required by the Compose deployment, loopback-only publication by default, non-root user, read-only root filesystem, dropped capabilities, and persistent data volume |
 
-The application protects a single local user boundary. It cannot protect against malware or an attacker already operating as the same logged-in OS user, a compromised exchange, or a user granting excessive API permissions. Prebuilt archives are not yet Apple-notarized or Windows Authenticode-signed.
+The application protects a single-user boundary. Remote access authentication does not replace HTTPS and does not provide user accounts, recovery, or multi-user authorization. It cannot protect against malware or an attacker already operating as the same logged-in OS user, a compromised exchange, or a user granting excessive API permissions. Prebuilt archives are not yet Apple-notarized or Windows Authenticode-signed.

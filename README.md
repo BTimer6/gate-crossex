@@ -99,6 +99,23 @@ Linux users can follow the macOS steps above: the install and start commands are
 
 By default, the local app is available at **http://127.0.0.1:17840**. This is a private address on your computer, not a public website. If the browser does not open automatically, copy the full address shown after `Gate CrossEx is ready`; the launcher chooses another local port if the default is unavailable.
 
+### 公网服务器密码保护 | Password protection for a public server
+
+如果通过反向代理或端口转发提供访问，请设置 `GCT_ACCESS_PASSWORD`（12–256 个字符）。启用后，网页、REST API、凭据页面和 WebSocket 都需要先登录；会话 Cookie 为 HttpOnly、SameSite=Strict，12 小时后或服务重启后失效。`/health` 保持无需登录，以便容器健康检查。
+
+If the app is reached through a reverse proxy or port forwarding, set `GCT_ACCESS_PASSWORD` (12–256 characters). Once enabled, the UI, REST API, credential pages, and WebSocket require a login. The session cookie is HttpOnly and SameSite=Strict, and expires after 12 hours or a service restart. `/health` remains unauthenticated for container health checks.
+
+**不要直接通过公网 HTTP 输入密码。** 推荐在同一服务器上使用 Caddy、Nginx 或其他反向代理提供 HTTPS，并设置：
+
+```dotenv
+GCT_ACCESS_PASSWORD=<强随机密码>
+GCT_ALLOWED_HOSTS=trade.example.com
+GCT_FRONTEND_ORIGIN=https://trade.example.com
+GCT_ACCESS_COOKIE_SECURE=1
+```
+
+**Do not enter the password over public plain HTTP.** Put the app behind an HTTPS reverse proxy such as Caddy or Nginx and set the variables above. Docker deployment details are in [local development](docs/local-development.md).
+
 引导程序会使用 Node.js 官方发布的 SHA-256 校验值验证项目专用运行时。以上安装命令会运行本仓库中的远程脚本；如安全策略有要求，请先检查脚本内容。如需选择其他安装目录，请在运行安装命令前将 `GCT_INSTALL_DIR` 设置为绝对路径。贡献者命令和 Docker 用法请参阅[本地开发文档](docs/local-development.md)。
 
 The bootstrap verifies the private Node.js runtime against Node.js's published SHA-256 checksums. The install commands run a remote script from this repository; inspect it first if required by your security policy. To choose another installation folder, set `GCT_INSTALL_DIR` to an absolute path before running the install command. See [local development](docs/local-development.md) for contributor and Docker commands.

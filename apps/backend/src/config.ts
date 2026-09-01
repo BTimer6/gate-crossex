@@ -14,6 +14,8 @@ export interface BackendConfig {
   allowedOrigin: string;
   allowedOrigins: ReadonlySet<string>;
   allowedHosts: ReadonlySet<string>;
+  accessPassword: string | null;
+  accessCookieSecure: boolean;
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
@@ -36,6 +38,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     .split(',')
     .map((entry) => entry.trim().toLowerCase())
     .filter(Boolean);
+  const accessPassword = environment.GCT_ACCESS_PASSWORD ?? null;
+  if (accessPassword !== null && (accessPassword.length < 12 || accessPassword.length > 256)) {
+    throw new Error('GCT_ACCESS_PASSWORD must be between 12 and 256 characters');
+  }
 
   const allowedOrigin = environment.GCT_FRONTEND_ORIGIN ?? `http://127.0.0.1:${frontendPort}`;
   // Browsers send the loopback host the user actually typed; localhost, 127.0.0.1, and [::1]
@@ -56,6 +62,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     allowedOrigin,
     allowedOrigins: new Set([allowedOrigin, ...loopbackOrigins]),
     allowedHosts: new Set(['127.0.0.1', 'localhost', '::1', ...configuredHosts]),
+    accessPassword,
+    accessCookieSecure: environment.GCT_ACCESS_COOKIE_SECURE === '1',
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',

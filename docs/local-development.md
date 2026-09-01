@@ -16,13 +16,28 @@ The README bootstrap installs a private Node.js runtime and dependencies for nor
 
 The launcher prefers `.runtime`, when present, over a system Node.js installation. It verifies dependency state against `package-lock.json`, builds the workspaces, applies checksummed migrations, selects an available loopback port, waits for health, and opens the UI. Production normally starts at `http://127.0.0.1:17840`.
 
-Docker is an optional local-only path:
+Docker requires an access password. Copy the example environment file, replace the password, and start the container:
 
 ```bash
+cp .env.example .env
 docker compose up --build
 ```
 
-The container publishes loopback only and stores data in the `gate-crossex-data` volume. It cannot use the host OS keychain.
+The container publishes loopback only by default and stores data in the `gate-crossex-data` volume. It cannot use the host OS keychain.
+
+For a public server, the recommended layout is an HTTPS reverse proxy on the same host forwarding to `127.0.0.1:17840`. Set `GCT_ALLOWED_HOSTS` to the public hostname, `GCT_FRONTEND_ORIGIN` to its full `https://` origin, and `GCT_ACCESS_COOKIE_SECURE=1`. Keep `GCT_PUBLISH_ADDRESS=127.0.0.1`; the reverse proxy is the only public listener.
+
+Direct router forwarding without TLS is not recommended because the password and trading data cross the network as plain HTTP. If it is unavoidable on a trusted private network, set `GCT_PUBLISH_ADDRESS=0.0.0.0`, add the address clients use to `GCT_ALLOWED_HOSTS`, and leave `GCT_ACCESS_COOKIE_SECURE=0`.
+
+Access authentication configuration:
+
+| Variable | Purpose |
+| --- | --- |
+| `GCT_ACCESS_PASSWORD` | Enables server-side password authentication; must contain 12–256 characters. |
+| `GCT_ACCESS_COOKIE_SECURE` | Set to `1` behind HTTPS so browsers only send the session cookie over TLS. |
+| `GCT_ALLOWED_HOSTS` | Comma-separated public hostnames or IP addresses accepted by Host-header validation. |
+| `GCT_FRONTEND_ORIGIN` | Exact browser origin, including scheme and optional port. |
+| `GCT_PUBLISH_ADDRESS` | Docker host bind address; defaults to loopback. |
 
 ## Verification
 
@@ -77,7 +92,7 @@ An interactive `./run` startup checks the latest published GitHub release with a
 - Keep exchange fixtures synthetic and secret-free.
 - Use the secure setup page for manual Gate testing and a dedicated least-privilege APIv4 key. Never grant withdrawal permission.
 - Every backend start is trading-locked; enabling live mode is session-only.
-- Keep the service on loopback. Do not expose it with `GCT_HOST=0.0.0.0`.
+- Keep the service on loopback unless access authentication is enabled and an HTTPS reverse proxy is the public boundary.
 
 ## Troubleshooting
 

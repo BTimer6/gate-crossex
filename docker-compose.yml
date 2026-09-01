@@ -4,13 +4,16 @@ services:
     init: true
     read_only: true
     ports:
-      - "127.0.0.1:17840:17840"
+      - "${GCT_PUBLISH_ADDRESS:-127.0.0.1}:17840:17840"
     environment:
-      # The process must listen on the container interface. The published host
-      # port remains loopback-only and is not reachable from the LAN.
+      # The process listens on the container interface. Host publication stays
+      # loopback-only unless GCT_PUBLISH_ADDRESS is explicitly changed.
       GCT_HOST: 0.0.0.0
-      GCT_FRONTEND_ORIGIN: http://127.0.0.1:17840
+      GCT_FRONTEND_ORIGIN: ${GCT_FRONTEND_ORIGIN:-http://127.0.0.1:17840}
       GCT_FRONTEND_PORT: 17840
+      GCT_ALLOWED_HOSTS: ${GCT_ALLOWED_HOSTS:-localhost}
+      GCT_ACCESS_PASSWORD: ${GCT_ACCESS_PASSWORD:?Set GCT_ACCESS_PASSWORD in .env before starting Docker}
+      GCT_ACCESS_COOKIE_SECURE: ${GCT_ACCESS_COOKIE_SECURE:-0}
       GCT_DISABLE_OS_KEYCHAIN: "1"
       GCT_CREDENTIAL_ENV_PATH: /app/.local-data/credentials.env
     volumes:

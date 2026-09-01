@@ -377,11 +377,15 @@ async function createTestApp(options: {
   directory?: string;
   borosStrategyFetcher?: () => Promise<unknown>;
   borosMarketFeeFetcher?: (marketIds: number[]) => Promise<unknown>;
+  accessPassword?: string;
+  accessCookieSecure?: boolean;
 } = {}): Promise<TestContext> {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'gate-crossex-app-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
     GCT_MIGRATIONS_DIR: resolve(process.cwd(), '../../migrations'),
+    ...(options.accessPassword ? { GCT_ACCESS_PASSWORD: options.accessPassword } : {}),
+    ...(options.accessCookieSecure ? { GCT_ACCESS_COOKIE_SECURE: '1' } : {}),
   });
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const vault = new MemoryCredentialVault();
@@ -507,6 +511,66 @@ afterEach(async () => {
 });
 
 describe('local backend', () => {
+  it('protects pages, APIs, and WebSockets with the configured access password', async () => {
+    const { app } = await createTestApp({
+      accessPassword: 'correct horse battery staple',
+      accessCookieSecure: true,
+    });
+    const host = { host: '127.0.0.1:17840' };
+
+    const health = await app.inject({ method: 'GET', url: '/health', headers: host });
+    expect(health.statusCode).toBe(200);
+
+    const page = await app.inject({
+      method: 'GET', url: '/portfolio?asset=BTC', headers: { ...host, accept: 'text/html' },
+    });
+    expect(page.statusCode).toBe(302);
+    expect(page.headers.location).toBe('/auth/login?next=%2Fportfolio%3Fasset%3DBTC');
+
+    const api = await app.inject({ method: 'GET', url: '/api/system/discovery', headers: host });
+    expect(api.statusCode).toBe(401);
+    expect(api.json()).toEqual({ error: 'access_authentication_required' });
+
+    const webSocket = await app.inject({ method: 'GET', url: '/ws/stream', headers: host });
+    expect(webSocket.statusCode).toBe(401);
+
+    const badLogin = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      headers: { ...host, 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'password=wrong-password&next=%2Fportfolio',
+    });
+    expect(badLogin.statusCode).toBe(401);
+    expect(badLogin.headers['set-cookie']).toBeUndefined();
+
+    const login = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      headers: { ...host, 'content-type': 'application/x-www-form-urlencoded' },
+      payload: 'password=correct%20horse%20battery%20staple&next=%2Fportfolio',
+    });
+    expect(login.statusCode).toBe(303);
+    expect(login.headers.location).toBe('/portfolio');
+    const cookie = String(login.headers['set-cookie']);
+    expect(cookie).toContain('__Host-gct_session=');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Strict');
+    expect(cookie).toContain('Secure');
+
+    const authenticated = await app.inject({
+      method: 'GET', url: '/api/system/discovery', headers: { ...host, cookie },
+    });
+    expect(authenticated.statusCode).toBe(200);
+
+    const logout = await app.inject({ method: 'POST', url: '/auth/logout', headers: { ...host, cookie } });
+    expect(logout.statusCode).toBe(303);
+    expect(logout.headers['set-cookie']).toContain('Max-Age=0');
+    const afterLogout = await app.inject({
+      method: 'GET', url: '/api/system/discovery', headers: { ...host, cookie },
+    });
+    expect(afterLogout.statusCode).toBe(401);
+  });
+
   it('reports live-only mode, migration state, and script-free credential handling', async () => {
     const { app } = await createTestApp();
     const health = await app.inject({ method: 'GET', url: '/health', headers: { host: '127.0.0.1:17840' } });

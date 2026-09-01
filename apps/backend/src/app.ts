@@ -74,6 +74,7 @@ import { TradingSession } from './trading-session.js';
 import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
 import { CrossExPrivateStream } from './private-stream.js';
 import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio.js';
+import { AccessAuth, renderAccessLoginPage, safeReturnPath } from './access-auth.js';
 import { readDatabaseStatus } from './database.js';
 import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
@@ -133,6 +134,10 @@ const FundingRankingRequestSchema = z.object({
 const FundingHistorySeriesRequestSchema = z.object({
   symbols: z.array(z.string().regex(CROSSEX_FUTURE_SYMBOL)).min(1).max(7),
   durationDays: z.union([z.literal(1), z.literal(7), z.literal(30)]),
+});
+const AccessLoginFormSchema = z.object({
+  password: z.string().min(1).max(256),
+  next: z.string().max(2_048).optional(),
 });
 
 interface DerivedMarketCatalog {
@@ -842,11 +847,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
                 'req.headers.x-gate-key',
                 'req.body.apiKey',
                 'req.body.apiSecret',
+                'req.body.password',
                 '*.apiKey',
                 '*.apiSecret',
                 '*.key',
                 '*.secret',
                 '*.signature',
+                '*.password',
               ],
               censor: '[REDACTED]',
             },
@@ -863,6 +870,76 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(cors, { origin: [...config.allowedOrigins], credentials: false });
   await app.register(formbody, { bodyLimit: 16 * 1024 });
   await app.register(websocket);
+
+  app.addHook('onRequest', async (request, reply) => {
+    const hostname = hostnameFromHeader(request.headers.host);
+    if (!hostname || !config.allowedHosts.has(hostname)) {
+      return reply.code(403).send({ error: 'non_local_host_rejected' });
+    }
+
+    const origin = request.headers.origin;
+    if (origin
+      && !isAllowedBrowserOrigin(origin, request.headers.host, config.allowedOrigins)
+      // These script-free forms carry a high-entropy, one-time CSRF token that their route
+      // consumes before touching credentials. Some browsers report an opaque/re-written Origin
+      // for the isolated page, so let the stronger per-form check make the decision here.
+      && !isCsrfProtectedCredentialForm(request.method, request.url)) {
+      request.log.warn({ origin, host: request.headers.host }, 'rejected unexpected browser origin');
+      return reply.code(403).send({ error: 'unexpected_origin_rejected' });
+    }
+  });
+
+  const accessAuth = new AccessAuth(config.accessPassword, config.accessCookieSecure);
+  app.addHook('onRequest', async (request, reply) => {
+    if (!accessAuth.enabled) return;
+    const pathname = request.url.split('?', 1)[0];
+    if (pathname === '/health' || pathname === '/auth/login') return;
+    if (accessAuth.isAuthenticated(request.headers.cookie)) return;
+    reply.header('Cache-Control', 'no-store, max-age=0');
+    const acceptsHtml = request.method === 'GET' && request.headers.accept?.includes('text/html');
+    if (acceptsHtml && pathname !== '/ws/stream') {
+      const next = safeReturnPath(request.url);
+      return reply.code(302).header('Location', `/auth/login?next=${encodeURIComponent(next)}`).send();
+    }
+    return reply.code(401).send({ error: 'access_authentication_required' });
+  });
+
+  app.get('/auth/login', async (request, reply) => {
+    if (!accessAuth.enabled || accessAuth.isAuthenticated(request.headers.cookie)) {
+      return reply.code(302).header('Location', '/').send();
+    }
+    const query = z.object({ next: z.string().max(2_048).optional() }).safeParse(request.query);
+    return setSecureHtml(reply, renderAccessLoginPage(safeReturnPath(query.success ? query.data.next : undefined)));
+  });
+
+  app.post('/auth/login', {
+    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    if (!accessAuth.enabled) return reply.code(404).send({ error: 'access_authentication_disabled' });
+    const parsed = AccessLoginFormSchema.safeParse(request.body);
+    const returnPath = safeReturnPath(parsed.success ? parsed.data.next : undefined);
+    const token = parsed.success ? accessAuth.login(parsed.data.password) : null;
+    if (!token) {
+      request.log.warn({ ip: request.ip }, 'access password login failed');
+      return setSecureHtml(reply, renderAccessLoginPage(returnPath, true), 401);
+    }
+    return reply
+      .code(303)
+      .header('Cache-Control', 'no-store, max-age=0')
+      .header('Set-Cookie', accessAuth.sessionCookie(token))
+      .header('Location', returnPath)
+      .send();
+  });
+
+  app.post('/auth/logout', async (request, reply) => {
+    accessAuth.logout(request.headers.cookie);
+    return reply
+      .code(303)
+      .header('Cache-Control', 'no-store, max-age=0')
+      .header('Set-Cookie', accessAuth.expiredCookie())
+      .header('Location', '/auth/login')
+      .send();
+  });
 
   const frontendIndexPath = join(config.frontendDistPath, 'index.html');
   const frontendAssetsPath = join(config.frontendDistPath, 'assets');
@@ -1026,24 +1103,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     livePortfolio.stop();
     marketHub.stop();
     privateStream.stop();
-  });
-
-  app.addHook('onRequest', async (request, reply) => {
-    const hostname = hostnameFromHeader(request.headers.host);
-    if (!hostname || !config.allowedHosts.has(hostname)) {
-      return reply.code(403).send({ error: 'non_local_host_rejected' });
-    }
-
-    const origin = request.headers.origin;
-    if (origin
-      && !isAllowedBrowserOrigin(origin, request.headers.host, config.allowedOrigins)
-      // These two script-free forms carry a high-entropy, one-time CSRF token that their route
-      // consumes before touching credentials. Some browsers report an opaque/re-written Origin
-      // for the isolated page, so let the stronger per-form check make the decision here.
-      && !isCsrfProtectedCredentialForm(request.method, request.url)) {
-      request.log.warn({ origin, host: request.headers.host }, 'rejected unexpected browser origin');
-      return reply.code(403).send({ error: 'unexpected_origin_rejected' });
-    }
   });
 
   app.get('/health', async (): Promise<HealthResponse> => {
