@@ -32,7 +32,7 @@ test('reports a newer published release using the configured GitHub repository',
     },
     savedSource: null,
   });
-  assert.equal(requestedUrl, 'https://api.github.com/repos/your-quantguy/gate-crossex/releases/latest');
+  assert.equal(requestedUrl, 'https://api.github.com/repos/BTimer6/gate-crossex/releases/latest');
   assert.deepEqual(update, { currentVersion, latestTag: 'v999.0.0' });
 });
 

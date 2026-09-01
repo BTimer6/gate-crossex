@@ -46,7 +46,7 @@ The first time you use Gate CrossEx, run the **install command** once. After tha
    Paste the install command below, press Return, and wait for it to finish:
 
    ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.sh)"
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/BTimer6/gate-crossex/main/bootstrap.sh)"
    ```
 
 3. 看到 `Gate CrossEx is ready to start` 后，运行下面的启动命令：<br>
@@ -72,7 +72,7 @@ The first time you use Gate CrossEx, run the **install command** once. After tha
    Paste the install command below, press Enter, and wait for it to finish:
 
    ```powershell
-   & ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/your-quantguy/gate-crossex/main/bootstrap.ps1)))
+   & ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/BTimer6/gate-crossex/main/bootstrap.ps1)))
    ```
 
 3. 看到 `Gate CrossEx is ready to start` 后，在同一个 PowerShell 窗口运行下面的启动命令：<br>
