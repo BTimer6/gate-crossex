@@ -93,7 +93,7 @@ export class AccessAuth {
   }
 }
 
-export function renderAccessLoginPage(returnPath: string, invalidPassword = false): { html: string; csp: string } {
+export function renderAccessLoginPage(returnPath: string, csrfToken: string, invalidPassword = false): { html: string; csp: string } {
   const message = invalidPassword
     ? '<p class="error" role="alert">密码不正确，请重试。 / Incorrect password. Please try again.</p>'
     : '';
@@ -121,6 +121,7 @@ export function renderAccessLoginPage(returnPath: string, invalidPassword = fals
   <p class="hint">请输入服务器访问密码。<br>Enter the server access password.</p>
   ${message}
   <form method="post" action="/auth/login">
+    <input type="hidden" name="csrfToken" value="${escapeHtml(csrfToken)}">
     <input type="hidden" name="next" value="${escapeHtml(returnPath)}">
     <label for="password">访问密码 / Password</label>
     <input id="password" name="password" type="password" minlength="12" maxlength="256" autocomplete="current-password" autofocus required>

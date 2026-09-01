@@ -534,20 +534,26 @@ describe('local backend', () => {
     const webSocket = await app.inject({ method: 'GET', url: '/ws/stream', headers: host });
     expect(webSocket.statusCode).toBe(401);
 
+    const loginPage = await app.inject({
+      method: 'GET', url: '/auth/login?next=%2Fportfolio', headers: { ...host, accept: 'text/html' },
+    });
+    const firstCsrfToken = csrfTokenFrom(loginPage.body);
+
     const badLogin = await app.inject({
       method: 'POST',
       url: '/auth/login',
-      headers: { ...host, 'content-type': 'application/x-www-form-urlencoded' },
-      payload: 'password=wrong-password&next=%2Fportfolio',
+      headers: { ...host, origin: 'null', 'content-type': 'application/x-www-form-urlencoded' },
+      payload: `csrfToken=${encodeURIComponent(firstCsrfToken)}&password=wrong-password&next=%2Fportfolio`,
     });
     expect(badLogin.statusCode).toBe(401);
     expect(badLogin.headers['set-cookie']).toBeUndefined();
+    const secondCsrfToken = csrfTokenFrom(badLogin.body);
 
     const login = await app.inject({
       method: 'POST',
       url: '/auth/login',
-      headers: { ...host, 'content-type': 'application/x-www-form-urlencoded' },
-      payload: 'password=correct%20horse%20battery%20staple&next=%2Fportfolio',
+      headers: { ...host, origin: 'null', 'content-type': 'application/x-www-form-urlencoded' },
+      payload: `csrfToken=${encodeURIComponent(secondCsrfToken)}&password=correct%20horse%20battery%20staple&next=%2Fportfolio`,
     });
     expect(login.statusCode).toBe(303);
     expect(login.headers.location).toBe('/portfolio');

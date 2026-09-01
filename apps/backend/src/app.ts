@@ -136,6 +136,7 @@ const FundingHistorySeriesRequestSchema = z.object({
   durationDays: z.union([z.literal(1), z.literal(7), z.literal(30)]),
 });
 const AccessLoginFormSchema = z.object({
+  csrfToken: z.string().min(20).max(200),
   password: z.string().min(1).max(256),
   next: z.string().max(2_048).optional(),
 });
@@ -300,7 +301,8 @@ function isAllowedBrowserOrigin(origin: string, hostHeader: string | undefined, 
 function isCsrfProtectedCredentialForm(method: string, url: string): boolean {
   if (method !== 'POST') return false;
   const pathname = url.split('?', 1)[0];
-  return pathname === '/secure/credentials'
+  return pathname === '/auth/login'
+    || pathname === '/secure/credentials'
     || pathname === '/secure/credentials/delete'
     || pathname === '/secure/credentials/switch';
 }
@@ -880,7 +882,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const origin = request.headers.origin;
     if (origin
       && !isAllowedBrowserOrigin(origin, request.headers.host, config.allowedOrigins)
-      // These script-free forms carry a high-entropy, one-time CSRF token that their route
+      // These script-free forms carry a high-entropy, one-time CSRF token that each route
       // consumes before touching credentials. Some browsers report an opaque/re-written Origin
       // for the isolated page, so let the stronger per-form check make the decision here.
       && !isCsrfProtectedCredentialForm(request.method, request.url)) {
@@ -909,7 +911,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       return reply.code(302).header('Location', '/').send();
     }
     const query = z.object({ next: z.string().max(2_048).optional() }).safeParse(request.query);
-    return setSecureHtml(reply, renderAccessLoginPage(safeReturnPath(query.success ? query.data.next : undefined)));
+    return setSecureHtml(reply, renderAccessLoginPage(
+      safeReturnPath(query.success ? query.data.next : undefined),
+      csrfTokens.issue(),
+    ));
   });
 
   app.post('/auth/login', {
@@ -918,10 +923,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (!accessAuth.enabled) return reply.code(404).send({ error: 'access_authentication_disabled' });
     const parsed = AccessLoginFormSchema.safeParse(request.body);
     const returnPath = safeReturnPath(parsed.success ? parsed.data.next : undefined);
-    const token = parsed.success ? accessAuth.login(parsed.data.password) : null;
+    const validForm = parsed.success && csrfTokens.consume(parsed.data.csrfToken);
+    const token = validForm ? accessAuth.login(parsed.data.password) : null;
     if (!token) {
-      request.log.warn({ ip: request.ip }, 'access password login failed');
-      return setSecureHtml(reply, renderAccessLoginPage(returnPath, true), 401);
+      request.log.warn({ ip: request.ip, invalidForm: !validForm }, 'access password login failed');
+      return setSecureHtml(reply, renderAccessLoginPage(returnPath, csrfTokens.issue(), validForm), validForm ? 401 : 400);
     }
     return reply
       .code(303)
